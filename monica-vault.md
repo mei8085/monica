@@ -754,9 +754,59 @@ if (! $contact) {  // ← 正确检查 null
 
 **结论**：身份 Contact 被软删除后，不是"空对象"也不是"优雅降级"，而是**大量页面直接抛出 500 错误**。
 
-### 6.8 身份查找的真实失效面：20+ 处调用点全部中招
+### 6.8 身份查找的真实失效面：扣误命中后约 17 处外部调用
 
-`getContactInVault()` 在全项目中有超过 20 处调用，涵盖 Vault 仪表板、联系人详情、日历、生活指标、期刊、DAV 同步等多个核心模块。以下是按模块分类的失效点：
+`getContactInVault()` 之前被统计为"全项目 20+ 处调用"，但这个数字**包含了方法定义本身和一个同名的私有方法误命中**，需要扣除。
+
+#### 6.8.0 先剔除误命中
+
+**误命中 1：方法定义本身不算调用**
+- [User.php#L267](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/User.php#L267) — `public function getContactInVault(Vault $vault)` 是方法定义，不是调用
+
+**误命中 2：PrepareJobsContactPush 是类内同名私有方法，不是 User 模型方法**
+- [PrepareJobsContactPush.php#L109-L118](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPush.php#L109-L118)
+  ```php
+  private function getContactInVault(): ?string  // 类内私有方法，返回的是 contact_id 字符串
+  {
+      $entry = $this->subscription->user->vaults()
+          ->wherePivot('vault_id', $this->subscription->vault_id)
+          ->first();
+
+      $pivot = optional($entry)->pivot;
+      return optional($pivot)->contact_id;  // 直接取 pivot 字段，不查询 Contact 表
+  }
+  ```
+- 同一文件 [L105](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPush.php#L105) 的 `$this->getContactInVault()` 调用的就是上面这个私有方法
+- **关键区别**：
+  - 它不调用 User 模型上的 `getContactInVault()`，所以不走 `Contact::findOrFail()` 那套 SoftDeletes 过滤逻辑
+  - 它直接走 `optional()` 兜底链，pivot 不存在时返回 `null`，不会抛错
+  - 它只是比较 contact_id 字符串，即使身份 Contact 软删除了，只要 `user_vault` 记录还在（确实还在）就正常工作
+- **结论**：DAV 客户端推送模块**不受影响**，必须从失效点清单中剔除。
+
+#### 真实外部调用面（约 17 处，按模块列）
+
+| # | 文件 | 行号 | 模式 | 风险 |
+|---|------|------|------|------|
+| 1 | [UserHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Helpers/UserHelper.php#L23) | 23 | 做了 null 检查 ✅ | 无 |
+| 2 | [VaultShowViewHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultShowViewHelper.php#L189) | 189 | 直接 `->id` ❌ | 必崩 |
+| 3 | [VaultController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultController.php#L68) | 68 | 赋值给变量后传递给 ViewHelper | 间接崩（由 #2 触发） |
+| 4 | [VaultLifeEventController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultLifeEventController.php#L17) | 17 | 赋值给变量（需结合后续代码判断） | 看用法 |
+| 5 | [VaultLifeMetricsViewHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageLifeMetrics/Web/ViewHelpers/VaultLifeMetricsViewHelper.php#L24) | 24 | （需结合后续代码） | — |
+| 6 | [ReportMoodTrackingEventIndexViewHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportMoodTrackingEventIndexViewHelper.php#L30) | 30 | （需结合后续代码） | — |
+| 7 | [PostShowViewHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostShowViewHelper.php#L162) | 162 | （需结合后续代码） | — |
+| 8 | [IncrementLifeMetric.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageLifeMetrics/Services/IncrementLifeMetric.php#L46) | 46 | （需结合后续代码） | — |
+| 9 | [LifeMetricContactController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricContactController.php#L27) | 27 | （需结合后续代码） | — |
+| 10 | [LifeMetricController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricController.php#L29) | 29 | （需结合后续代码） | — |
+| 11 | [LifeMetricController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricController.php#L48) | 48 | （需结合后续代码） | — |
+| 12 | [VaultCalendarIndexViewHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageCalendar/Web/ViewHelpers/VaultCalendarIndexViewHelper.php#L100) | 100 | 直接调 `->moodTrackingEvents()` ❌ | 必崩 |
+| 13 | [ImportContactTask.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageTasks/Dav/ImportContactTask.php#L138) | 138 | 直接 `->id` ❌ | 必崩 |
+| 14 | [ImportCalendarContactImportantDates.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageContactImportantDates/Dav/ImportCalendarContactImportantDates.php#L136) | 136 | 直接 `->id` ❌ | 必崩 |
+| 15 | [ContactShowViewHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageContact/Web/ViewHelpers/ContactShowViewHelper.php#L63) | 63 | 直接 `->id` ❌ | 必崩 |
+| 16 | [ContactShowViewHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageContact/Web/ViewHelpers/ContactShowViewHelper.php#L64) | 64 | 直接 `->id` ❌ | 必崩 |
+| 17 | [ContactShowViewHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageContact/Web/ViewHelpers/ContactShowViewHelper.php#L117) | 117 | 直接 `->id` ❌ | 必崩 |
+| 18 | [ContactShowViewHelper.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageContact/Web/ViewHelpers/ContactShowViewHelper.php#L118) | 118 | 直接 `->id` ❌ | 必崩 |
+
+扣掉 1 处方法定义（不计入）+ 剔除 2 处误命中（私有方法同名）+ 1 处做了 null 检查（无风险），剩余约 **17 处外部调用**（其中 ContactShowViewHelper 的 4 次调用 + 其余文件的 13 次），**绝大多数直接链式调用，必崩**。
 
 #### 6.8.1 空间仪表板（入口级，全站首页即崩溃）
 
@@ -770,13 +820,13 @@ if (! $contact) {  // ← 正确检查 null
 #### 6.8.2 联系人详情页（核心功能，打开联系人就崩）
 
 - **ViewHelper**：[ContactShowViewHelper.php#L63-L64](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageContact/Web/ViewHelpers/ContactShowViewHelper.php#L63-L64) 和 [L117-L118](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageContact/Web/ViewHelpers/ContactShowViewHelper.php#L117-L118)
-  - 两处 `$user->getContactInVault($contact->vault)->id !== $contact->id`
+  - 4 处 `$user->getContactInVault($contact->vault)->id !== $contact->id`
   - 用于判断联系人是否是用户自己，决定是否显示归档/删除按钮
   - 只要打开任何一个联系人详情页就会崩
 
 #### 6.8.3 日历页面（重要功能，日历入口即崩）
 
-- **ViewHelper**：[VaultCalendarIndexViewHelper.php#L100](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageCalendar/Web/ViewHelpers/VaultCalendarIndexViewHelper.php#L100)
+- **ViewHelper**：[VaultCalendarIndexViewHelper.php#L100-L103](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageCalendar/Web/ViewHelpers/VaultCalendarIndexViewHelper.php#L100-L103)
   - `$contact = $user->getContactInVault($vault);` 后直接调用 `$contact->moodTrackingEvents()`
   - 日历页面加载心情追踪数据时崩溃
 
@@ -810,31 +860,106 @@ if (! $contact) {  // ← 正确检查 null
 
 - **ViewHelper**：[ReportMoodTrackingEventIndexViewHelper.php#L30](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportMoodTrackingEventIndexViewHelper.php#L30)
 
-#### 6.8.8 DAV 客户端推送
-
-- **服务**：[PrepareJobsContactPush.php#L105](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPush.php#L105)
-  - 比较时需要排除用户自己的身份 Contact
-  - DAV 同步功能会受影响
-
-#### 6.8.9 生活事件模块
+#### 6.8.8 生活事件模块
 
 - **控制器**：[VaultLifeEventController.php#L17](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultLifeEventController.php#L17)
 
-#### 失效程度总览
+#### 失效程度总览（修正后）
 
-| 模块 | 失效点数量 | 失效程度 |
+| 模块 | 调用点数量 | 失效程度 |
 |------|-----------|----------|
 | Vault 仪表板 | 1+ 个 ViewHelper | **入口级崩溃**，打开 Vault 就 500 |
-| 联系人详情 | 2 处（4 次调用） | 打开任何联系人详情页就崩 |
+| 联系人详情 | 4 次调用 | 打开任何联系人详情页就崩 |
 | 日历 | 1 个 ViewHelper | 日历页面加载失败 |
 | DAV 同步（导入） | 2 个服务 | 日历/任务导入静默失败 |
 | 生活指标 | 3 个控制器 + 1 个服务 + 1 个 ViewHelper | 整个生活指标模块全崩 |
 | 期刊帖子 | 1 个 ViewHelper | 查看帖子详情崩 |
 | 心情追踪报告 | 1 个 ViewHelper | 报告页面崩 |
-| DAV 客户端推送 | 1 个服务 | DAV 同步异常 |
+| ~~DAV 客户端推送~~ | ~~1 个服务~~ | **已剔除**（同名私有方法，不依赖 User 模型，不崩） |
 | 生活事件 | 1 个控制器 | 生活事件页崩 |
 
 **总结**：被移除的 Manager（或任何被移除的用户）虽然"权限校验"仍然通过，但大部分业务页面因为身份 Contact 软删除而直接抛出 500 错误。**这是一种"伪失效"——权限还在，但功能用不了，因为几乎所有需要身份 Contact 的页面都会报错。**
+
+### 6.9 can_be_deleted 保护被绕过：又一个"创建时承诺、删除时忽略"的注释误导
+
+与 6.6 节的方法注释问题属于同类问题，都是"设计上有承诺、代码上不执行"。
+
+#### 6.9.1 创建时的承诺
+
+[GrantVaultAccessToUser.php#L76-L79](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVaultSettings/Services/GrantVaultAccessToUser.php#L76-L79) 在创建用户身份 Contact 时明确标记不可删除：
+
+```php
+$contact = Contact::create([
+    'vault_id'      => $this->vault->id,
+    'first_name'    => $this->user->first_name,
+    'last_name'     => $this->user->last_name,
+    'can_be_deleted' => false,              // ← 承诺：此 Contact 不可删除
+    'template_id'   => $this->vault->default_template_id,
+]);
+```
+
+同样的模式也出现在 [CreateVault.php#L80-L94](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Services/CreateVault.php#L80-L94)（创建 Vault 时为创建者生成身份 Contact，也是 `can_be_deleted = false`）。
+
+#### 6.9.2 同目录其他服务的正确写法（对照基准）
+
+在同一 `ManageVaultSettings/Services` 目录下，销毁类服务都会在删除前检查 `can_be_deleted`：
+
+**DestroyLifeEventType.php#L50-L52**（[DestroyLifeEventType.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVaultSettings/Services/DestroyLifeEventType.php#L50-L52)）：
+```php
+if (! $type->can_be_deleted) {
+    throw new CantBeDeletedException;
+}
+$type->delete();
+```
+
+**DestroyLifeEventCategory.php#L46-L48**（[DestroyLifeEventCategory.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVaultSettings/Services/DestroyLifeEventCategory.php#L46-L48)）：
+```php
+if (! $category->can_be_deleted) {
+    throw new CantBeDeletedException;
+}
+$category->delete();
+```
+
+跨目录的 DestroyContact 同样遵循此惯例（[DestroyContact.php#L44-L46](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageContact/Services/DestroyContact.php#L44-L46)）：
+```php
+if (! $this->contact->can_be_deleted) {
+    throw new CantBeDeletedException;
+}
+```
+
+#### 6.9.3 RemoveVaultAccess 的写法落差
+
+[RemoveVaultAccess.php#L72-L79](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccess.php#L72-L79) 完全不检查 `can_be_deleted`：
+
+```php
+private function remove(): void
+{
+    $vault = $this->user->vaults()
+        ->wherePivot('vault_id', $this->vault->id)
+        ->first();
+
+    if ($vault !== null) {
+        Contact::find($vault->pivot->contact_id)->delete();  // ← 没有 can_be_deleted 检查
+    }
+}
+```
+
+**矛盾与后果**：
+
+1. **设计意图 vs 实际代码**：身份 Contact 被创建时标记 `can_be_deleted = false` 的目的就是为了防止用户通过普通的删除联系人接口把自己的"身份"删掉。但 RemoveVaultAccess 作为"移除成员"的官方入口，却绕过了这道保护。
+2. **从业务上看，移除成员确实需要删掉身份 Contact**——这意味着要么：
+   - `can_be_deleted = false` 的约束对"身份 Contact"是合理的（防止误删），RemoveVaultAccess 应该在检查后使用 `forceDelete()` 硬删除（顺便真正触发级联，解决 6.4 节的漏洞）
+   - 或者 `can_be_deleted` 字段对身份 Contact 根本不适用，创建时就不该设为 `false`
+3. **目前的实际状态是"两头不靠"**：既忽略了 `can_be_deleted` 的语义约束（同目录其他服务都遵守的约定被破坏），又没有用 `forceDelete()` 来真正触发级联——最终既违反了设计约定，又没解决级联失效的根本问题。
+
+#### 6.9.4 同类注释误导汇总
+
+| 位置 | 承诺 | 实际 |
+|------|------|------|
+| [RemoveVaultAccess.php#L68-L72](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccess.php#L68-L72) 方法注释 | "delete contact → cascade delete user_vault → remove access" | 软删除，级联不触发，权限没丢 |
+| [GrantVaultAccessToUser.php#L78](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVaultSettings/Services/GrantVaultAccessToUser.php#L78) 字段设置 | `can_be_deleted = false` 标记不可删除 | RemoveVaultAccess 完全不查该字段，直接删 |
+
+两处设计承诺都没有被执行，却给后续开发者（包括写测试的人）造成了"机制已经生效"的心理暗示，是导致漏洞被长期忽视的重要原因。
 
 ---
 
