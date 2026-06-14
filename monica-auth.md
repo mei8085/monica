@@ -296,15 +296,178 @@ WebAuthn 使用 `LaravelWebauthn\Services\LoginRateLimiter`，注入到 [Attempt
 
 ---
 
-## 四、记住我与会话刷新策略
+## 四、会话刷新主线（Session Refresh Main Line）
 
-### 1. 记住我（Remember Me）基础机制
+本节沿着"**建立会话 → 逐请求验证 → 过渡态清理 → 延长会话 → 配置项 → 高权限二次确认**"的完整生命周期，逐层拆解三条核心机制的代码级实现。
 
-项目使用 Laravel 原生的 `remember` 机制，在以下入口支持：
+---
 
-- **邮箱密码登录**：通过 `$request->boolean('remember')` 传递给 `Auth::attempt()`（实际发生在管道第 2 步 `AttemptToAuthenticate` 中）
-- **社交登录**：在 [SocialiteCallbackController](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Http/Controllers/Auth/SocialiteCallbackController.php#L33-L35) 中将 `remember` 存入 session，后续在 [AttemptToAuthenticateSocialite](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Actions/AttemptToAuthenticateSocialite.php#L56) 中取出使用
-- **2FA 后登录**：从 session `login.remember` 取出，由 Fortify 的 2FA 控制器调用 `$guard->login($user, $remember)` 时传入
+### 1. 登录尾段：PrepareAuthenticatedSession 的会话建立
+
+`Laravel\Fortify\Actions\PrepareAuthenticatedSession` 是 Fortify 登录管道的**最后一步**，Monica 未自定义此动作，在两条登录路径中复用：
+
+- **邮箱密码路径**：[fortify.php#L149](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/config/fortify.php#L149) — login pipeline 第 3 步（紧接 `AttemptToAuthenticate` 之后）
+- **社交登录路径**：[SocialiteCallbackController.php#L64](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Http/Controllers/Auth/SocialiteCallbackController.php#L64) — 社交 loginPipeline 第 2 步（紧接 `AttemptToAuthenticateSocialite` 之后）
+
+它按顺序执行四个**原子动作**（不可拆分，中间无异常捕获）：
+
+| 步骤 | 动作（Fortify v1.28.0 源码） | 安全意义 |
+|-----|------------------------------|---------|
+| ① | `$request->session()->regenerate()` | **防会话固定攻击**。销毁旧 session ID、生成新 ID，旧 ID 立即在 session 后端（database）失效，浏览器收到新 `laravel_session` cookie |
+| ② | `$request->session()->put([$this->passwordHashSessionKey() => $user->getAuthPassword()])` | 写入密码哈希快照到 session，key 由 Fortify 配置的 guard 名决定：`login_password_hash_web`（Monica 的 fortify.guard = `web`，见 [fortify.php#L18](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/config/fortify.php#L18)）。供后续 AuthenticateSession 逐请求比对 |
+| ③ | `Hash::needsRehash($user->getAuthPassword()) ? $user->forceFill(['password' => Hash::make($request->password)])->save() : null` | **透明哈希升级**：如果 bcrypt cost 参数或算法改变，在用户下次登录时自动用新参数重哈希并写回数据库。此步骤依赖 `AttemptToAuthenticate` 已经验证过明文密码，所以可以安全地用 `$request->password` 重做哈希 |
+| ④ | `event(new Authenticated($this->config->get('fortify.guard'), $user))` | 触发 `Illuminate\Auth\Events\Authenticated` 事件，通知会话已完整就绪 |
+
+**事件时机差异必须明确**：
+- **`Login` 事件**：由 `Auth::attempt()` / `$guard->login()` 触发，在管道第 ② 步（`AttemptToAuthenticate` 或 2FA 控制器）触发 — 此时 session ID 尚未 regenerate、password_hash 尚未写入
+- **`Authenticated` 事件**：在本动作第 ④ 步触发 — 此时四条会话准备工作（regenerate、hash写入、rehash、登录）全部完成
+
+Monica 的 [LoginListener](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Listeners/LoginListener.php) 故意监听 `Login` 而非 `Authenticated`，因为它需要 `$event->remember` 参数（`Login` 事件携带，`Authenticated` 事件不携带）。
+
+---
+
+### 2. 逐请求验证：AuthenticateSession 的 password_hash 失效比对
+
+Jetstream 提供的 `AuthenticateSession` 中间件在**每个受保护请求**上执行密码哈希快照比对，一旦不一致立即销毁会话。
+
+- 配置绑定：[jetstream.php#L34](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/config/jetstream.php#L34) → `'auth_session' => AuthenticateSession::class`
+- 中间件层叠：[web.php#L184-L188](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/routes/web.php#L184-L188)，受保护路由组三层中间件为 `auth:sanctum` → `config('jetstream.auth_session')` → `verified`
+
+#### 完整执行流程（Jetstream v5.3.8）
+
+```
+请求进入 AuthenticateSession::handle()
+│
+├─ 1. $guard = $this->getGuardForRequest($request)
+│     └─ 解析当前 guard（写入时用 web，比对时用同一 guard 保证 key 一致）
+│
+├─ 2. $user = $request->user($guard)  // 获取已认证用户
+│     └─ 若 null（未认证），直接 $next($request) 跳过
+│
+├─ 3. $sessionHash = $request->session()->get('login_password_hash_'.$guard)
+│     └─ 从 session 取出登录时写入的哈希快照
+│
+├─ 4. if ($user && $sessionHash !== null && $sessionHash !== $user->getAuthPassword())
+│     │
+│     ├─ 不一致 → 执行失效链路：
+│     │    ├─ Auth::guard($guard)->logout()       // 注销 guard
+│     │    ├─ $request->session()->invalidate()    // 销毁整个 session
+│     │    ├─ $request->session()->regenerateToken()  // 重新生成 CSRF token
+│     │    └─ redirect('/login')                  // 踢回登录页
+│     │
+│     └─ 一致（或 $sessionHash 为 null / $user 为 null）→ 通过，$next($request)
+│
+└─ 返回响应前，若有 SESSION_AUTHENTICATED_AT 则更新
+```
+
+#### 四种失效触发场景
+
+| 场景 | 根因 | DB 侧变化 | session 侧状态 | 逐请求比对结果 |
+|-----|------|----------|---------------|--------------|
+| 用户改密码 | Profile 页 `UpdateUserPassword` | `$user->password` 变为新 bcrypt hash | `login_password_hash_web` 仍为旧值 | `旧值 !== 新值` → 失效 |
+| 管理员重置密码 | 后台直接改 users.password | 同上 | 同上 | 同上 → 失效 |
+| bcrypt cost 升级 | `config/hashing.php` 中 rounds 提高 | 用户下次登录时，PrepareAuthenticatedSession 第③步 rehash 后 DB 写入新 hash | 该用户**本次登录**的 session 在写入时已用新 hash（通过）；**其他浏览器旧会话**存的是旧 hash | 旧会话 → 失效 |
+| 登出其他会话 | `LogoutOtherBrowserSessionsForm.vue` 触发 Fortify `logout-other-devices` 路由 | 内部强制改 users.password 的"密码确认 hash" | 当前浏览器 session 立即重新写 hash；其他浏览器不变 | 其他浏览器 → 失效 |
+
+#### 无密码用户的兼容逻辑
+
+纯社交登录用户 `$user->password === null`：
+- 登录时，PrepareAuthenticatedSession 写入 `login_password_hash_web` = `null`
+- 逐请求时，AuthenticateSession 比对：`null !== null` → **false**（通过）
+- 即使某场景把 DB 中 password 改回非 null 值，也会触发失效 — 这是预期行为
+
+这与 [FortifyServiceProvider.php#L44-L50](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Providers/FortifyServiceProvider.php#L44-L50) 中 `confirmPasswordsUsing` 对无密码用户返回 `true` 的设计哲学一致：**无密码用户不存在"密码泄露后改密码踢下线"的语义**。
+
+---
+
+### 3. 过渡态清理：login.id / login.remember 在 2FA 通过后的 forget 时机
+
+`login.id` 和 `login.remember` 是**纯临时状态**：仅在"凭证验证通过 → 等待 2FA 挑战"这一短暂窗口内存在于 session 中。2FA 验证通过后必须彻底清理，否则可能被重放攻击利用。
+
+Monica 代码中这两个键在三条登录路径中的**写入 → 读取 → 清理**链路如下：
+
+#### 路径 A：邮箱密码 → TOTP/WebAuthn 2FA 通过（Fortify 内置控制器）
+
+**写入**：[RedirectIfTwoFactorAuthenticatable@twoFactorChallengeResponse](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Actions/Fortify/RedirectIfTwoFactorAuthenticatable.php#L84-L96)
+
+```php
+$request->session()->put([
+    'login.id' => $user->getKey(),
+    'login.remember' => $request->boolean('remember'),
+]);
+// 然后 redirect → /two-factor-challenge
+```
+
+**读取与清理**：Fortify v1.28.0 内置 `TwoFactorAuthenticatedSessionController::store()`（POST `/two-factor-challenge`），依次执行：
+
+```
+1. 校验 TOTP code 或 recovery code（通过 TwoFactorLoginRequest）
+   └─ 内部通过 session()->get('login.id') 取出待验证用户（注意：是 get 不是 pull，key 仍留存在 session）
+
+2. $remember = $request->session()->pull('login.remember', false)
+   └─ 用 pull() 取出 remember 并同时删除 login.remember
+
+3. $guard->login($user, $remember)  ← 正式登录，触发 Login 事件
+
+4. $request->session()->forget(['login.id', 'login.remember']);
+   └─ 显式 forget 两个键（防御性清理：login.id 之前没被 pull 过，必须显式删；login.remember 虽已 pull 但再次删做双保险）
+
+5. $request->session()->regenerate();
+   └─ 重新生成会话 ID，彻底斩断 2FA 挑战阶段与正式登录阶段的 session 关联
+```
+
+**防御性设计**：第 4 步显式 `forget` + 第 5 步 `regenerate` 双重保险，确保即使某一步漏清理，新 session ID 也不会携带旧的 challenge 数据。
+
+#### 路径 B：社交登录 → 2FA 通过
+
+**写入前的过渡**：[SocialiteCallbackController](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Http/Controllers/Auth/SocialiteCallbackController.php#L33-L35) 先把 `remember` 暂存到 session：
+```php
+session()->put('login.remember', true);
+```
+
+**写入 challenge 键**：[AttemptToAuthenticateSocialite@twoFactorChallengeResponse](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Actions/AttemptToAuthenticateSocialite.php#L195-L207) 执行**原子搬运**：
+```php
+$request->session()->put([
+    'login.id' => $user->getKey(),
+    'login.remember' => $request->session()->pull('login.remember', $request->filled('remember')),
+    //               ↑ 先 pull 删除旧的 login.remember，再作为值重新 put 到同一 key
+]);
+```
+这里 `pull('login.remember', ...)` 的作用是：**从社交暂存区取出值，同时删除旧位置，再写入到 challenge 区的同一 key 名**——保证路径 B 与路径 A 的 session 键名完全一致。
+
+**读取与清理**：与路径 A 完全相同，因为两条路径最终都 redirect 到 `route('two-factor.login')`，由同一个 `TwoFactorAuthenticatedSessionController::store()` 处理。
+
+#### 路径 C：社交登录 → 无 2FA，直通登录
+
+[AttemptToAuthenticateSocialite.php#L56](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Actions/AttemptToAuthenticateSocialite.php#L56)：
+
+```php
+$this->guard->login($user, $request->session()->pull('login.remember', false));
+```
+
+- 直接 `pull('login.remember')` 取值并清理（社交路径无 2FA，所以 `login.id` 从未被写入，无需清理）
+- 之后进入 `PrepareAuthenticatedSession`，由 `regenerate()` 刷新会话 ID
+
+#### login.id / login.remember 生命周期总览
+
+| 阶段 | 发生位置 | login.id 状态 | login.remember 状态 |
+|-----|---------|--------------|-------------------|
+| 1. 进入登录管道前 | POST /login 或 社交回调前 | 不存在 | 不存在 |
+| 2. 凭证验证通过后需 2FA | RedirectIfTwoFactorAuthenticatable / AttemptToAuthenticateSocialite | put → 存在 | put → 存在 |
+| 3. 用户浏览 2FA 挑战页 | GET /two-factor-challenge | 存在 | 存在 |
+| 4. 2FA 代码验证通过 | TwoFactorAuthenticatedSessionController::store() | pull 取出后 forget 双保险 | pull 取出后 forget 双保险 |
+| 5. 正式登录后 | PrepareAuthenticatedSession | 已不存在 | 已不存在 |
+| 6. 后续受保护请求 | AuthenticateSession 逐请求比对 | 保持不存在 | 保持不存在 |
+
+---
+
+### 4. 记住我（Remember Me）扩展
+
+除了上述三条核心刷新机制，Monica 还对"记住我"做了 WebAuthn 专项扩展。`remember` 标志在三条登录路径中的传递链路：
+
+- **邮箱密码登录**：`$request->boolean('remember')` → 管道第 2 步 `AttemptToAuthenticate` 传给 `Auth::attempt()`
+- **社交登录**：[SocialiteCallbackController](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Http/Controllers/Auth/SocialiteCallbackController.php#L33-L35) `session()->put('login.remember', true)` → [AttemptToAuthenticateSocialite](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Actions/AttemptToAuthenticateSocialite.php#L56) `pull()` 取出传给 `$guard->login()`
+- **2FA 通过后登录**：从 session `login.remember` pull 取出 → 传给 `$guard->login($user, $remember)`
 
 ### 2. WebAuthn 记住我扩展
 
@@ -341,7 +504,27 @@ public function handle(Login $event)
 
 参考：[LoginController.php#L33-L37](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Http/Controllers/Auth/LoginController.php#L33-L37)
 
-### 3. 会话配置
+### 3. PrepareAuthenticatedSession：登录尾段的会话刷新动作
+
+`Laravel\Fortify\Actions\PrepareAuthenticatedSession` 是 Fortify 登录管道的最后一步，Monica 未自定义此动作，在两条登录路径中复用：
+
+- **邮箱密码路径**：[fortify.php#L149](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/config/fortify.php#L149) 作为 login pipeline 的第 3 步
+- **社交登录路径**：[SocialiteCallbackController.php#L64](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Http/Controllers/Auth/SocialiteCallbackController.php#L64) 作为社交 loginPipeline 的第 2 步
+
+它执行以下四个原子动作（顺序执行）：
+
+| 步骤 | 动作 | 代码含义 |
+|-----|------|---------|
+| ① | `$request->session()->regenerate()` | 重新生成会话 ID，**防止会话固定攻击**。旧 session ID 立即失效，浏览器收到新 cookie |
+| ② | `$request->session()->put([...])` | 写入 `login_password_hash`（见下一节 AuthenticateSession 比对机制） |
+| ③ | `$user->forceFill(...)` + `$user->save()` | 若用户密码哈希需要升级（如 bcrypt cost 参数调整），调用 `Hash::make()` 重新哈希并写回数据库。由 `Hash::needsRehash($user->getAuthPassword())` 判断 |
+| ④ | `event(new Authenticated(...))` | 触发 `Illuminate\Auth\Events\Authenticated` 事件，通知其他监听器（如审计日志、最近登录时间更新等） |
+
+Monica 的 [LoginListener](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Listeners/LoginListener.php) 监听的是 **`Login` 事件**（由 `Auth::attempt()` 或 `$guard->login()` 触发，发生在管道第 2 步），而非此处的 `Authenticated` 事件——两者触发时机不同：
+- `Login`：表示登录成功（可能会话尚未准备好）
+- `Authenticated`：表示登录+会话准备全部完成
+
+### 4. 会话配置
 
 会话配置见 [session.php](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/config/session.php)：
 
@@ -353,16 +536,68 @@ public function handle(Login $event)
 | `cookie` | 基于 app name | 会话 cookie 名称 |
 | `same_site` | `lax` | SameSite 属性 |
 
-### 4. 会话认证中间件（AuthenticateSession）
+### 5. AuthenticateSession：password_hash 会话失效比对机制
 
-Jetstream 提供的 `AuthenticateSession` 中间件用于在已认证会话中验证用户身份的有效性（防止会话固定攻击、密码修改后失效等）。
+Jetstream 提供的 `AuthenticateSession` 中间件用于在已认证会话中**逐请求**验证用户身份的有效性，核心机制是比对 session 中存储的密码哈希与数据库当前的密码哈希。
 
-- 配置：[jetstream.php#L34](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/config/jetstream.php#L34)
-- 使用位置：[web.php#L184-L188](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/routes/web.php#L184-L188)
+- 配置别名：[jetstream.php#L34](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/config/jetstream.php#L34) → `'auth_session' => AuthenticateSession::class`
+- 使用位置：[web.php#L184-L188](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/routes/web.php#L184-L188)，作为受保护路由组的第二层中间件
 
 受保护的路由组使用三层中间件：`auth:sanctum` + `config('jetstream.auth_session')` + `verified`。
 
-### 5. 密码确认（Password Confirmation）
+#### password_hash 的写入
+
+在登录尾段的 `PrepareAuthenticatedSession` 第 ② 步，session 被写入：
+
+```php
+// PrepareAuthenticatedSession 内部（Fortify 内置）
+$request->session()->put([
+    'login_password_hash_sanctum' => $user->getAuthPassword(),  // sanctum guard 对应的 key
+    // 或 'login_password_hash_web' 对应 web guard
+]);
+```
+
+key 名称由当前 guard 名决定（Monica 的受保护路由用 `auth:sanctum`，所以写入的是 `login_password_hash_sanctum`）。
+
+#### password_hash 的逐请求比对
+
+`AuthenticateSession::handle()` 在每个受保护请求上执行以下逻辑：
+
+```
+1. $user = $request->user()
+   └─ 若未认证，跳过（交由 auth:sanctum 中间件处理）
+
+2. $sessionHash = $request->session()->get('login_password_hash_'.$guardName)
+   └─ 从 session 取出登录时存储的密码哈希
+
+3. if ($sessionHash !== $user->getAuthPassword())
+   ├─ 不一致 → 密码被修改过（或哈希算法升级重算过）
+   │    ├─ Auth::logout()  ← 强制登出当前会话
+   │    ├─ session invalidate + regenerate token
+   │    └─ 跳转 /login
+   └─ 一致 → 通过，继续请求
+```
+
+#### 失效场景
+
+| 场景 | 触发条件 | 后果 |
+|-----|---------|------|
+| 用户修改密码 | `$user->password` 字段更新为新哈希 | 所有旧会话的 `login_password_hash_*` 与新值不等，逐请求被强制登出 |
+| 管理员重置用户密码 | 同上 | 同上 |
+| 哈希算法升级 | `Hash::needsRehash()` 为 true 时 PrepareAuthenticatedSession 自动重算并写回 | 该用户自己的当前会话在下次登录时写入新 hash；其他旧会话逐请求失效 |
+| 登出其他浏览器会话 | 前端 [LogoutOtherBrowserSessionsForm.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/resources/js/Pages/Profile/Partials/LogoutOtherBrowserSessionsForm.vue) 触发 Fortify 的 logout-other-sessions 路由，内部重算密码哈希并强制重新登录 | 当前浏览器以外的所有会话失效 |
+
+#### Monica 无密码用户的特殊情况
+
+对于纯社交登录用户（`$user->password` 为 `null`）：
+- `getAuthPassword()` 返回 `null`
+- session 中存储的 `login_password_hash_*` 也是 `null`
+- 比对 `null !== null` 为 `false`（即比对通过）
+- 因此无密码用户的会话不会因"密码变更"而被意外失效
+
+这与 [FortifyServiceProvider.php#L44-L50](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Providers/FortifyServiceProvider.php#L44-L50) 中 `confirmPasswordsUsing` 对无密码用户放行的设计保持一致。
+
+### 6. 密码确认（Password Confirmation）
 
 敏感操作前的密码确认机制：
 
