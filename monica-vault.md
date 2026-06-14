@@ -571,6 +571,271 @@ $this->assertDatabaseMissing('user_vault', [
 
 > **安全隐患**：被移除的用户实际上并未失去访问权，只要他知道 Vault 的 URL，仍然可以查看和操作 Vault 中的数据（取决于权限级别）。这是 RemoveVaultAccess 设计中的一个严重漏洞。
 
+### 6.5 被移除管理员的权限放大与反向调用链
+
+**严重漏洞**：被移除的 Vault Manager 不仅仍然拥有访问权，还可以通过 Vault Settings 的三个接口反向操作，实现权限放大。
+
+#### 6.5.1 三级校验全失效：从路由到服务层层层失守
+
+**第一关：路由中间件**（[web.php#L485-L491](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/routes/web.php#L485-L491)）
+```php
+Route::middleware('can:vault-manager,vault')->group(function () {
+    Route::post('settings/users', ...);       // 拉人进 Vault
+    Route::put('settings/users/{user}', ...);  // 改成员权限
+    Route::delete('settings/users/{user}', ...); // 踢成员出 Vault
+});
+```
+- 依赖 Gate `vault-manager` 做第一道拦截
+- 但 Gate 只查 `user_vault.permission <= 100`，不检查 Contact 软删除状态
+
+**第二关：Gate 层**（[AuthServiceProvider.php#L49-L54](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Providers/AuthServiceProvider.php#L49-L54)）
+```php
+Gate::define('vault-manager', function (User $user, $vault): bool {
+    return $user->vaults()
+        ->wherePivotIn('vault_id', [static::id($vault)])
+        ->wherePivot('permission', '<=', 100)  // 只查 permission 字段
+        ->exists();
+});
+```
+- `vaults()` 关系只关联 `user_vault` 表，不 join contacts，自然不检查 `deleted_at`
+- 只要 `user_vault` 记录还在，Gate 就返回 true
+
+**第三关：服务层权限校验**（[BaseService.php#L190-L199](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Services/BaseService.php#L190-L199)）
+```php
+public function validateUserPermissionInVault(int $permission): void
+{
+    $exists = $this->author->vaults()
+        ->where('vaults.id', $this->vault->id)
+        ->wherePivot('permission', '<=', $permission)  // 只查 permission
+        ->exists();
+    // 不检查 Contact 的软删除状态
+}
+```
+- 与 Gate 层如出一辙，同样只查 `user_vault.permission`
+
+**结论**：三道防线都不检查 Contact 的软删除状态，只要 `user_vault` 记录没删，被移除的 Manager 就拥有完整的 Vault 管理权限。
+
+#### 6.5.2 三个接口的反向调用能力
+
+| 接口 | HTTP | 服务 | 所需权限 | 被移除 Manager 可否调用 | 可做什么 |
+|------|------|------|----------|------------------------|----------|
+| `POST /vaults/{vault}/settings/users` | 新增成员 | [GrantVaultAccessToUser.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVaultSettings/Services/GrantVaultAccessToUser.php) | `author_must_be_vault_manager` | ✅ 可以 | 拉同 Account 下的其他用户进 Vault |
+| `DELETE /vaults/{vault}/settings/users/{user}` | 移除成员 | [RemoveVaultAccess.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccess.php) | `author_must_be_vault_manager` | ✅ 可以 | 踢掉其他成员，**甚至可以踢掉当初移除他的那个人** |
+| `PUT /vaults/{vault}/settings/users/{user}` | 修改权限 | [ChangeVaultAccess.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVaultSettings/Services/ChangeVaultAccess.php) | `author_must_be_account_administrator` + `author_must_be_vault_manager` | ❌ 不能（需账户管理员） | — |
+
+**攻击场景**：
+1. Vault 管理员 A 将管理员 B 从 Vault 中移除（执行 RemoveVaultAccess）
+2. B 的身份 Contact 被软删除，但 `user_vault` 记录仍然存在，权限仍是 100
+3. B 仍然可以访问 Vault Settings 的所有接口
+4. B 可以反过来调用 `DELETE /vaults/{vault}/settings/users/A` 将 A 也踢出去
+5. 甚至可以拉自己的小号进 Vault 并设为 Manager
+
+#### 6.5.3 控制器本身无额外校验
+
+三个接口的控制器 [VaultSettingsUserController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsUserController.php) 非常"薄"，只负责组装参数和调用服务：
+
+```php
+public function store(Request $request, string $vaultId)
+{
+    $data = [
+        'account_id' => Auth::user()->account_id,
+        'author_id' => Auth::id(),
+        'vault_id' => $vaultId,
+        'user_id' => $request->input('user_id'),
+        'permission' => $request->input('permission'),
+    ];
+    $user = (new GrantVaultAccessToUser)->execute($data);  // 直接调用，没有额外校验
+    // ...
+}
+```
+
+所有权限逻辑都委托给服务层的 BaseService，而服务层只查 `user_vault` 表——整条调用链上没有任何地方检查用户的"身份 Contact"是否被软删除。
+
+### 6.6 方法注释与代码事实相反的误导
+
+[RemoveVaultAccess.php#L68-L72](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccess.php#L68-L72) 的 `remove()` 方法注释明确承诺：
+
+```php
+/**
+ * Thanks to relational databases, if we delete the contact linked to the
+ * user we want to remove from the vault, it will delete the access in the
+ * `user_vault` table, effectively removing the user's access.
+ */
+```
+
+**翻译**："多亏了关系型数据库，如果我们删除想要从 Vault 中移除的用户关联的 Contact，它会删除 `user_vault` 表中的访问记录，有效移除用户的访问权限。"
+
+**但实际代码**：
+```php
+private function remove(): void
+{
+    $vault = $this->user->vaults()
+        ->wherePivot('vault_id', $this->vault->id)
+        ->first();
+
+    if ($vault !== null) {
+        Contact::find($vault->pivot->contact_id)->delete();  // ← 软删除！
+    }
+}
+```
+
+**矛盾点**：
+- 注释说"delete the contact" → 暗示硬删除
+- 注释说"it will delete the access in the user_vault table" → 承诺级联删除
+- 实际执行的是 `SoftDeletes` 的软删除（UPDATE）→ **不触发**数据库外键级联
+- 最终结果：**`user_vault` 记录还在，用户访问权没丢**
+
+> **注释本身具有误导性**：任何读这段代码的开发者（包括写测试的人）都会自然地认为级联删除是生效的，从而不再追问验证。这也是为什么测试用例写了空过断言也没人发现——因为大家都"相信"注释。
+
+### 6.7 身份查找失效后的真实行为：不是空对象，是直接报错
+
+原文档说"导致业务页面无法正常工作"，但实际情况更严重——**直接抛出致命错误**。
+
+#### 6.7.1 getContactInVault 的返回值
+
+[User.php#L267-L282](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/User.php#L267-L282)：
+```php
+public function getContactInVault(Vault $vault): ?Contact
+{
+    $entry = $this->vaults()
+        ->wherePivot('vault_id', $vault->id)
+        ->first();
+
+    if ($entry === null) {
+        return null;  // user_vault 记录不存在时返回 null
+    }
+
+    try {
+        return Contact::findOrFail($entry->pivot->contact_id);  // Contact 软删除时抛 ModelNotFoundException
+    } catch (ModelNotFoundException) {
+        return null;  // 捕获异常，返回 null
+    }
+}
+```
+
+返回类型是 `?Contact`，即 Contact 或 null。**方法本身是安全的**，找到了返回 Contact 对象，找不到返回 null。
+
+#### 6.7.2 调用方几乎从不检查 null
+
+问题出在**调用方**。全项目 20+ 处调用 `getContactInVault()` 的地方，绝大多数直接链式调用属性或方法，**完全不做 null 检查**。
+
+**典型模式一：直接取 `->id`**（最常见）
+```php
+// VaultShowViewHelper.php#L189
+'contact' => $user->getContactInVault($vault)->id,
+
+// ContactShowViewHelper.php#L63-L64
+'can_be_archived' => $user->getContactInVault($contact->vault)->id !== $contact->id,
+'can_be_deleted' => $user->getContactInVault($contact->vault)->id !== $contact->id,
+```
+- 如果 `getContactInVault()` 返回 null，调用 `->id` 会抛出：
+  - PHP 8.0-: `ErrorException: Trying to get property 'id' of non-object`
+  - PHP 8.1+: `Error: Attempt to read property "id" on null`
+
+**典型模式二：直接调用方法**
+```php
+// VaultCalendarIndexViewHelper.php#L100-L103
+$contact = $user->getContactInVault($vault);
+return $contact->moodTrackingEvents()  // ← null 上调用方法，直接报错
+    ->whereDate('rated_at', $date)
+    ->get();
+```
+- 抛出：`Error: Call to a member function moodTrackingEvents() on null`
+
+**少数做了检查的调用方**
+```php
+// UserHelper.php#L23-L27
+$contact = $user->getContactInVault($vault);
+if (! $contact) {  // ← 正确检查 null
+    return null;
+}
+```
+- 只有 `UserHelper::getInformationAboutContact()` 这一处做了防御性检查
+
+**结论**：身份 Contact 被软删除后，不是"空对象"也不是"优雅降级"，而是**大量页面直接抛出 500 错误**。
+
+### 6.8 身份查找的真实失效面：20+ 处调用点全部中招
+
+`getContactInVault()` 在全项目中有超过 20 处调用，涵盖 Vault 仪表板、联系人详情、日历、生活指标、期刊、DAV 同步等多个核心模块。以下是按模块分类的失效点：
+
+#### 6.8.1 空间仪表板（入口级，全站首页即崩溃）
+
+- **控制器**：[VaultController.php#L68](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultController.php#L68)
+  - `$contact = Auth::user()->getContactInVault($vault);`
+  - 虽然没有直接链式调用，但传给了 ViewHelper，ViewHelper 会链式调用
+- **ViewHelper**：[VaultShowViewHelper.php#L189](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultShowViewHelper.php#L189)
+  - `'contact' => $user->getContactInVault($vault)->id,`
+  - 直接取 id，必崩
+
+#### 6.8.2 联系人详情页（核心功能，打开联系人就崩）
+
+- **ViewHelper**：[ContactShowViewHelper.php#L63-L64](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageContact/Web/ViewHelpers/ContactShowViewHelper.php#L63-L64) 和 [L117-L118](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageContact/Web/ViewHelpers/ContactShowViewHelper.php#L117-L118)
+  - 两处 `$user->getContactInVault($contact->vault)->id !== $contact->id`
+  - 用于判断联系人是否是用户自己，决定是否显示归档/删除按钮
+  - 只要打开任何一个联系人详情页就会崩
+
+#### 6.8.3 日历页面（重要功能，日历入口即崩）
+
+- **ViewHelper**：[VaultCalendarIndexViewHelper.php#L100](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageCalendar/Web/ViewHelpers/VaultCalendarIndexViewHelper.php#L100)
+  - `$contact = $user->getContactInVault($vault);` 后直接调用 `$contact->moodTrackingEvents()`
+  - 日历页面加载心情追踪数据时崩溃
+
+#### 6.8.4 日历重要日期导入（DAV 同步，后台静默失败）
+
+- **DAV 导入服务**：[ImportCalendarContactImportantDates.php#L136](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageContactImportantDates/Dav/ImportCalendarContactImportantDates.php#L136)
+  ```php
+  'contact_id' => optional($importantDate)->contact_id ?? $this->author()->getContactInVault($this->vault())->id,
+  ```
+  - 从日历导入重要日期时，如果联系人不存在，就用"用户自己的身份 Contact"作为归属
+  - 如果身份 Contact 已软删除，DAV 同步任务会直接失败
+
+- **任务导入服务**：[ImportContactTask.php#L138](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/ManageTasks/Dav/ImportContactTask.php#L138)
+  - 同样的模式，DAV 任务导入也会崩
+
+#### 6.8.5 生活指标模块（多个入口全崩）
+
+- **控制器**：
+  - [LifeMetricController.php#L29](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricController.php#L29)
+  - [LifeMetricController.php#L48](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricController.php#L48)
+  - [LifeMetricContactController.php#L27](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricContactController.php#L27)
+- **服务**：[IncrementLifeMetric.php#L46](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageLifeMetrics/Services/IncrementLifeMetric.php#L46)
+- **ViewHelper**：[VaultLifeMetricsViewHelper.php#L24](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageLifeMetrics/Web/ViewHelpers/VaultLifeMetricsViewHelper.php#L24)
+
+#### 6.8.6 期刊与帖子
+
+- **ViewHelper**：[PostShowViewHelper.php#L162](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostShowViewHelper.php#L162)
+  - 查看帖子详情时需要获取用户身份 Contact
+
+#### 6.8.7 心情追踪报告
+
+- **ViewHelper**：[ReportMoodTrackingEventIndexViewHelper.php#L30](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportMoodTrackingEventIndexViewHelper.php#L30)
+
+#### 6.8.8 DAV 客户端推送
+
+- **服务**：[PrepareJobsContactPush.php#L105](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPush.php#L105)
+  - 比较时需要排除用户自己的身份 Contact
+  - DAV 同步功能会受影响
+
+#### 6.8.9 生活事件模块
+
+- **控制器**：[VaultLifeEventController.php#L17](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultLifeEventController.php#L17)
+
+#### 失效程度总览
+
+| 模块 | 失效点数量 | 失效程度 |
+|------|-----------|----------|
+| Vault 仪表板 | 1+ 个 ViewHelper | **入口级崩溃**，打开 Vault 就 500 |
+| 联系人详情 | 2 处（4 次调用） | 打开任何联系人详情页就崩 |
+| 日历 | 1 个 ViewHelper | 日历页面加载失败 |
+| DAV 同步（导入） | 2 个服务 | 日历/任务导入静默失败 |
+| 生活指标 | 3 个控制器 + 1 个服务 + 1 个 ViewHelper | 整个生活指标模块全崩 |
+| 期刊帖子 | 1 个 ViewHelper | 查看帖子详情崩 |
+| 心情追踪报告 | 1 个 ViewHelper | 报告页面崩 |
+| DAV 客户端推送 | 1 个服务 | DAV 同步异常 |
+| 生活事件 | 1 个控制器 | 生活事件页崩 |
+
+**总结**：被移除的 Manager（或任何被移除的用户）虽然"权限校验"仍然通过，但大部分业务页面因为身份 Contact 软删除而直接抛出 500 错误。**这是一种"伪失效"——权限还在，但功能用不了，因为几乎所有需要身份 Contact 的页面都会报错。**
+
 ---
 
 ## 七、完整流程图
