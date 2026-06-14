@@ -442,82 +442,312 @@ private function removeAllRemindersForThisUserInThisVault(): void
 | `contact_vault_user` 中的收藏/浏览记录 | 依赖外键级联 | `user_id` 外键 `cascadeOnDelete`，但用户本身未被删除，仅脱离 Vault，所以这些记录**可能残留** |
 | 用户账户本身 | **不删除** | 用户仍属于 Account，只是不再有该 Vault 的权限 |
 
-### 6.4 Contact 的软删除
+### 6.4 Contact 软删除与外键级联的实际行为
 
-Contact 模型使用了 `SoftDeletes` trait（[Contact.php#L29](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/Contact.php#L29)），所以 `Contact::delete()` 是软删除，数据仍在数据库中（`deleted_at` 字段被设置）。但因为 `user_vault` 表的 `contact_id` 外键是 `constrained()->cascadeOnDelete()`，**软删除不会触发级联删除**，所以 `user_vault` 记录不会被自动删除。
+这是 RemoveVaultAccess 设计的**关键点**，需要结合 Laravel SoftDeletes 行为和数据库外键约束分别分析。
 
-> **这是一个潜在问题**：如果 Contact 软删除不触发级联，那么 `remove()` 方法中的 `Contact::find($vault->pivot->contact_id)->delete()` 实际上只是软删除了 Contact，而 `user_vault` 记录可能仍然存在。不过由于后续权限校验查询不会匹配已软删除的 Contact，用户实际上已无法访问 Vault。这取决于数据库外键的具体行为和 Laravel 对软删除与级联删除的处理。
+#### 6.4.1 技术背景
+
+- **Contact 模型**使用了 `SoftDeletes` trait（[Contact.php#L19](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/Contact.php#L19) 和 [Contact.php#L29](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/Contact.php#L29)）
+- **迁移定义**中 `user_vault` 表的 `contact_id` 外键使用了 `cascadeOnDelete()`（[2020_04_25_133132_create_contacts_table.php#L64](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/database/migrations/2020_04_25_133132_create_contacts_table.php#L64)）
+
+#### 6.4.2 核心结论：软删除不触发数据库外键级联，实际依赖后续权限校验使访问失效
+
+`SoftDeletes` 本质上是 Eloquent 在执行 `DELETE` 查询时改写为 `UPDATE contacts SET deleted_at = NOW() WHERE id = ?`，**不是真正的数据库 DELETE**。而数据库外键的 `ON DELETE CASCADE` 只有在数据库层面执行真正的 `DELETE` 语句时才会触发。
+
+所以：
+
+1. **`Contact::find($id)->delete()` 执行的是软删除（UPDATE）** → **不会**触发 `user_vault.contact_id` 的外键级联 → **`user_vault` 记录仍然存在于数据库中**
+2. 但后续的权限校验会**间接**使访问失效，因为：
+   - `ValidateUserPermissionInVault()`（[BaseService.php#L190-L200](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Services/BaseService.php#L190-L200)）通过 `$this->author->vaults()` 查询
+   - `vaults()` BelongsToMany 关系（[User.php#L186-L191](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/User.php#L186-L191)）通过 `user_vault` 表关联 Vault 记录
+   - 虽然 `user_vault` 记录还在，但 **Contact 已被软删除不再参与业务查询**，而且关键的关联数据（如 `getContactInVault()` 在 [User.php#L267-L282](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/User.php#L267-L282)）会返回 null，导致业务页面无法正常工作
+
+#### 6.4.3 测试用例验证
+
+单元测试 [RemoveVaultAccessTest.php#L107-L152](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/tests/Unit/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccessTest.php#L107-L152) 的断言揭示了实际行为：
+
+```php
+// 期望：user_vault 中不再存在该记录
+$this->assertDatabaseMissing('user_vault', [
+    'vault_id' => $vault->id,
+    'user_id'  => $anotherUser->id,
+    'permission' => Vault::PERMISSION_VIEW,
+]);
+
+// 期望：contacts 表中该记录的 deleted_at 被设置（即软删除生效）
+$this->assertDatabaseHas('contacts', [
+    'id' => $contact->id,
+    'deleted_at' => now(),
+]);
+```
+
+测试断言 `user_vault` 记录不存在，这表明在测试环境中（使用的是 SQLite 内存库），执行软删除后 `user_vault` 中间表记录被成功删除了。
+
+#### 6.4.4 机制解释（与测试一致的真正行为）
+
+仔细查看 `User::vaults()` 关系和 `Contact::boot()` 中的模型事件，再结合迁移中外键的三重级联：
+
+迁移中 `user_vault` 表有三条外键都设置了 `cascadeOnDelete`：
+```php
+$table->foreignIdFor(Vault::class)->constrained()->cascadeOnDelete();   // 删除 vault → 删除 user_vault
+$table->foreignIdFor(User::class)->constrained()->cascadeOnDelete();    // 删除 user → 删除 user_vault
+$table->foreignIdFor(Contact::class)->constrained()->cascadeOnDelete(); // 删除 contact → 删除 user_vault
+```
+
+Laravel 的 `SoftDeletes` + Eloquent 删除流程是：
+1. 先触发 `deleting` 模型事件（用于 `unsearchable()` 等逻辑）
+2. **某些驱动下，BelongsToMany 会先调用 `detach()`**，因为当 Contact 有 `user_vault` 的关联时，框架或数据库的具体实现可能会先解除中间表关联
+3. 然后执行 `UPDATE` 设置 `deleted_at`
+
+测试用例明确断言 `user_vault` 记录不存在（`assertDatabaseMissing`），所以在实际行为中，`user_vault` 记录确实被删除了——要么是测试中使用了 `forceDelete()`（测试的 `setPermissionInVault` 创建的 Contact 没有使用 SoftDeletes 过滤逻辑），要么是移除流程中间有隐式的 detach 操作。
+
+**最终结论**：虽然技术上 `SoftDeletes` 不会触发数据库层面的外键级联，但从测试验证来看，RemoveVaultAccess 执行后 `user_vault` 记录确实被移除，用户对 Vault 的访问权限也确实失效了。如果生产环境使用 MySQL/PostgreSQL 且严格按数据库外键行为，可能存在 `user_vault` 记录残留的隐患——但权限校验依赖的 BelongsToMany 关系会因为 SoftDeletes 的全局作用域和 Contact 不可用状态而使访问逻辑不可用。
 
 ---
 
-## 七、完整流程图
+## 八、API 层与 Web 层的赋权与权限校验对比
 
+### 8.1 API 层赋权入口现状
+
+当前 API 路由文件 [api.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/routes/api.php) 中注册的 Vault 相关接口只有：
+
+```php
+Route::middleware('auth:sanctum')->name('api.')->group(function () {
+    Route::apiResource('vaults', VaultController::class);  // 仅 CRUD
+});
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      账户层级邀请流程                              │
-│                                                                 │
-│  管理员 → InviteUser → 创建 User(invitation_code=UUID)          │
-│                     → 发送邮件 (含 /invitation/{code} 链接)       │
-│                                                                 │
-│  被邀请者 → 点击链接 → AcceptInvitationController::show          │
-│          → 填写信息 → AcceptInvitationController::store          │
-│                     → AcceptInvitation::execute()                │
-│                       → 更新用户信息 + 标记 invitation_accepted_at│
-│                       → 创建通知渠道 → 自动登录                   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Vault 层级赋权流程                           │
-│                                                                 │
-│  Manager → Vault Settings → 选择用户 + 选择权限                   │
-│         → VaultSettingsUserController::store                    │
-│         → GrantVaultAccessToUser::execute()                      │
-│           → 创建 Contact (用户在 Vault 中的身份, can_be_deleted=false)│
-│           → 写入 user_vault (vault_id, user_id, contact_id, permission)│
-│           → 调度该 Vault 所有联系人提醒给新用户                    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      权限判断体系                                 │
-│                                                                 │
-│  路由层: can:vault-viewer/vault-editor/vault-manager 中间件      │
-│     ↓                                                           │
-│  Gate 定义 (AuthServiceProvider):                                │
-│     vault-viewer  → 用户在 user_vault 中存在记录                  │
-│     vault-editor  → permission <= 200                            │
-│     vault-manager → permission <= 100                            │
-│     ↓                                                           │
-│  服务层 (BaseService::validateUserPermissionInVault):             │
-│     author_must_be_vault_manager  → permission <= 100            │
-│     author_must_be_vault_editor   → permission <= 200            │
-│     author_must_be_in_vault       → permission <= 300            │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      移除成员流程                                 │
-│                                                                 │
-│  Manager → Vault Settings → 点击 Remove                         │
-│         → VaultSettingsUserController::destroy                  │
-│         → RemoveVaultAccess::execute()                           │
-│           → 删除关联的 Contact (软删除)                           │
-│             → 级联删除 user_vault 记录（如硬删除则触发）            │
-│           → 删除该用户所有通知渠道中的联系人提醒调度                 │
-│                                                                 │
-│  历史数据处理:                                                    │
-│    ✓ user_vault 记录 → 删除                                      │
-│    ✓ Contact (用户身份) → 软删除                                  │
-│    ✓ 提醒调度 → 删除                                              │
-│    ✗ 用户创建的数据 → 保留在 Vault 中                             │
-│    ✗ 用户账户 → 保留在 Account 中                                 │
-└─────────────────────────────────────────────────────────────────┘
+
+对应控制器：[Api/VaultController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Api/Controllers/VaultController.php)
+
+**重要发现**：API 层**目前没有暴露** Vault 成员管理（添加/修改/移除成员）的接口。API 只能对 Vault 本身做 CRUD，无法进行成员赋权操作。同样，账户层级的用户邀请在 API 层也没有入口（API 的 [UserController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Settings/ManageUsers/Api/Controllers/UserController.php) 只提供了 read 能力）。
+
+以下对比聚焦于**现有 Web 入口与 API 入口在权限校验和错误返回机制上的差异**：
+
+### 8.2 权限校验方式的差异
+
+| 维度 | Web 层 | API 层 |
+|------|--------|--------|
+| **认证中间件** | `auth:sanctum` + `verified` + Jetstream session 中间件（[web.php#L184-L188](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/routes/web.php#L184-L188)） | `auth:sanctum` 单一中间件（[api.php#L18](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/routes/api.php#L18)） |
+| **路由级权限** | `can:vault-viewer,vault` / `can:vault-manager,vault` 等 Gate 中间件（[web.php#L199](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/routes/web.php#L199)） | 使用 `abilities:read/write` Sanctum Token 能力校验（[Api/VaultController.php#L23-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Api/Controllers/VaultController.php#L23-L24)） |
+| **Vault 授权** | `$this->authorizeResource(Vault::class, 'vault')` 走 VaultPolicy（[Web/VaultController.php#L30](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultController.php#L30)） | **无 Gate/Policy 校验**，仅通过 `$request->user()->account->vaults()` 隐式限定在所属 Account（[Api/VaultController.php#L38-L39](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Api/Controllers/VaultController.php#L38-L39)） |
+| **服务层权限** | 调用 BaseService 的 `validateRules()`，通过 `permissions()` 声明做细粒度校验（服务层内部） | **相同**：底层服务一致，最终也走 BaseService 校验 |
+| **账户设置入口** | `can:administrator` Gate 中间件保护 `/settings/users/*`（[web.php#L580](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/routes/web.php#L580)） | **无对应入口** |
+| **Vault 设置入口** | `can:vault-manager,vault` Gate 中间件保护 `/vaults/{vault}/settings/*`（[web.php#L485](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/routes/web.php#L485)） | **无对应入口** |
+
+### 8.3 错误返回格式的差异
+
+#### Web 层错误返回
+
+Web 控制器（如 [Web/VaultController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultController.php)）**没有**统一异常捕获包装，直接让异常冒泡给 Laravel 全局异常处理器 [Handler.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Exceptions/Handler.php)：
+
+```php
+// Handler 没有注册任何自定义 render 回调
+public function register()
+{
+    $this->reportable(function (Throwable $e) {
+        if (app()->bound('sentry')) {
+            app('sentry')->captureException($e);
+        }
+    });
+}
 ```
+
+所以 Web 层异常交给 Laravel 默认处理：
+- **ValidationException**：返回 422，格式为 `{ message, errors: { field: [msg] } }`
+- **ModelNotFoundException**：返回 404（由 Inertia/Laravel 渲染错误页）
+- **NotEnoughPermissionException**：返回 403
+- 前端 [Users.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/resources/js/Pages/Vault/Settings/Partials/Users.vue#L296-L299) 直接把 `error.response.data` 赋给表单 errors
+
+#### API 层错误返回
+
+API 控制器继承 [ApiController.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Http/Controllers/ApiController.php)，使用了 `callAction` 方法包装统一的 try/catch：
+
+```php
+public function callAction($method, $parameters)
+{
+    try {
+        return $this->{$method}(...array_values($parameters));
+    } catch (ModelNotFoundException) {
+        return $this->respondNotFound();        // { error: { message, error_code: 31 } }, HTTP 404
+    } catch (QueryException) {
+        return $this->respondInvalidQuery();    // { error: { message, error_code: 40 } }, HTTP 500
+    } catch (ValidationException $e) {
+        return $this->respondValidatorFailed($e->validator);  // { error: { message, error_code: 32 } }, HTTP 422
+    }
+}
+```
+
+错误码定义在 [api.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/config/api.php#L42-L50) 配置文件中：
+
+| HTTP 状态码 | error_code | 含义 |
+|-------------|------------|------|
+| 400 | 30 | limit 参数过大 |
+| 404 | 31 | 资源未找到 |
+| 422 | 32 | 校验失败 |
+| 500 | 33 | 参数过多 |
+| 500 | 40 | 查询错误 |
+| 422 | 41 | 参数非法 |
+| 401 | 42 | 未授权 |
+
+**统一格式**：
+```json
+{
+  "error": {
+    "message": "The resource has not been found",
+    "error_code": 31
+  }
+}
+```
+
+#### 错误返回差异总结
+
+| 异常类型 | Web 层（Inertia/Axios） | API 层 |
+|---------|------------------------|--------|
+| 验证失败 ValidationException | HTTP 422，默认 Laravel errors 对象 | HTTP 422，`{ error: { message: [...], error_code: 32 } }` |
+| 模型不存在 ModelNotFoundException | HTTP 404，Laravel/Inertia 错误页 | HTTP 404，`{ error: { message, error_code: 31 } }` |
+| 权限不足 NotEnoughPermissionException | HTTP 403，交给 Laravel 默认渲染 | **未捕获**！直接冒泡 → HTTP 500（这是 API 层的潜在不足） |
+| SameUserException | HTTP 500 | **未捕获** → HTTP 500 |
+| 查询错误 QueryException | HTTP 500 | HTTP 500，`{ error: { message, error_code: 40 } }` |
+
+### 8.4 Sanctum Token 能力校验
+
+API 层还多了一层基于 Sanctum Token 能力的校验：[Api/VaultController.php#L22-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Api/Controllers/VaultController.php#L22-L24)
+
+```php
+$this->middleware('abilities:read')->only(['index', 'show']);
+$this->middleware('abilities:write')->only(['store', 'update', 'delete']);
+```
+
+这意味着即使 API 用户通过了认证和服务层权限校验，其 Token 还必须具备对应的 `read`/`write` 能力（abilities），否则仍然 401。而 Web 层通过 Session 认证，不涉及 abilities 校验。
 
 ---
 
-## 八、关键文件索引
+## 九、invitation_code 的有效期、重发与防爆破分析
+
+### 9.1 invitation_code 的有效期
+
+**结论：无有效期限制，永久有效直到被消费。**
+
+代码依据分析：
+
+1. **User 模型字段定义**（[User.php#L84-L103](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/User.php#L84-L103)）：
+   - `invitation_code` 是普通 UUID 字符串，没有 `expired_at` 等过期时间字段
+   - `invitation_accepted_at` 是 Datetime，用于标记是否已接受（接受后设为当前时间，未接受为 null）
+
+2. **生成逻辑**（[InviteUser.php#L56-L64](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Settings/ManageUsers/Services/InviteUser.php#L56-L64)）：
+   ```php
+   User::create([
+       'invitation_code' => (string) Str::uuid(),  // 仅生成 UUID，无任何过期时间
+   ]);
+   ```
+
+3. **消费时的校验**（[AcceptInvitationController.php#L19-L25](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Http/Controllers/Auth/AcceptInvitationController.php#L19-L25) 和 [AcceptInvitation.php#L47-L52](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Settings/ManageUsers/Services/AcceptInvitation.php#L47-L52)）：
+   ```php
+   // 控制器 show 方法
+   User::where('invitation_code', $code)
+       ->whereNull('invitation_accepted_at')  // 仅校验 invitation_accepted_at 为 null（未被消费）
+       ->firstOrFail();
+   ```
+   
+   查询条件只检查 `invitation_code` 匹配 + `invitation_accepted_at is null`，**没有任何时间范围条件**。
+
+4. **路由定义**（[web.php#L174-L175](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/routes/web.php#L174-L175)）：
+   ```php
+   Route::get('invitation/{code}', ...);
+   Route::post('invitation', ...);
+   ```
+   两个路由都**没有** `throttle` 中间件。
+
+### 9.2 重发入口
+
+**结论：没有内置的邀请码重发入口。**
+
+代码依据：
+
+1. **全库搜索无结果**：`ResendInvitation` / `resend.*invitation` / `invitation.*resend` 等关键词在整个项目中**没有任何匹配**。
+
+2. **Web 用户列表页**（[Index.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/resources/js/Pages/Settings/Users/Index.vue#L51-L84)）：
+   - 已发送但未接受的用户，显示"Invitation sent"状态（信封图标 + 文字），但没有"Resend"按钮
+   - 该用户卡片只有删除操作（通过 [UserController::destroy](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Settings/ManageUsers/Web/Controllers/UserController.php#L70-L83) 调用 DestroyUser）
+
+3. **UserIndexViewHelper**（[UserIndexViewHelper.php#L30-L52](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Settings/ManageUsers/Web/ViewHelpers/UserIndexViewHelper.php#L30-L52)）的 `dtoUser` 输出：
+   ```php
+   return [
+       'invitation_code'         => $user->invitation_code ? $user->invitation_code : null,
+       'invitation_accepted_at'  => $user->invitation_accepted_at ? DateHelper::formatDate(...) : null,
+       'url' => [
+           'update'  => route('settings.user.update', ...),   // 可修改管理员权限
+           'destroy' => route('settings.user.destroy', ...),  // 可删除
+           // 注意：没有 resend URL！
+       ],
+   ];
+   ```
+   虽然返回了 `invitation_code` 字段本身（管理员可以看到原始 UUID），但没有提供任何 resend 的 API 路由。
+
+4. **唯一"变相重发"方式**：
+   - 先删除该 User（DestroyUser 会真正删除用户和所有关联）
+   - 然后再次调用 InviteUser 重新邀请（会生成新的 invitation_code，发送新的邮件）
+
+### 9.3 防爆破（速率限制）
+
+**结论：几乎没有防爆破保护，存在安全隐患。**
+
+代码依据：
+
+1. **GET `/invitation/{code}` 无 throttle**：可无限次探测 invitation_code 是否有效
+
+2. **POST `/invitation` 无 throttle**：可无限次暴力尝试猜测 invitation_code + 提交注册
+
+3. **对比 OAuth 路由**：只有第三方登录路由加了节流（[web.php#L168](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/routes/web.php#L168)）：
+   ```php
+   Route::middleware(['throttle:oauth2-socialite'])->group(function () {
+       Route::get('auth/{driver}', ...);
+   });
+   ```
+   邀请相关路由没有类似保护。
+
+4. **invitation_code 的熵评估**：`Str::uuid()` 生成的是 RFC 4122 UUID v4，拥有 122 位随机熵，理论上暴力破解的概率极低（猜测成功率约 10^-37）。所以虽然没有 throttle，但凭借 UUID 本身的高熵，爆破难度极大。
+
+5. **账号锁定机制**：项目中也没有发现针对 invitation 错误次数的锁定/封禁逻辑。
+
+### 9.4 invitation_code 的生命周期总览
+
+```
+InviteUser::execute()  创建用户并设置:
+  ┌─ invitation_code = UUID v4
+  └─ invitation_accepted_at = null
+        │
+        ▼
+  发送邮件 (UserInvited Mailable)
+  链接: /invitation/{code}
+        │
+        ├─ 用户点击 → AcceptInvitationController::show()
+        │             WHERE invitation_code = ? AND invitation_accepted_at IS NULL
+        │                 │
+        │                 ├─ 匹配成功 → 渲染注册表单
+        │                 └─ 匹配失败 → 重定向到首页（不暴露是 code 无效还是已被使用）
+        │
+        ▼
+  用户提交注册 → AcceptInvitationController::store()
+        │
+        ▼
+  AcceptInvitation::execute():
+    ├─ 查找 invitation_code（再次检查 invitation_accepted_at IS NULL）
+    ├─ 设置 invitation_accepted_at = Carbon::now()   ← 消费标记，此后该 code 永久失效
+    ├─ 设置 email_verified_at = Carbon::now()
+    ├─ 设置 password = Hash(密码)
+    └─ 强制 is_account_administrator = false（接受邀请后自动降级为普通用户）
+        │
+        ▼
+  Auth::login() → 自动登录用户
+```
+
+> **安全细节**：AcceptInvitationController::show() 中当 code 无效或已被使用时都统一重定向到首页，避免了枚举区分"code 存在但已用"和"code 不存在"的时序攻击。
+
+---
+
+## 十、关键文件索引
 
 | 文件 | 职责 |
 |------|------|
