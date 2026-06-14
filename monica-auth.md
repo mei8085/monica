@@ -50,7 +50,7 @@ Jetstream 使用 `sanctum` guard，适用于 Inertia 页面和 API：
 
 - [jetstream.php#L47](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/config/jetstream.php#L47)
 
-### 5. Sanctum 用户设置中间件
+### 5. Sanctum 用户设置中间件（SanctumSetUser）
 
 [SanctumSetUser](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Http/Middleware/SanctumSetUser.php) 中间件用于将当前已认证用户同步到 Sanctum guard，并附加一个 `TransientToken`（瞬时令牌），使得 Web 会话用户可以通过 Sanctum 授权检查。
 
@@ -58,6 +58,40 @@ Jetstream 使用 `sanctum` guard，适用于 Inertia 页面和 API：
 // SanctumSetUser.php
 $this->sanctum()->setUser($request->user()->withAccessToken(new TransientToken));
 ```
+
+#### 入栈的门控条件
+
+SanctumSetUser **并非全局 web 中间件**，也不在默认 `web` 中间件组中。它唯一的使用位置是 [EnsureDavRequestsAreStateful](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/app/Http/Middleware/EnsureDavRequestsAreStateful.php#L38-L43) 内部的条件 Pipeline：
+
+```php
+// EnsureDavRequestsAreStateful.php
+public function handle(Request $request, Closure $next)
+{
+    return (new Pipeline($this->app))->send($request)->through(
+        $this->auth->guard()->check()   // 前置条件 1：用户已认证
+            ? $this->authenticated()     //   → 走 authenticated 管道（含 SanctumSetUser）
+            : $this->authenticate()      //   → 走 authenticate 管道（Basic Auth 等）
+    )->then(fn (Request $request) => $next($request));
+}
+
+private function authenticated(): array
+{
+    return $this->app->environment('local')  // 前置条件 2：本地开发环境
+        ? [SanctumSetUser::class]            //   → local 环境才注入 SanctumSetUser
+        : [];                                 //   → 生产环境无任何中间件
+}
+```
+
+三层门控：
+1. **仅 DAV 请求路径**：只有经过 `EnsureDavRequestsAreStateful` 的 `/dav`（CardDAV/CalDAV）请求才可能触发
+2. **用户已认证**：`$this->auth->guard()->check()` 必须返回 true（即 session 已登录或 Basic Auth 已通过）
+3. **本地开发环境**：`$this->app->environment('local')` 必须成立
+
+生产环境下 DAV 的已认证请求不会执行 SanctumSetUser，因为 DAV 请求依赖 Basic Auth 或 Bearer Token 而非 sanctum guard 做授权。
+
+#### 常规 Web 请求的 Sanctum 用户同步机制
+
+对于受 `auth:sanctum` 保护的 Inertia 页面路由（[web.php#L184-L188](file:///d:/fz/0601-1/solo-dogfeeding/code/83-monica/routes/web.php#L184-L188)），Sanctum 的 `Guard::user()` 会自动回退到 `web` session guard 获取用户，因此**不需要** SanctumSetUser。只有在 DAV 这种绕过常规 auth 中间件、手动构建 Pipeline 的场景下，才需要手动同步。
 
 ### 6. User 模型的认证 Trait
 
