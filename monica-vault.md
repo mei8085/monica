@@ -412,7 +412,7 @@ private function remove(): void
 }
 ```
 
-**关键设计**：删除 `user_vault` 关联的 Contact 记录，由于 `user_vault` 表中 `contact_id` 有外键约束（`cascadeOnDelete`），删除 Contact 会**级联删除** `user_vault` 中间表记录，从而移除用户的 Vault 访问权限。
+**关键设计**：设计意图是删除 `user_vault` 关联的 Contact 记录，利用 `user_vault` 表 `contact_id` 外键的 `cascadeOnDelete` 约束级联删除 `user_vault` 中间表记录，从而移除用户的 Vault 访问权限。**但由于 Contact 使用了 SoftDeletes，实际执行的是 UPDATE 而非真正的 DELETE，级联删除不会触发**——详见 6.4 节详细分析。
 
 ### 6.2 清理提醒数据
 
@@ -435,12 +435,12 @@ private function removeAllRemindersForThisUserInThisVault(): void
 
 | 数据 | 处理方式 | 说明 |
 |------|----------|------|
-| `user_vault` 中间表记录 | 级联删除（通过删除 Contact 触发） | 用户不再有 Vault 访问权 |
-| 关联的 Contact 记录 | 直接删除（`Contact::delete()`） | 该用户在 Vault 中的"身份"被移除 |
-| 联系人提醒调度 (`contact_reminder_scheduled`) | 主动删除 | 该用户不再收到此 Vault 的提醒 |
+| `user_vault` 中间表记录 | **仍然存在**，不会被删除 | 软删除是 UPDATE 语句，不触发数据库外键级联，记录永久残留 |
+| 关联的 Contact 记录 | 软删除（`deleted_at` 设为当前时间） | 该用户在 Vault 中的"身份"被软删除，但数据仍在 |
+| 联系人提醒调度 (`contact_reminder_scheduled`) | 主动删除 | 该用户不再收到此 Vault 的提醒（通过遍历删除） |
 | 用户创建的联系人、笔记等数据 | **不删除**，仍保留在 Vault 中 | 数据归属 Vault，不随用户移除而消失 |
-| `contact_vault_user` 中的收藏/浏览记录 | 依赖外键级联 | `user_id` 外键 `cascadeOnDelete`，但用户本身未被删除，仅脱离 Vault，所以这些记录**可能残留** |
-| 用户账户本身 | **不删除** | 用户仍属于 Account，只是不再有该 Vault 的权限 |
+| `contact_vault_user` 中的收藏/浏览记录 | **仍然存在** | 用户本身未被删除，中间表记录不会因外键级联删除 |
+| 用户账户本身 | **不删除** | 用户仍属于 Account，只是不再有该 Vault 的身份 Contact |
 
 ### 6.4 Contact 软删除与外键级联的实际行为
 
@@ -451,58 +451,196 @@ private function removeAllRemindersForThisUserInThisVault(): void
 - **Contact 模型**使用了 `SoftDeletes` trait（[Contact.php#L19](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/Contact.php#L19) 和 [Contact.php#L29](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/Contact.php#L29)）
 - **迁移定义**中 `user_vault` 表的 `contact_id` 外键使用了 `cascadeOnDelete()`（[2020_04_25_133132_create_contacts_table.php#L64](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/database/migrations/2020_04_25_133132_create_contacts_table.php#L64)）
 
-#### 6.4.2 核心结论：软删除不触发数据库外键级联，实际依赖后续权限校验使访问失效
+#### 6.4.2 核心结论：软删除不触发外键级联，且**不影响权限校验通过**，被移除用户仍能访问 Vault
 
 `SoftDeletes` 本质上是 Eloquent 在执行 `DELETE` 查询时改写为 `UPDATE contacts SET deleted_at = NOW() WHERE id = ?`，**不是真正的数据库 DELETE**。而数据库外键的 `ON DELETE CASCADE` 只有在数据库层面执行真正的 `DELETE` 语句时才会触发。
 
 所以：
 
 1. **`Contact::find($id)->delete()` 执行的是软删除（UPDATE）** → **不会**触发 `user_vault.contact_id` 的外键级联 → **`user_vault` 记录仍然存在于数据库中**
-2. 但后续的权限校验会**间接**使访问失效，因为：
-   - `ValidateUserPermissionInVault()`（[BaseService.php#L190-L200](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Services/BaseService.php#L190-L200)）通过 `$this->author->vaults()` 查询
-   - `vaults()` BelongsToMany 关系（[User.php#L186-L191](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/User.php#L186-L191)）通过 `user_vault` 表关联 Vault 记录
-   - 虽然 `user_vault` 记录还在，但 **Contact 已被软删除不再参与业务查询**，而且关键的关联数据（如 `getContactInVault()` 在 [User.php#L267-L282](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/User.php#L267-L282)）会返回 null，导致业务页面无法正常工作
+2. **权限校验不会因此失效**——关键原因逐层分析如下：
 
-#### 6.4.3 测试用例验证
+##### 6.4.2.1 权限校验的查询逻辑完全不涉及 Contact 表
 
-单元测试 [RemoveVaultAccessTest.php#L107-L152](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/tests/Unit/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccessTest.php#L107-L152) 的断言揭示了实际行为：
-
+**Gate 层**（[AuthServiceProvider.php#L36-L54](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Providers/AuthServiceProvider.php#L36-L54)）：
 ```php
-// 期望：user_vault 中不再存在该记录
+Gate::define('vault-viewer', function (User $user, $vault): bool {
+    return $user->vaults()                         // 查 user_vault 表
+        ->wherePivotIn('vault_id', [static::id($vault)])
+        ->exists();                                  // 只要 user_vault 中有记录就返回 true
+});
+
+Gate::define('vault-editor', function (User $user, $vault): bool {
+    return $user->vaults()
+        ->wherePivotIn('vault_id', [static::id($vault)])
+        ->wherePivot('permission', '<=', 200)       // 只查 permission 字段
+        ->exists();
+});
+```
+
+**服务层**（[BaseService.php#L190-L199](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Services/BaseService.php#L190-L199)）：
+```php
+public function validateUserPermissionInVault(int $permission): void
+{
+    $exists = $this->author->vaults()              // 查 user_vault 表
+        ->where('vaults.id', $this->vault->id)
+        ->wherePivot('permission', '<=', $permission)  // 只查 permission 字段
+        ->exists();
+    // 不检查 Contact 的任何状态
+}
+```
+
+**User::vaults() 关系定义**（[User.php#L186-L191](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/User.php#L186-L191)）：
+```php
+public function vaults(): BelongsToMany
+{
+    return $this->belongsToMany(Vault::class)       // 只关联 user_vault 中间表 + vaults 表
+        ->withPivot('permission', 'contact_id')     // 不 join contacts 表
+        ->withTimestamps();
+}
+```
+
+**关键结论**：所有权限校验查询都只查 `user_vault` 中间表的 `permission` 字段，**不 join contacts 表，也不检查 `deleted_at` 状态**。只要 `user_vault` 记录还在，被移除用户的权限校验就仍然通过。
+
+##### 6.4.2.2 唯一会失效的地方：依赖 `getContactInVault()` 的业务逻辑
+
+**[getContactInVault()](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Models/User.php#L267-L282)** 是少数会实际查询 Contact 的方法：
+```php
+public function getContactInVault(Vault $vault): ?Contact
+{
+    $entry = $this->vaults()
+        ->wherePivot('vault_id', $vault->id)
+        ->first();
+
+    if ($entry === null) {
+        return null;
+    }
+
+    try {
+        return Contact::findOrFail($entry->pivot->contact_id);  // 会因 SoftDeletes 全局作用域抛出 ModelNotFoundException
+    } catch (ModelNotFoundException) {
+        return null;
+    }
+}
+```
+
+这个方法在 [VaultController::show()](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultController.php#L68) 等页面入口被调用，用于获取当前用户在 Vault 中的身份 Contact。如果该 Contact 已软删除，这里会返回 null，导致部分页面（如 Vault 仪表板）因缺少必要数据而无法正常渲染。
+
+但**不依赖 `getContactInVault()` 的 API 或页面（如联系人列表、笔记列表等）仍然可以正常访问**，因为它们的权限校验只走 Gate 层和服务层。
+
+#### 6.4.3 测试用例的 Bug：断言权限值不一致，永远空过
+
+单元测试 [RemoveVaultAccessTest.php#L107-L152](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/tests/Unit/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccessTest.php#L107-L152) 存在严重缺陷：
+
+**实际写入**（[RemoveVaultAccessTest.php#L33-L36](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/tests/Unit/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccessTest.php#L33-L36)）：
+```php
+$vault->users()->save($anotherUser, [
+    'permission' => Vault::PERMISSION_MANAGE,   // 写入 100
+    'contact_id' => $contact->id,
+]);
+```
+
+**断言检查**（[RemoveVaultAccessTest.php#L137-L141](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/tests/Unit/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccessTest.php#L137-L141)）：
+```php
 $this->assertDatabaseMissing('user_vault', [
     'vault_id' => $vault->id,
     'user_id'  => $anotherUser->id,
-    'permission' => Vault::PERMISSION_VIEW,
-]);
-
-// 期望：contacts 表中该记录的 deleted_at 被设置（即软删除生效）
-$this->assertDatabaseHas('contacts', [
-    'id' => $contact->id,
-    'deleted_at' => now(),
+    'permission' => Vault::PERMISSION_VIEW,      // 检查 300
 ]);
 ```
 
-测试断言 `user_vault` 记录不存在，这表明在测试环境中（使用的是 SQLite 内存库），执行软删除后 `user_vault` 中间表记录被成功删除了。
+**问题**：写入的是 `PERMISSION_MANAGE=100`，但断言检查的是 `PERMISSION_VIEW=300`。数据库里本来就不存在 `permission=300` 的记录，所以无论 `user_vault` 记录是否被删除，这条断言**永远通过**（空过），测试完全没有验证级联删除是否生效。
 
-#### 6.4.4 机制解释（与测试一致的真正行为）
-
-仔细查看 `User::vaults()` 关系和 `Contact::boot()` 中的模型事件，再结合迁移中外键的三重级联：
-
-迁移中 `user_vault` 表有三条外键都设置了 `cascadeOnDelete`：
+**正确的断言**应该是：
 ```php
-$table->foreignIdFor(Vault::class)->constrained()->cascadeOnDelete();   // 删除 vault → 删除 user_vault
-$table->foreignIdFor(User::class)->constrained()->cascadeOnDelete();    // 删除 user → 删除 user_vault
-$table->foreignIdFor(Contact::class)->constrained()->cascadeOnDelete(); // 删除 contact → 删除 user_vault
+$this->assertDatabaseMissing('user_vault', [
+    'vault_id' => $vault->id,
+    'user_id'  => $anotherUser->id,
+    'permission' => Vault::PERMISSION_MANAGE,    // 应该和写入一致
+]);
 ```
 
-Laravel 的 `SoftDeletes` + Eloquent 删除流程是：
-1. 先触发 `deleting` 模型事件（用于 `unsearchable()` 等逻辑）
-2. **某些驱动下，BelongsToMany 会先调用 `detach()`**，因为当 Contact 有 `user_vault` 的关联时，框架或数据库的具体实现可能会先解除中间表关联
-3. 然后执行 `UPDATE` 设置 `deleted_at`
+另外，辅助方法 `setPermissionInVault()`（[TestCase.php#L69-L80](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/tests/TestCase.php#L69-L80)）也有同样的模式——创建独立的 Contact 用于测试，但没有验证级联行为。
 
-测试用例明确断言 `user_vault` 记录不存在（`assertDatabaseMissing`），所以在实际行为中，`user_vault` 记录确实被删除了——要么是测试中使用了 `forceDelete()`（测试的 `setPermissionInVault` 创建的 Contact 没有使用 SoftDeletes 过滤逻辑），要么是移除流程中间有隐式的 detach 操作。
+#### 6.4.4 最终修正结论
 
-**最终结论**：虽然技术上 `SoftDeletes` 不会触发数据库层面的外键级联，但从测试验证来看，RemoveVaultAccess 执行后 `user_vault` 记录确实被移除，用户对 Vault 的访问权限也确实失效了。如果生产环境使用 MySQL/PostgreSQL 且严格按数据库外键行为，可能存在 `user_vault` 记录残留的隐患——但权限校验依赖的 BelongsToMany 关系会因为 SoftDeletes 的全局作用域和 Contact 不可用状态而使访问逻辑不可用。
+1. **`user_vault` 记录不会被级联删除**：软删除是 UPDATE 语句，不触发数据库外键的 ON DELETE CASCADE，中间表记录**始终存在**。
+2. **权限校验不受影响**：Gate 和服务层校验只查 `user_vault` 表，不检查 Contact 的软删除状态，被移除用户**仍然通过权限校验，可以正常访问 Vault 内容**。
+3. **只有特定业务页面失效**：依赖 `getContactInVault()` 的页面（如 Vault 仪表板）会因 Contact 软删除返回 null 而无法正常渲染，但不依赖该方法的页面（如联系人列表）仍可正常访问。
+4. **测试用例存在缺陷**：断言的权限值与实际写入不一致，导致测试永远通过，没有真正验证级联删除行为。
+
+> **安全隐患**：被移除的用户实际上并未失去访问权，只要他知道 Vault 的 URL，仍然可以查看和操作 Vault 中的数据（取决于权限级别）。这是 RemoveVaultAccess 设计中的一个严重漏洞。
+
+---
+
+## 七、完整流程图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      账户层级邀请流程                              │
+│                                                                 │
+│  管理员 → InviteUser → 创建 User(invitation_code=UUID)          │
+│                     → 发送邮件 (含 /invitation/{code} 链接)       │
+│                                                                 │
+│  被邀请者 → 点击链接 → AcceptInvitationController::show          │
+│          → 填写信息 → AcceptInvitationController::store          │
+│                     → AcceptInvitation::execute()                │
+│                       → 更新用户信息 + 标记 invitation_accepted_at│
+│                       → 创建通知渠道 → 自动登录                   │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      Vault 层级赋权流程                           │
+│                                                                 │
+│  Manager → Vault Settings → 选择用户 + 选择权限                   │
+│         → VaultSettingsUserController::store                    │
+│         → GrantVaultAccessToUser::execute()                      │
+│           → 创建 Contact (用户在 Vault 中的身份, can_be_deleted=false)│
+│           → 写入 user_vault (vault_id, user_id, contact_id, permission)│
+│           → 调度该 Vault 所有联系人提醒给新用户                    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      权限判断体系                                 │
+│                                                                 │
+│  路由层: can:vault-viewer/vault-editor/vault-manager 中间件      │
+│     ↓                                                           │
+│  Gate 定义 (AuthServiceProvider):                                │
+│     vault-viewer  → 用户在 user_vault 中存在记录                  │
+│     vault-editor  → permission <= 200                            │
+│     vault-manager → permission <= 100                            │
+│     ↓                                                           │
+│  服务层 (BaseService::validateUserPermissionInVault):             │
+│     author_must_be_vault_manager  → permission <= 100            │
+│     author_must_be_vault_editor   → permission <= 200            │
+│     author_must_be_in_vault       → permission <= 300            │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      移除成员流程                                 │
+│                                                                 │
+│  Manager → Vault Settings → 点击 Remove                         │
+│         → VaultSettingsUserController::destroy                  │
+│         → RemoveVaultAccess::execute()                           │
+│           → 删除关联的 Contact (软删除: UPDATE deleted_at)       │
+│             → ⚠️  user_vault 记录仍然存在!           │
+│             → ⚠️  权限校验仍然通过 (只查 user_vault, 不查 Contact)│
+│             → ⚠️  被移除用户仍可访问 Vault!                     │
+│           → 删除该用户所有通知渠道中的联系人提醒调度                 │
+│                                                                 │
+│  历史数据处理:                                                    │
+│    ✗ user_vault 记录 → 仍然存在 (权限校验仍然通过!)              │
+│    ✓ Contact (用户身份) → 软删除 (deleted_at 已设置)             │
+│    ✓ 提醒调度 → 删除                                              │
+│    ✗ 用户创建的数据 → 保留在 Vault 中                             │
+│    ✗ 用户账户 → 保留在 Account 中                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+> **⚠️ 安全警告**：移除成员的级联删除设计存在漏洞。被移除用户仍然拥有访问权，可正常访问 Vault 内容。
 
 ---
 
@@ -661,33 +799,49 @@ $this->middleware('abilities:write')->only(['store', 'update', 'delete']);
 
 ### 9.2 重发入口
 
-**结论：没有内置的邀请码重发入口。**
+**结论：有两种变相重发方式，无需删除用户即可实现。**
 
-代码依据：
+#### 方式一：管理员从接口响应获取 invitation_code 直接拼接链接（无需删除用户）
 
-1. **全库搜索无结果**：`ResendInvitation` / `resend.*invitation` / `invitation.*resend` 等关键词在整个项目中**没有任何匹配**。
+这是最便捷的重发方式，代码依据如下：
 
-2. **Web 用户列表页**（[Index.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/resources/js/Pages/Settings/Users/Index.vue#L51-L84)）：
-   - 已发送但未接受的用户，显示"Invitation sent"状态（信封图标 + 文字），但没有"Resend"按钮
-   - 该用户卡片只有删除操作（通过 [UserController::destroy](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Settings/ManageUsers/Web/Controllers/UserController.php#L70-L83) 调用 DestroyUser）
-
-3. **UserIndexViewHelper**（[UserIndexViewHelper.php#L30-L52](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Settings/ManageUsers/Web/ViewHelpers/UserIndexViewHelper.php#L30-L52)）的 `dtoUser` 输出：
+1. **ViewHelper 返回 invitation_code 字段**（[UserIndexViewHelper.php#L30-L52](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Settings/ManageUsers/Web/ViewHelpers/UserIndexViewHelper.php#L30-L52)）：
    ```php
-   return [
-       'invitation_code'         => $user->invitation_code ? $user->invitation_code : null,
-       'invitation_accepted_at'  => $user->invitation_accepted_at ? DateHelper::formatDate(...) : null,
-       'url' => [
-           'update'  => route('settings.user.update', ...),   // 可修改管理员权限
-           'destroy' => route('settings.user.destroy', ...),  // 可删除
-           // 注意：没有 resend URL！
-       ],
-   ];
+   public static function dtoUser(User $user, User $loggedUser): array
+   {
+       return [
+           'id' => $user->id,
+           'email' => $user->email,
+           'invitation_code'         => $user->invitation_code ? $user->invitation_code : null,  // ← 直接返回原始 UUID
+           'invitation_accepted_at'  => $user->invitation_accepted_at ? DateHelper::formatDate(...) : null,
+           // ...
+       ];
+   }
    ```
-   虽然返回了 `invitation_code` 字段本身（管理员可以看到原始 UUID），但没有提供任何 resend 的 API 路由。
+   只要用户还没接受邀请（`invitation_accepted_at is null`），接口就会将 `invitation_code` 明文返回给前端。
 
-4. **唯一"变相重发"方式**：
-   - 先删除该 User（DestroyUser 会真正删除用户和所有关联）
-   - 然后再次调用 InviteUser 重新邀请（会生成新的 invitation_code，发送新的邮件）
+2. **前端虽然没有直接显示，但数据已传递**（[Index.vue](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/resources/js/Pages/Settings/Users/Index.vue#L51-L84)）：
+   - 前端 UI 只显示 "Invitation sent" 状态（信封图标 + 文字），没有直接显示 `invitation_code`
+   - 但通过 Inertia 的响应数据，管理员可以在浏览器开发者工具的 Network 面板中看到完整的 `invitation_code` 字段值
+
+3. **拼接链接直接可用**：
+   路由定义（[web.php#L174](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/routes/web.php#L174)）：
+   ```php
+   Route::get('invitation/{code}', ...)->name('invitation.show');
+   ```
+   管理员只需将获取到的 `invitation_code` 拼接到 URL：
+   ```
+   https://your-monica-domain/invitation/{invitation_code}
+   ```
+   直接发送给被邀请人即可，无需通过系统重新发送邮件。
+
+#### 方式二：删除后重新邀请（会生成新的 invitation_code）
+
+如果希望生成新的邀请码：
+- 先删除该 User（[DestroyUser.php](file:///d:/fz/0601-1/solo-dogfeeding/code/82-monica/app/Domains/Settings/ManageUsers/Services/DestroyUser.php) 会真正删除用户和所有关联）
+- 然后再次调用 InviteUser 重新邀请（会生成新的 invitation_code，发送新的邮件）
+
+> **注意**：全库搜索 `ResendInvitation` / `resend.*invitation` 等关键词**没有任何匹配**，说明项目**确实没有提供官方的重发按钮或 API**。上述方式一属于"利用现有数据结构的变通做法"。
 
 ### 9.3 防爆破（速率限制）
 
