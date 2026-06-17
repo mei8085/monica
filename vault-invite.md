@@ -436,6 +436,181 @@ public function validateUserPermissionInVault(int $permission): void
 - `update()` - 修改用户权限（PUT），调用 `ChangeVaultAccess`
 - `destroy()` - 移除用户（DELETE），调用 `RemoveVaultAccess`
 
+### 6.10 权限值校验边界：只校验 integer 带来的风险
+
+`GrantVaultAccessToUser` 和 `ChangeVaultAccess` 两个服务的 `rules()` 方法中，对 `permission` 字段的校验完全相同：
+
+```php
+// GrantVaultAccessToUser::rules() 第 29 行 / ChangeVaultAccess::rules() 第 26 行
+'permission' => 'required|integer',
+```
+
+**仅校验类型为整数，不校验具体数值范围**。这带来以下边界情况：
+
+| 问题 | 表现 | 影响 |
+|------|------|------|
+| **非三档值可写入** | 可以传入任意整数（如 1, 50, 99, 150, 250, 999 等） | 权限判断使用 `<=` 比较，数值越小权限越高。写入 50 将获得比 MANAGE(100) 更高的权限，写入 999 将获得比 VIEW(300) 更低的权限（无法通过任何 Gate 校验） |
+| **前端限制可绕过** | 前端 [Users.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/16-monica/resources/js/Pages/Vault/Settings/Partials/Users.vue) 通过单选按钮硬编码 value="100"/"200"/"300"，但直接调用 API 可绕过 | API 层面无防护，恶意调用可能越权 |
+| **负数和零值** | 可以传入 0 或负数 | 这些值 < 100，将获得"超级管理员"权限 |
+
+**代码层面没有任何 `in:100,200,300` 或 `min`/`max` 校验规则**，这是一个明显的安全边界漏洞。
+
+### 6.11 重复授权边界：同一用户重复授权产生多条 user_vault 关系
+
+#### 数据库层面：缺少唯一约束
+
+`user_vault` 表定义（`database/migrations/2020_04_25_133132_create_contacts_table.php` 第 61-67 行）：
+
+```php
+Schema::create('user_vault', function (Blueprint $table) {
+    $table->foreignIdFor(Vault::class)->constrained()->cascadeOnDelete();
+    $table->foreignIdFor(User::class)->constrained()->cascadeOnDelete();
+    $table->foreignIdFor(Contact::class)->constrained()->cascadeOnDelete();
+    $table->integer('permission');
+    $table->timestamps();
+    // 没有 $table->unique(['vault_id', 'user_id'])
+});
+```
+
+**没有对 `(vault_id, user_id)` 建立唯一索引**，数据库层面允许多条相同 `vault_id + user_id` 的记录。
+
+#### 代码层面：无存在性检查
+
+`GrantVaultAccessToUser::grant()` 第 72-86 行：
+
+```php
+private function grant(): void
+{
+    $contact = Contact::create([...]);  // 每次都创建新的联系人
+
+    $this->vault->users()->save($this->user, [
+        'permission' => $this->data['permission'],
+        'contact_id' => $contact->id,
+    ]);
+}
+```
+
+- `validate()` 方法只检查目标用户属于同一账户且不是给自己授权
+- **没有检查用户是否已经在该保险柜中**
+- `$this->vault->users()->save(...)` 在多对多关系中总是插入新记录（不同于 `sync()`）
+
+**结论：对同一用户重复调用 `GrantVaultAccessToUser`，会产生多条 `user_vault` 记录，同时产生多个 `can_be_deleted = false` 的联系人记录。**
+
+#### 前端层面：间接防止重复
+
+在 [Users.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/16-monica/resources/js/Pages/Vault/Settings/Partials/Users.vue) 的 `store()` 方法第 288-292 行：
+
+```js
+// 成功后从可添加列表中移除
+var id = this.localUsersInAccount.findIndex((x) => x.id === this.form.user_id);
+this.localUsersInAccount.splice(id, 1);
+```
+
+用户添加成功后，前端立即将其从"可添加用户"列表中移除，防止界面上的重复操作。但这是前端逻辑，API 调用仍可绕过。
+
+#### 测试层面：无重复授权测试
+
+[GrantVaultAccessToUserTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/16-monica/tests/Unit/Domains/Vault/ManageVaultSettings/Services/GrantVaultAccessToUserTest.php) 中没有覆盖"同一用户重复授权"的场景，测试用例只验证了正常授权流程。
+
+### 6.12 重复关系下的操作行为分析
+
+当同一用户在 `user_vault` 表中有多条记录时，各操作的行为如下：
+
+#### 6.12.1 权限判断：取最高权限
+
+`AuthServiceProvider` 中的 Gate 使用 `exists()` 判断：
+
+```php
+Gate::define('vault-editor', function (User $user, $vault): bool {
+    return $user->vaults()
+        ->wherePivotIn('vault_id', [static::id($vault)])
+        ->wherePivot('permission', '<=', 200)
+        ->exists();
+});
+```
+
+`BaseService::validateUserPermissionInVault()` 同样使用 `exists()`：
+
+```php
+public function validateUserPermissionInVault(int $permission): void
+{
+    $exists = $this->author->vaults()
+        ->where('vaults.id', $this->vault->id)
+        ->wherePivot('permission', '<=', $permission)
+        ->exists();
+}
+```
+
+**行为**：只要有任意一条记录满足 `permission <= N`，就返回 `true`。
+
+**影响**：如果用户有两条记录，一条 permission=100（MANAGE），一条 permission=300（VIEW），则该用户拥有 MANAGE 权限。重复授权只会"升高"或"保持"权限，不会降低。
+
+#### 6.12.2 修改权限：只改第一条记录
+
+`ChangeVaultAccess::change()` 第 69-79 行：
+
+```php
+private function change(): void
+{
+    $this->user->vaults()
+        ->where('vault_id', $this->vault->id)
+        ->first()  // ← 只取第一条
+        ->pivot
+        ->update([
+            'permission' => $this->data['permission'],
+        ]);
+}
+```
+
+**行为**：`first()` 只返回按主键升序排列的第一条匹配记录。
+
+**影响**：
+- 如果存在多条记录，只有最旧的那条（id 最小）的 permission 会被更新
+- 其他记录保持原值不变
+- 如果第一条记录权限被降低（如 100 → 300），但第二条记录仍为 100，则用户实际权限仍然是 MANAGE
+- **前端显示可能与实际权限不符**
+
+#### 6.12.3 移除权限：只删第一条记录
+
+`RemoveVaultAccess::remove()` 第 73-82 行：
+
+```php
+private function remove(): void
+{
+    $vault = $this->user->vaults()
+        ->wherePivot('vault_id', $this->vault->id)
+        ->first()  // ← 只取第一条
+        ->first();
+
+    if ($vault !== null) {
+        Contact::find($vault->pivot->contact_id)->delete();
+    }
+}
+```
+
+**行为**：`first()` 只返回第一条匹配记录，删除其关联的 Contact（级联删除 user_vault 记录）。
+
+**影响**：
+- 如果存在多条记录，只有第一条被删除
+- 其他记录仍然存在，用户权限不变
+- **出现"已移除但仍有权限"的不一致状态**
+
+#### 6.12.4 提醒调度：重复调度但幂等
+
+每次调用 `GrantVaultAccessToUser` 都会触发 `scheduleContactReminders()`（第 92-111 行），遍历所有联系人提醒并调用 `ScheduleContactReminderForUser`。
+
+`ScheduleContactReminderForUser::schedule()` 第 85 行使用 `syncWithoutDetaching`：
+
+```php
+$this->contactReminder->userNotificationChannels()->syncWithoutDetaching([$channel->id => [
+    'scheduled_at' => $this->upcomingDate->tz('UTC'),
+]]);
+```
+
+**行为**：`syncWithoutDetaching` 是幂等操作——如果关联已存在则更新 `scheduled_at`，不存在则创建。
+
+**影响**：重复授权不会产生重复的提醒调度记录，只会刷新调度时间。这是唯一在重复关系下行为正确的操作。
+
 ---
 
 ## 七、完整协同流程
