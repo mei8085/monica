@@ -46,7 +46,7 @@ contact_feed_items
 
 **核心设计：action 常量 + feedable 多态关联**
 
-- `action` 字段用一个字符串常量表示"发生了什么"，在 `ContactFeedItem` 模型中定义了 **30 种操作类型**（完整列表见下文 2.3 节）。
+- `action` 字段用一个字符串常量表示"发生了什么"，在 `ContactFeedItem` 模型中定义了 **38 个** `ACTION_*` 常量（完整清单见 2.3 节）。
 
 - `feedable` 是 Laravel 的多态关联（`MorphTo`），指向被操作的实体对象。这使得在渲染 Feed 条目时，可以直接拿到原始对象的完整数据。
 
@@ -106,7 +106,7 @@ TimelineEvent (时间线事件，如"南极之旅")
 
 `TimelineEvent` 模型有一个计算属性 `range`，通过查询其下所有 `LifeEvent` 的最早和最晚 `happened_at`，自动生成日期范围字符串。
 
-### 2.3 Feed 产生的完整入口：30 种操作 × Service 层
+### 2.3 Feed 产生的完整入口：38 个常量 × 35 个 Service
 
 Feed 条目不是在 Controller 中直接创建的，而是在各领域 Service 的 `execute()` 方法末尾调用 `createFeedItem()` 私有方法。这是一种 **"写时记录"（Write-Ahead Logging）** 模式——每次对联系人的写操作，都会自动追加一条 Feed 条目。
 
@@ -129,67 +129,76 @@ execute()
         └── $this->note->feedItem()->save($feedItem)   ← 通过多态关联绑定
 ```
 
-#### 2.3.2 完整的 30 种 Feed 来源清单
+#### 2.3.2 完整的 38 个 action 常量清单
 
-`ContactFeedItem` 模型中定义了 30 个 `ACTION_*` 常量，对应 30 种操作类型。这些操作分布在 26 个 Service 类中：
+`ContactFeedItem` 模型中定义了 38 个 `ACTION_*` 常量。下表逐一列举，分布在 35 个 Service 类中实际使用了其中 35 个。
 
-| 操作分类 | Action 常量 | Service 文件 | 是否绑定 feedable |
+| 分类 | Action 常量 | 实际使用的 Service | 是否绑定 feedable |
 |---|---|---|---|
-| **联系人基础操作** | | | |
-| 创建联系人 | `ACTION_CONTACT_CREATED` | [CreateContact.php#L121-L128](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContact/Services/CreateContact.php#L121-L128) | 否 |
-| 更新联系人信息 | `ACTION_INFORMATION_UPDATED` | [UpdateContact.php#L111-L118](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContact/Services/UpdateContact.php#L111-L118) | 否 |
-| 归档联系人 | `ACTION_ARCHIVED_CONTACT` | [ToggleArchiveContact.php#L69-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContact/Services/ToggleArchiveContact.php#L69-L76) | 否 |
-| 取消归档联系人 | `ACTION_UNARCHIVED_CONTACT` | [ToggleArchiveContact.php#L69-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContact/Services/ToggleArchiveContact.php#L69-L76) | 否 |
-| 收藏联系人 | `ACTION_FAVORITED_CONTACT` | [ToggleFavoriteContact.php#L98-L105](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContact/Services/ToggleFavoriteContact.php#L98-L105) | 否 |
-| 取消收藏联系人 | `ACTION_UNFAVORITED_CONTACT` | [ToggleFavoriteContact.php#L98-L105](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContact/Services/ToggleFavoriteContact.php#L98-L105) | 否 |
-| 更新头像 | `ACTION_CHANGE_AVATAR` | [UpdatePhotoAsAvatar.php#L91-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageAvatar/Services/UpdatePhotoAsAvatar.php#L91-L98) | 否 |
-| 删除头像 | `ACTION_CHANGE_AVATAR` | [DestroyAvatar.php#L76-L83](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageAvatar/Services/DestroyAvatar.php#L76-L83) | 否 |
-| 更新工作信息 | `ACTION_JOB_INFORMATION_UPDATED` | [UpdateJobInformation.php#L62-L66](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageJobInformation/Services/UpdateJobInformation.php#L62-L66) | 否 |
-| 更新宗教信仰 | `ACTION_RELIGION_UPDATED` | [UpdateReligion.php#L58-L62](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageReligion/Services/UpdateReligion.php#L58-L62) | 否 |
-| **重要日期** | | | |
-| 创建重要日期 | `ACTION_IMPORTANT_DATE_CREATED` | [CreateContactImportantDate.php#L89-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactImportantDates/Services/CreateContactImportantDate.php#L89-L99) | 是 → ContactImportantDate |
-| 更新重要日期 | `ACTION_IMPORTANT_DATE_UPDATED` | [UpdateContactImportantDate.php#L90-L100](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactImportantDates/Services/UpdateContactImportantDate.php#L90-L100) | 是 → ContactImportantDate |
-| 删除重要日期 | `ACTION_IMPORTANT_DATE_DESTROYED` | [DestroyContactImportantDate.php#L65-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactImportantDates/Services/DestroyContactImportantDate.php#L65-L73) | 否（实体已删） |
-| **笔记** | | | |
-| 创建笔记 | `ACTION_NOTE_CREATED` | [CreateNote.php#L74-L83](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageNotes/Services/CreateNote.php#L74-L83) | 是 → Note |
-| 更新笔记 | `ACTION_NOTE_UPDATED` | [UpdateNote.php#L74-L83](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageNotes/Services/UpdateNote.php#L74-L83) | 是 → Note |
-| 删除笔记 | `ACTION_NOTE_DESTROYED` | [DestroyNote.php#L60-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageNotes/Services/DestroyNote.php#L60-L68) | 否（先记再删） |
-| **联系方式** | | | |
-| 创建联系方式 | `ACTION_CONTACT_INFORMATION_CREATED` | [CreateContactInformation.php#L87-L96](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactInformation/Services/CreateContactInformation.php#L87-L96) | 是 → ContactInformation |
-| 更新联系方式 | `ACTION_CONTACT_INFORMATION_UPDATED` | [UpdateContactInformation.php#L86-L95](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactInformation/Services/UpdateContactInformation.php#L86-L95) | 是 → ContactInformation |
-| 删除联系方式 | `ACTION_CONTACT_INFORMATION_DESTROYED` | [DestroyContactInformation.php#L76-L84](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactInformation/Services/DestroyContactInformation.php#L76-L84) | 否（实体已删） |
-| **地址** | | | |
-| 添加地址 | `ACTION_CONTACT_ADDRESS_CREATED` | [AssociateAddressToContact.php#L73-L86](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactAddresses/Services/AssociateAddressToContact.php#L73-L86) | 是 → Address |
-| 更新地址 | `ACTION_CONTACT_ADDRESS_UPDATED` | *（无独立 Service，地址本身在 Address 管理）* | 是 → Address |
-| 删除地址 | `ACTION_CONTACT_ADDRESS_DESTROYED` | [RemoveAddressFromContact.php#L74-L87](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactAddresses/Services/RemoveAddressFromContact.php#L74-L87) | 否（实体已删） |
-| **标签** | | | |
-| 分配标签 | `ACTION_LABEL_ASSIGNED` | [AssignLabel.php#L71-L78](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageLabels/Services/AssignLabel.php#L71-L78) | 是 → Label |
-| 移除标签 | `ACTION_LABEL_REMOVED` | [RemoveLabel.php#L62-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageLabels/Services/RemoveLabel.php#L62-L71) | 是 → Label |
-| **宠物** | | | |
-| 创建宠物 | `ACTION_PET_CREATED` | [CreatePet.php#L79-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManagePets/Services/CreatePet.php#L79-L88) | 是 → Pet |
-| 更新宠物 | `ACTION_PET_UPDATED` | [UpdatePet.php#L72-L80](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManagePets/Services/UpdatePet.php#L72-L80) | 是 → Pet |
-| 删除宠物 | `ACTION_PET_DESTROYED` | [DestroyPet.php#L65-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManagePets/Services/DestroyPet.php#L65-L73) | 否（实体已删） |
-| **目标** | | | |
-| 创建目标 | `ACTION_GOAL_CREATED` | [CreateGoal.php#L76-L85](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageGoals/Services/CreateGoal.php#L76-L85) | 是 → Goal |
-| 更新目标 | `ACTION_GOAL_UPDATED` | [UpdateGoal.php#L77-L85](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageGoals/Services/UpdateGoal.php#L77-L85) | 是 → Goal |
-| 删除目标 | `ACTION_GOAL_DESTROYED` | [DestroyGoal.php#L66-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageGoals/Services/DestroyGoal.php#L66-L74) | 否（实体已删） |
-| **群组** | | | |
-| 加入群组 | `ACTION_ADDED_TO_GROUP` | [AddContactToGroup.php#L84-L93](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageGroups/Services/AddContactToGroup.php#L84-L93) | 是 → Group |
-| 离开群组 | `ACTION_REMOVED_FROM_GROUP` | [RemoveContactFromGroup.php#L62-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageGroups/Services/RemoveContactFromGroup.php#L62-L71) | 是 → Group |
-| **文章** | | | |
-| 加入文章 | `ACTION_ADDED_TO_POST` | [AddContactToPost.php#L78-L87](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Vault/ManageJournals/Services/AddContactToPost.php#L78-L87) | 是 → Post |
-| 离开文章 | `ACTION_REMOVED_FROM_POST` | [RemoveContactFromPost.php#L80-L89](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Vault/ManageJournals/Services/RemoveContactFromPost.php#L80-L89) | 是 → Post |
-| **心情追踪** | | | |
-| 添加心情 | `ACTION_MOOD_TRACKING_EVENT_CREATED` | [CreateMoodTrackingEvent.php#L67-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageMoodTrackingEvents/Services/CreateMoodTrackingEvent.php#L67-L75) | 是 → MoodTrackingEvent |
-| 更新心情 | `ACTION_MOOD_TRACKING_EVENT_UPDATED` | [UpdateMoodTrackingEvent.php#L67-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageMoodTrackingEvents/Services/UpdateMoodTrackingEvent.php#L67-L75) | 是 → MoodTrackingEvent |
-| 删除心情 | `ACTION_MOOD_TRACKING_EVENT_DESTROYED` | [DestroyMoodTrackingEvent.php#L63-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageMoodTrackingEvents/Services/DestroyMoodTrackingEvent.php#L63-L71) | 否（实体已删） |
-| **借贷** | | | |
-| 创建借贷 | `ACTION_LOAN_CREATED` | *（注：CreateLoan 中未创建 FeedItem，存在遗漏）* | - |
-| 更新借贷 | `ACTION_LOAN_UPDATED` | *（存在常量但未被使用）* | - |
+| **联系人基础操作（10 个常量，10 个被使用 | | | |
+| 创建联系人 | `ACTION_CONTACT_CREATED` = `'contact_created'` | [CreateContact.php#L121-L128](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContact/Services/CreateContact.php#L121-L128) | 否 |
+| 更新联系人信息 | `ACTION_INFORMATION_UPDATED` = `'information_updated'` | [UpdateContact.php#L111-L118](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContact/Services/UpdateContact.php#L111-L118) | 否 |
+| 归档联系人 | `ACTION_ARCHIVED_CONTACT` = `'archived'` | [ToggleArchiveContact.php#L69-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContact/Services/ToggleArchiveContact.php#L69-L76) | 否 |
+| 取消归档联系人 | `ACTION_UNARCHIVED_CONTACT` = `'unarchived'` | [ToggleArchiveContact.php#L69-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContact/Services/ToggleArchiveContact.php#L69-L76) | 否 |
+| 收藏联系人 | `ACTION_FAVORITED_CONTACT` = `'favorited'` | [ToggleFavoriteContact.php#L98-L105](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContact/Services/ToggleFavoriteContact.php#L98-L105) | 否 |
+| 取消收藏联系人 | `ACTION_UNFAVORITED_CONTACT` = `'unfavorited'` | [ToggleFavoriteContact.php#L98-L105](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContact/Services/ToggleFavoriteContact.php#L98-L105) | 否 |
+| 更换头像 | `ACTION_CHANGE_AVATAR` = `'changed_avatar'` | [UpdatePhotoAsAvatar.php#L91-L98](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageAvatar/Services/UpdatePhotoAsAvatar.php#L91-L98) + [DestroyAvatar.php#L76-L83](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageAvatar/Services/DestroyAvatar.php#L76-L83) | 否 |
+| 更新工作信息 | `ACTION_JOB_INFORMATION_UPDATED` = `'job_information_updated'` | [UpdateJobInformation.php#L62-L66](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageJobInformation/Services/UpdateJobInformation.php#L62-L66) + [ResetJobInformation.php#L52-L56](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageJobInformation/Services/ResetJobInformation.php#L52-L56) | 否 |
+| 更新宗教信仰 | `ACTION_RELIGION_UPDATED` = `'religion_updated'` | [UpdateReligion.php#L58-L62](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageReligion/Services/UpdateReligion.php#L58-L62) | 否 |
+| **重要日期（3 个常量，3 个被使用 | | | |
+| 创建重要日期 | `ACTION_IMPORTANT_DATE_CREATED` = `'important_date_created'` | [CreateContactImportantDate.php#L89-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactImportantDates/Services/CreateContactImportantDate.php#L89-L99) | 是 → ContactImportantDate |
+| 更新重要日期 | `ACTION_IMPORTANT_DATE_UPDATED` = `'important_date_updated'` | [UpdateContactImportantDate.php#L90-L100](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactImportantDates/Services/UpdateContactImportantDate.php#L90-L100) | 是 → ContactImportantDate |
+| 删除重要日期 | `ACTION_IMPORTANT_DATE_DESTROYED` = `'important_date_destroyed'` | [DestroyContactImportantDate.php#L65-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactImportantDates/Services/DestroyContactImportantDate.php#L65-L73) | 否（实体已删） |
+| **笔记（3 个常量，3 个被使用 | | | |
+| 创建笔记 | `ACTION_NOTE_CREATED` = `'note_created'` | [CreateNote.php#L74-L83](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageNotes/Services/CreateNote.php#L74-L83) | 是 → Note |
+| 更新笔记 | `ACTION_NOTE_UPDATED` = `'note_updated'` | [UpdateNote.php#L74-L83](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageNotes/Services/UpdateNote.php#L74-L83) | 是 → Note |
+| 删除笔记 | `ACTION_NOTE_DESTROYED` = `'note_destroyed'` | [DestroyNote.php#L60-L68](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageNotes/Services/DestroyNote.php#L60-L68) | 否（先记后删） |
+| **联系方式（3 个常量，3 个被使用 | | | |
+| 创建联系方式 | `ACTION_CONTACT_INFORMATION_CREATED` = `'contact_information_created'` | [CreateContactInformation.php#L87-L96](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactInformation/Services/CreateContactInformation.php#L87-L96) | 是 → ContactInformation |
+| 更新联系方式 | `ACTION_CONTACT_INFORMATION_UPDATED` = `'contact_information_updated'` | [UpdateContactInformation.php#L86-L95](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactInformation/Services/UpdateContactInformation.php#L86-L95) | 是 → ContactInformation |
+| 删除联系方式 | `ACTION_CONTACT_INFORMATION_DESTROYED` = `'contact_information_destroyed'` | [DestroyContactInformation.php#L76-L84](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactInformation/Services/DestroyContactInformation.php#L76-L84) | 否（实体已删） |
+| **地址（3 个常量，2 个被使用 | | | |
+| 添加地址 | `ACTION_CONTACT_ADDRESS_CREATED` = `'address_created'` | [AssociateAddressToContact.php#L73-L86](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactAddresses/Services/AssociateAddressToContact.php#L73-L86) | 是 → Address |
+| 更新地址 | `ACTION_CONTACT_ADDRESS_UPDATED` = `'address_updated'` | **未使用（常量已定义但无 Service 创建 | — |
+| 删除地址 | `ACTION_CONTACT_ADDRESS_DESTROYED` = `'address_destroyed'` | [RemoveAddressFromContact.php#L74-L87](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactAddresses/Services/RemoveAddressFromContact.php#L74-L87) | 否（实体已删） |
+| **标签（2 个常量，2 个被使用 | | | |
+| 分配标签 | `ACTION_LABEL_ASSIGNED` = `'label_assigned'` | [AssignLabel.php#L71-L78](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageLabels/Services/AssignLabel.php#L71-L78) | 是 → Label |
+| 移除标签 | `ACTION_LABEL_REMOVED` = `'label_removed'` | [RemoveLabel.php#L62-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageLabels/Services/RemoveLabel.php#L62-L71) | 是 → Label |
+| **宠物（3 个常量，3 个被使用 | | | |
+| 创建宠物 | `ACTION_PET_CREATED` = `'pet_created'` | [CreatePet.php#L79-L88](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManagePets/Services/CreatePet.php#L79-L88) | 是 → Pet |
+| 更新宠物 | `ACTION_PET_UPDATED` = `'pet_updated'` | [UpdatePet.php#L72-L80](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManagePets/Services/UpdatePet.php#L72-L80) | 是 → Pet |
+| 删除宠物 | `ACTION_PET_DESTROYED` = `'pet_destroyed'` | [DestroyPet.php#L65-L73](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManagePets/Services/DestroyPet.php#L65-L73) | 否（实体已删） |
+| **目标（3 个常量，3 个被使用 | | | |
+| 创建目标 | `ACTION_GOAL_CREATED` = `'goal_created'` | [CreateGoal.php#L76-L85](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageGoals/Services/CreateGoal.php#L76-L85) | 是 → Goal |
+| 更新目标 | `ACTION_GOAL_UPDATED` = `'goal_updated'` | [UpdateGoal.php#L77-L85](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageGoals/Services/UpdateGoal.php#L77-L85) | 是 → Goal |
+| 删除目标 | `ACTION_GOAL_DESTROYED` = `'goal_destroyed'` | [DestroyGoal.php#L66-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageGoals/Services/DestroyGoal.php#L66-L74) | 否（实体已删） |
+| **群组（2 个常量，2 个被使用 | | | |
+| 加入群组 | `ACTION_ADDED_TO_GROUP` = `'added_to_group'` | [AddContactToGroup.php#L84-L93](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageGroups/Services/AddContactToGroup.php#L84-L93) | 是 → Group |
+| 离开群组 | `ACTION_REMOVED_FROM_GROUP` = `'removed_from_group'` | [RemoveContactFromGroup.php#L62-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageGroups/Services/RemoveContactFromGroup.php#L62-L71) | 是 → Group |
+| **文章（2 个常量，2 个被使用 | | | |
+| 加入文章 | `ACTION_ADDED_TO_POST` = `'added_to_post'` | [AddContactToPost.php#L78-L87](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Vault/ManageJournals/Services/AddContactToPost.php#L78-L87) | 是 → Post |
+| 离开文章 | `ACTION_REMOVED_FROM_POST` = `'removed_from_post'` | [RemoveContactFromPost.php#L80-L89](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Vault/ManageJournals/Services/RemoveContactFromPost.php#L80-L89) | 是 → Post |
+| **心情追踪（3 个常量，3 个被使用 | | | |
+| 添加心情 | `ACTION_MOOD_TRACKING_EVENT_CREATED` = `'mood_tracking_event_added'` | [CreateMoodTrackingEvent.php#L67-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageMoodTrackingEvents/Services/CreateMoodTrackingEvent.php#L67-L75) | 是 → MoodTrackingEvent |
+| 更新心情 | `ACTION_MOOD_TRACKING_EVENT_UPDATED` = `'mood_tracking_event_updated'` | [UpdateMoodTrackingEvent.php#L67-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageMoodTrackingEvents/Services/UpdateMoodTrackingEvent.php#L67-L75) | 是 → MoodTrackingEvent |
+| 删除心情 | `ACTION_MOOD_TRACKING_EVENT_DESTROYED` = `'mood_tracking_event_deleted'` | [DestroyMoodTrackingEvent.php#L63-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageMoodTrackingEvents/Services/DestroyMoodTrackingEvent.php#L63-L71) | 否（实体已删） |
+| **借贷（2 个常量，0 个被使用 | | | |
+| 创建借贷 | `ACTION_LOAN_CREATED` = `'loan_created'` | **未使用（常量已定义但无 Service 创建） | — |
+| 更新借贷 | `ACTION_LOAN_UPDATED` = `'loan_updated'` | **未使用（常量已定义但无 Service 创建） | — |
+
+**核准统计：**
+
+- **38 个** action 常量定义在 `ContactFeedItem` 模型中
+- **35 个** Service 文件实际调用 `ContactFeedItem::create()`
+- **35 个** action 常量被实际使用
+- **3 个** 常量定义了但未被使用：
+  - `ACTION_LOAN_CREATED` — CreateLoan Service 中没有 `createFeedItem()`
+  - `ACTION_LOAN_UPDATED` — 没有对应的 UpdateLoan Service 创建 feed
+  - `ACTION_CONTACT_ADDRESS_UPDATED` — 地址在 Vault 级 UpdateAddress Service 不创建 feed
 
 #### 2.3.3 Feed 产生的三种模式
 
-通过分析 26 个 Service 的 `createFeedItem()` 方法，可以归纳出 **三种产生模式**：
+通过分析 35 个 Service 的 `createFeedItem()` 方法，可以归纳出 **三种产生模式**：
 
 **模式一：有 feedable 绑定（大多数 create/update 操作）**
 
@@ -224,13 +233,13 @@ private function createFeedItem(): void
 }
 ```
 
-**模式三：删除前记录 Feed（DestroyNote 的特殊处理）**
+**模式三：删除操作**
 
 对于删除操作，有两种子模式：
 
-- **先删后记**（大多数 destroy 操作）：先删除实体，再创建 FeedItem，此时 feedable 关联无法绑定（实体已不存在）。例如 [DestroyContactInformation.php#L76-L84](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactInformation/Services/DestroyContactInformation.php#L76-L84)。
+- **先删后记**（9 种删除操作中的 8 种：destroy_pet, destroy_goal, destroy_contact_information, destroy_important_date, destroy_address, destroy_mood_tracking_event, destroy_note_destroyed 等大多数）：先删除实体，再创建 FeedItem，此时 feedable 关联无法绑定（实体已不存在）。例如 [DestroyContactInformation.php#L76-L84](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactInformation/Services/DestroyContactInformation.php#L76-L84)。
 
-- **先记后删**（仅 DestroyNote）：先创建 FeedItem 并绑定 feedable，再删除实体。这种方式保证了 feedable_id/type 被写入数据库，虽然后续查询时 feedable 关联会返回 null，但 id 仍然保留。见 [DestroyNote.php#L46-L58](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageNotes/Services/DestroyNote.php#L46-L58):
+- **先记后删**（仅 `DestroyNote`）：先创建 FeedItem 并绑定 feedable，再删除实体。这种方式保证了 feedable_id/type 被写入数据库，虽然后续查询时 feedable 关联会返回 null，但 id 仍然保留。见 [DestroyNote.php#L46-L58](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageNotes/Services/DestroyNote.php#L46-L58):
 
 ```php
 public function execute(array $data): void
@@ -311,7 +320,7 @@ JSON 响应
 
 #### 3.1.1 动态句子生成：getSentence()
 
-`getSentence()` 使用 PHP 8 的 `match` 表达式，将 **30 种 action 常量** 映射为翻译字符串（[ModuleFeedViewHelper.php#L37-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/ModuleFeedViewHelper.php#L37-L77)）：
+`getSentence()` 使用 PHP 8 的 `match` 表达式，将 **35 个命名分支**（34 个 model 常量 + 1 个额外的 `author_deleted`） + `default` 兜底 = 36 个分支）映射为翻译字符串（[ModuleFeedViewHelper.php#L37-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/ModuleFeedViewHelper.php#L37-L77)）：
 
 ```php
 private static function getSentence(ContactFeedItem $item): mixed
@@ -357,10 +366,19 @@ private static function getSentence(ContactFeedItem $item): mixed
 }
 ```
 
-注意几点设计：
-- 这里使用了硬编码字符串匹配（如 `'note_created'`），而非引用 `ContactFeedItem::ACTION_NOTE_CREATED` 常量。这在新增 action 时需要同时修改两处。
-- 有一个 `'author_deleted'` 的特殊处理，但在 Service 代码中未找到其产生来源。
-- `default` 兜底分支返回 "unknown action"，保证向后兼容性。
+**注意几点设计：**
+
+- 1. **硬编码字符串匹配**：这里使用了硬编码字符串（如 `'note_created'`），而非引用 `ContactFeedItem::ACTION_NOTE_CREATED` 常量。这在新增 action 时需要同时修改两处（模型常量和 match 分支）。
+
+- 2. **额外的 `author_deleted` 分支**：有一个 `'author_deleted'` 分支不在模型常量中找不到对应的 `ACTION_*` 常量，是一个特殊的遗留分支，用于在 Service 代码中未找到其产生来源。
+
+- 3. **遗漏的 4 个 model 常量未覆盖**：模型中定义了但 `getSentence()` 中缺少：
+  - `loan_created`（未覆盖 → 走 default
+  - `loan_updated` → 走 default
+  - `mood_tracking_event_updated` → 走 default（但 getData() 中有但 getSentence() 中没有）
+  - `mood_tracking_event_deleted` → 走 default
+
+- 4. **`default` 兜底分支**：返回 "unknown action"，保证向后兼容性。
 
 #### 3.1.2 操作者信息：getAuthor()
 
@@ -371,7 +389,7 @@ private static function getSentence(ContactFeedItem $item): mixed
 
 #### 3.1.3 数据映射分发：getData()
 
-`getData()` 使用 `switch` 语句，按 action 类型将数据映射分发到 **8 个 Action Feed Helper**（[ModuleFeedViewHelper.php#L107-L147](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/ModuleFeedViewHelper.php#L107-L147)）：
+`getData()` 使用 `switch` 语句，按 action 类型将数据映射分发到 **7 个 Action Feed Helper + 1 个通用 Helper（[ModuleFeedViewHelper.php#L107-L147](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/ModuleFeedViewHelper.php#L107-L147)）：
 
 ```php
 private static function getData(ContactFeedItem $item, User $user)
@@ -419,28 +437,43 @@ private static function getData(ContactFeedItem $item, User $user)
 
 #### 3.1.4 完整的 Action → Helper 映射表
 
-| Action 类型 | Helper 类 | 产出数据结构 |
-|---|---|---|
-| `label_assigned`, `label_removed` | [ActionFeedLabelAssigned](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedLabelAssigned.php) | `{ label: { object, description }, contact }` |
-| `address_created`, `address_updated`, `address_destroyed` | [ActionFeedAddress](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedAddress.php) | `{ address: { object, description }, contact }` |
-| `contact_information_created/updated/destroyed` | [ActionFeedContactInformation](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedContactInformation.php) | `{ information: { object, description }, contact }` |
-| `pet_created`, `pet_updated`, `pet_destroyed` | [ActionFeedPet](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedPet.php) | `{ pet: { object, description }, contact }` |
-| `note_created`, `note_updated`, `note_destroyed` | [ActionFeedNote](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedNote.php) | `{ note: { object, description }, contact }` |
-| `goal_created`, `goal_updated`, `goal_destroyed` | [ActionFeedGoal](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedGoal.php) | `{ goal: { object, description }, contact }` |
-| `mood_tracking_event_added/updated/deleted` | [ActionFeedMoodTrackingEvent](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedMoodTrackingEvent.php) | `{ mood_tracking_event: { object, description }, contact }` |
-| `important_date_created/updated/destroyed` | **default → ActionFeedGenericContactInformation** | `{ contact }`（无实体详情） |
-| `added_to_group`, `removed_from_group` | **default → ActionFeedGenericContactInformation** | `{ contact }`（无实体详情） |
-| `added_to_post`, `removed_from_post` | **default → ActionFeedGenericContactInformation** | `{ contact }`（无实体详情） |
-| `contact_created`, `information_updated` | **default → ActionFeedGenericContactInformation** | `{ contact }`（无实体详情） |
-| `job_information_updated`, `religion_updated` | **default → ActionFeedGenericContactInformation** | `{ contact }`（无实体详情） |
-| `archived`, `unarchived`, `favorited`, `unfavorited` | **default → ActionFeedGenericContactInformation** | `{ contact }`（无实体详情） |
-| `changed_avatar` | **default → ActionFeedGenericContactInformation** | `{ contact }`（无实体详情） |
-| `loan_created`, `loan_updated` | **default → ActionFeedGenericContactInformation** | `{ contact }`（无实体详情） |
-| 未知 action | **default → ActionFeedGenericContactInformation** | `{ contact }`（无实体详情） |
+| Helper 类 | 覆盖的 action | 数量 | 产出数据结构 |
+|---|---|---|---|
+| [ActionFeedLabelAssigned](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedLabelAssigned.php) | `label_assigned`, `label_removed` | 2 | `{ label: { object, description }, contact }` |
+| [ActionFeedAddress](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedAddress.php) | `address_created`, `address_updated`, `address_destroyed` | 3 | `{ address: { object, description }, contact }` |
+| [ActionFeedContactInformation](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedContactInformation.php) | `contact_information_created/updated/destroyed` | 3 | `{ information: { object, description }, contact }` |
+| [ActionFeedPet](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedPet.php) | `pet_created`, `pet_updated`, `pet_destroyed` | 3 | `{ pet: { object, description }, contact }` |
+| [ActionFeedNote](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedNote.php) | `note_created`, `note_updated`, `note_destroyed` | 3 | `{ note: { object, description }, contact }` |
+| [ActionFeedGoal](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedGoal.php) | `goal_created`, `goal_updated`, `goal_destroyed` | 3 | `{ goal: { object, description }, contact }` |
+| [ActionFeedMoodTrackingEvent](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedMoodTrackingEvent.php) | `mood_tracking_event_added/updated/deleted` | 3 | `{ mood_tracking_event: { object, description }, contact }` |
+| **专属 Helper 合计 | - | **20 个 action | |
+| [ActionFeedGenericContactInformation](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedGenericContactInformation.php) | default 兜底（其余所有其他所有未匹配的所有 action） | **18 个 action | `{ contact }`（仅联系人基础信息） |
+| **总计** | - | **38 个 action | |
+
+**走 default 分支的 18 个 action：**
+
+1. `contact_created` — 创建联系人
+2. `information_updated` — 更新联系人信息
+3. `important_date_created` — 创建重要日期
+4. `important_date_updated` — 更新重要日期
+5. `important_date_destroyed` — 删除重要日期
+6. `added_to_group` — 加入群组
+7. `removed_from_group` — 离开群组
+8. `added_to_post` — 加入文章
+9. `removed_from_post` — 离开文章
+10. `archived` — 归档联系人
+11. `unarchived` — 取消归档
+12. `favorited` — 收藏联系人
+13. `unfavorited` — 取消收藏
+14. `changed_avatar` — 更换头像
+15. `job_information_updated` — 更新工作信息
+16. `religion_updated` — 更新宗教信仰
+17. `loan_created` — 创建借贷（未使用）
+18. `loan_updated` — 更新借贷（未使用）
 
 #### 3.1.5 通用动作映射：ActionFeedGenericContactInformation
 
-**约 17 种 action** 会进入 `default` 分支，使用 [ActionFeedGenericContactInformation](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedGenericContactInformation.php) 作为兜底映射：
+约 18 种 action 会进入 `default` 分支，使用 [ActionFeedGenericContactInformation](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedGenericContactInformation.php) 作为兜底映射：
 
 ```php
 public static function data(ContactFeedItem $item): array
@@ -629,7 +662,7 @@ return Inertia::render('Vault/Dashboard/Index', [
 ```
 ┌─────────────────────────── 写操作（产生 Feed） ───────────────────────────┐
 │                                                                           │
-│  用户操作 → Controller → Service::execute()                              │
+│  用户操作 → Controller → Service::execute()  (35 个 Service)        │
 │                          ├── 业务逻辑（创建/更新/删除实体）                │
 │                          ├── contact->last_updated_at = now()             │
 │                          └── createFeedItem()                             │
@@ -659,9 +692,9 @@ return Inertia::render('Vault/Dashboard/Index', [
 │                      ->orderBy('started_at', 'desc')->paginate(15)       │
 │                                                                           │
 │            → ModuleFeedViewHelper / ModuleLifeEventViewHelper              │
-│                ├── getSentence() → match(action) → trans(...)  (30 种)    │
+│                ├── getSentence() → match(action) → trans(...)  (35 种命名 + default│
 │                ├── getAuthor()  → UserHelper / 默认 Monica SVG            │
-│                └── getData()    → switch(action) → 8 个 ActionFeed* Helper│
+│                └── getData()    → switch(action) → 7 个专属 Helper + default│
 │                                                                           │
 │            → PaginatorHelper::getData($paginator)                         │
 │                                                                           │
@@ -670,34 +703,44 @@ return Inertia::render('Vault/Dashboard/Index', [
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 30 种操作 × 3 种模式 × 2 种映射方式
+### 6.2 38 个常量 × 35 个Service × 3 种模式 × 2 种映射方式
 
 ```
-Action 常量 (30 种)
+Action 常量 (38 个, 定义在 ContactFeedItem 模型)
     │
-    ├─► Service::createFeedItem() (26 个 Service)
+    ├─ 实际被 Service 使用: 35 个
     │     │
-    │     ├─ 模式一：有 feedable 绑定 (17 种 action)
+    │     ├─ 模式一：有 feedable 绑定 (约 17 个 action)
     │     │     └─► Note, Address, Goal, Pet, Label, ContactInformation,
-    │     │         MoodTrackingEvent, ContactImportantDate, Group, Post, Loan
+    │     │         MoodTrackingEvent, ContactImportantDate, Group, Post
     │     │
-    │     ├─ 模式二：无 feedable 绑定 (10 种 action)
+    │     ├─ 模式二：无 feedable 绑定 (约 10 个 action)
     │     │     └─► 联系人基础操作: 创建/更新/收藏/归档/头像/工作/宗教
     │     │
-    │     └─ 模式三：删除操作 (10 种 action)
+    │     └─ 模式三：删除操作 (约 8 个 action)
     │           ├─ 先记后删 (仅 DestroyNote)
-    │           └─ 先删后记 (其余 9 种)
+    │           └─ 先删后记 (其余 7 种)
     │
-    └─► ModuleFeedViewHelper::getData()
-          │
-          ├─ 专属 Helper (13 种 action → 7 个 Helper)
-          │     ├─ ActionFeedNote, ActionFeedAddress, ActionFeedGoal
-          │     ├─ ActionFeedPet, ActionFeedLabelAssigned
-          │     ├─ ActionFeedContactInformation
-          │     └─ ActionFeedMoodTrackingEvent
-          │
-          └─ 通用 Helper (17 种 action → ActionFeedGenericContactInformation)
-                └─ 仅返回联系人基础信息 (无实体详情)
+    └─ 未被使用: 3 个 (loan_created, loan_updated, address_updated)
+
+ModuleFeedViewHelper::getData()
+      │
+      ├─ 专属 Helper (20 个 action → 7 个 Helper)
+      │     ├─ ActionFeedNote (3)
+      │     ├─ ActionFeedAddress (3)
+      │     ├─ ActionFeedGoal (3)
+      │     ├─ ActionFeedPet (3)
+      │     ├─ ActionFeedLabelAssigned (2)
+      │     ├─ ActionFeedContactInformation (3)
+      │     └─ ActionFeedMoodTrackingEvent (3)
+      │
+      └─ 通用 Helper (18 个 action → ActionFeedGenericContactInformation)
+            └─ 仅返回联系人基础信息 (无实体详情)
+
+ModuleFeedViewHelper::getSentence()
+      │
+      ├─ 命名分支: 35 个 (34 个 model 常量 + 1 个 author_deleted
+      └─ default: 兜底 (4 个 model 常量未覆盖 + 未知 action)
 ```
 
 ---
@@ -708,19 +751,23 @@ Action 常量 (30 种)
 
 2. **多态关联实现统一 Feed 表**：`ContactFeedItem.feedable` 使用 Laravel 的 `nullableNumericMorphs`，将 11 种不同实体（Note、Address、Goal、Pet、Label、ContactInformation、MoodTrackingEvent、ContactImportantDate、Group、Post、Loan）统一收纳进同一张 `contact_feed_items` 表。这是"不同类型活动条目合并成时间线"的核心数据库机制。
 
-3. **30 种操作 × 26 个 Service**：Feed 条目的创建散布在各领域 Service 中（而非事件监听器），每个 Service 在完成业务操作后显式调用 `createFeedItem()`。这保证了领域自治，但新增 Feed 来源时需要侵入对应 Service。
+3. **38 个常量 × 35 个 Service**：模型定义了 38 个 action 常量，分布在 35 个 Service 文件中实际调用 `ContactFeedItem::create()`。有 3 个常量定义了但未被使用（loan_created、loan_updated、address_updated）。Feed 条目的创建散布在各领域 Service 中（而非事件监听器），每个 Service 在完成业务操作后显式调用 `createFeedItem()`。
 
 4. **三种 Feed 产生模式**：
    - 有 feedable 绑定（大多数 create/update）
    - 无 feedable 绑定（联系人基础操作）
    - 删除操作（先记后删 / 先删后记）
 
-5. **ViewHelper 替代 Resource**：Monica 使用 ViewHelper 模式而非 Laravel Eloquent Resource 完成 ORM → JSON 映射。`ModuleFeedViewHelper` 充当调度中心，根据 `action` 类型分发到 8 个 ActionFeed* 子 Helper。
+5. **ViewHelper 替代 Resource**：Monica 使用 ViewHelper 模式而非 Laravel Eloquent Resource 完成 ORM → JSON 映射。`ModuleFeedViewHelper` 充当调度中心，根据 `action` 类型分发到 7 个专属 ActionFeed* 子 Helper + 1 个通用兜底 Helper。
 
-6. **映射层的覆盖缺口**：约 17 种 action（重要日期、群组、文章、联系人基础操作等）进入 `default` 分支使用 `ActionFeedGenericContactInformation`，仅返回联系人基础信息，丢失了 `description` 字段中已保存的实体摘要。这是可以改进的设计点。
+6. **映射层的覆盖缺口**：
+   - `getData()` 中约 **18 个 action 走 `default` 分支，使用 `ActionFeedGenericContactInformation`，仅返回联系人基础信息，丢失了 `description` 字段中已保存的实体摘要（如重要日期、群组名称、文章标题等）。这是可以改进的设计点。
+   - `getSentence()` 有 35 个命名分支，但有 4 个 model 常量未覆盖（loan_created、loan_updated、mood_tracking_event_updated、mood_tracking_event_deleted），会走 default 返回 "unknown action"。
 
-7. **排序策略差异**：Feed 按 `created_at` 倒序（操作发生时间），Timeline Event 按 `started_at` 倒序（事件开始日期）。这反映了两种时间线的本质区别——一个关注"何时操作的"，另一个关注"何时发生的"。
+7. **硬编码字符串匹配**：`getSentence()` 和 `getData()` 都使用硬编码字符串匹配而非 model 常量，新增 action 时需要同步修改多处，存在不一致风险。
 
-8. **分页统一**：Feed 和 Timeline Event 都固定每页 15 条，都通过 `PaginatorHelper` 生成标准化的分页元数据。Vault 级 Feed 通过 `whereIn('contact_id', ...)` 聚合 Vault 下所有联系人的动态。
+8. **排序策略差异**：Feed 按 `created_at` 倒序（操作发生时间），Timeline Event 按 `started_at` 倒序（事件开始日期）。这反映了两种时间线的本质区别——一个关注"何时操作的"，另一个关注"何时发生的"。
 
-9. **`default_activity_tab`**：Vault 模型上的 `default_activity_tab` 字段让用户可以选择仪表盘默认展示 Feed 还是 Timeline Event。
+9. **分页统一**：Feed 和 Timeline Event 都固定每页 15 条，都通过 `PaginatorHelper` 生成标准化的分页元数据。Vault 级 Feed 通过 `whereIn('contact_id', ...)` 聚合 Vault 下所有联系人的动态。
+
+10. **`default_activity_tab`**：Vault 模型上的 `default_activity_tab` 字段让用户可以选择仪表盘默认展示 Feed 还是 Timeline Event。
