@@ -205,9 +205,34 @@ execute()
   - `ACTION_LOAN_UPDATED` — 没有对应的 UpdateLoan Service 创建 feed
   - `ACTION_CONTACT_ADDRESS_UPDATED` — 地址在 Vault 级 UpdateAddress Service 不创建 feed
 
+#### 2.4.3 统一分类口径：8 大类 × feedable 保留状态（全文基准）
+
+35 个实际使用的 action 按**技术性质**（而非业务模块）归为 8 类，所有后续章节（2.5 节删除语义、6.2 节总览图、第七章总结）均以本分类为准：
+
+| 类 # | 技术分类 | 子类说明 | 数量 | feedable 保留状态 | action 清单 |
+|---|---|---|---|---|---|
+| ① | **创建实体** | 新建可被多态追踪的实体对象 | 7 | ✅ **有效绑定**（实体存在，关联有效） | `important_date_created`, `note_created`, `contact_information_created`, `address_created`, `pet_created`, `goal_created`, `mood_tracking_event_added` |
+| ② | **更新实体** | 修改已存在的可追踪实体字段 | 6 | ✅ **有效绑定**（实体存在，关联有效） | `important_date_updated`, `note_updated`, `contact_information_updated`, `pet_updated`, `goal_updated`, `mood_tracking_event_updated` |
+| ③ | **绑定关联（attach）** | 把联系人关联到已有实体，新增 pivot 行，实体本身不新增 | 3 | ✅ **实体保留**（pivot 新增，实体原已存在） | `label_assigned`, `added_to_group`, `added_to_post` |
+| ④ | **解绑关联（仅 detach）** | 只拆除 pivot 关联行，**实体本身不删除** | 3 | ✅ **实体保留**（pivot 删除，实体仍存在） | `label_removed`, `removed_from_group`, `removed_from_post` |
+| ⑤ | **解绑 + 条件删除** | 先 detach pivot；若无其他引用则真正删除实体；但无论删不删都 bind | 1 | ⚠️ **有值但实体可能不存在**（存在 dangling 风险） | `address_destroyed` |
+| ⑥ | **纯删除实体** | 直接删除实体对象，无论先删后记还是先记后删，均不 bind | 6 | ❌ **为 NULL**（完全丢失多态关联） | `important_date_destroyed`, `note_destroyed`, `contact_information_destroyed`, `pet_destroyed`, `goal_destroyed`, `mood_tracking_event_deleted` |
+| ⑦ | **联系人级操作（无实体）** | 直接操作联系人本身或元信息，无可关联的 feedable 实体 | 5 | ❌ **本就无实体可关联**（语义上不需要） | `contact_created`, `information_updated`, `changed_avatar`, `job_information_updated`, `religion_updated` |
+| ⑧ | **Toggle 双向标记** | 切换 bool 标记位（收藏/归档），无可关联实体 | 4 | ❌ **本就无实体可关联**（语义上不需要） | `archived`, `unarchived`, `favorited`, `unfavorited` |
+
+**合计**：7 + 6 + 3 + 3 + 1 + 6 + 5 + 4 = **35** ✓
+
+**bind 状态图例（全文表格统一使用）**：
+- ✅ **有效绑定 / 实体保留**：`feedable_id/type` 有值，且 `$item->feedable` 能正常返回对象
+- ⚠️ **有值但实体可能不存在（dangling）**：`feedable_id/type` 有值，但实体可能已被删除，查询时可能返回 `null`
+- ❌ **为 NULL**：`feedable_id/type` 字段为 `NULL`，无任何多态关联
+- ❌ **本就无实体可关联**：语义上不需要关联实体的联系人级/Toggle 操作
+
 ### 2.5 关键：删除/解绑/移除时 feedable 关联是否保留
 
-删除/解绑/移除类操作共有 10 个，但它们对多态关联的处理方式并不一致。以下是逐一核准后的完整对照表：
+**与 2.4.3 节 8 大类基准的对应**：本节覆盖的是 8 大类中涉及"删除/解除关联"的三类——**④ 解绑关联（仅 detach，3 个）、⑤ 解绑 + 条件删除（1 个）、⑥ 纯删除实体（6 个）**，合计 10 个 action。类①②③⑦⑧不涉及删除语义，不在此展开。
+
+这 10 个操作对多态关联的处理方式并不一致。以下是逐一核准后的完整对照表（bind 状态图例同 2.4.3 节）：
 
 | action | Service | 操作性质 | 执行顺序 | `$entity->feedItem()->save()` | feedable 数据库状态 |
 |---|---|---|---|---|---|
@@ -222,12 +247,12 @@ execute()
 | **removed_from_group** | [RemoveContactFromGroup.php](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Contact/ManageGroups/Services/RemoveContactFromGroup.php#L43-L71) | **解绑 pivot** | ① detach() ② createFeedItem + **save** | ✅ 调用 | ✅ **feedable 正常可用**（Group 实体不删） |
 | **removed_from_post** | [RemoveContactFromPost.php](file:///d:/fz/0601-2/solo-dogfeeding/code/15-monica/app/Domains/Vault/ManageJournals/Services/RemoveContactFromPost.php#L48-L89) | **解绑 pivot** | ① detach() ② createFeedItem + **save** | ✅ 调用 | ✅ **feedable 正常可用**（Post 实体不删） |
 
-**可以归纳为四种删除/解绑语义**：
+**可以归纳为四种删除/解绑语义（对应 2.4.3 节 8 大类编号）**：
 
-1. **纯删除实体（6 种）**：先删实体再记 Feed，完全不绑定 feedable → `feedable_id/type` 均为 NULL，实体详情丢失，仅靠 `description` 字段保存文本摘要
-2. **先记后删仍不 bind（1 种 DestroyNote）**：虽然先记 Feed 再删实体（理论上实体还存在），但 `createFeedItem()` 中仍然没有调用 `$note->feedItem()->save()`——这是 DestroyNote 的特殊写法，结果与第一种相同
-3. **解绑 pivot + 条件删除（1 种 RemoveAddress）**：地址是多对多多态（可被多个联系人共享），解绑后若没有其他联系人使用该地址则真正删除；但无论是否删除实体，都会先 bind feedable → 导致数据库中 `feedable_id/type` 有值，但查询时 `$item->feedable` 可能返回 null（实体被删的情况）
-4. **仅解绑 pivot（3 种 Label/Group/Post）**：实体本身保留，仅解除中间表关联；bind feedable → `feedable_id/type` 正常可用，前端可以看到群组名称、标签名称、文章标题等完整数据
+1. **⑥ 纯删除实体（6 种）**：对应类⑥的全部 6 个 action。先删实体再记 Feed（DestroyNote 虽为先记后删特例，但仍不 bind），完全不绑定 feedable → ❌ `feedable_id/type` 均为 NULL，实体详情丢失，仅靠 `description` 字段保存文本摘要
+2. **⑤ 解绑 pivot + 条件删除（1 种 RemoveAddress）**：对应类⑤的 `address_destroyed`。地址是多对多多态（可被多个联系人共享），解绑后若没有其他联系人使用该地址则真正删除；但无论是否删除实体，都会先 bind feedable → ⚠️ 导致数据库中 `feedable_id/type` 有值，但查询时 `$item->feedable` 可能返回 null（实体被删的情况，dangling 关联）
+3. **④ 仅解绑 pivot（3 种 Label/Group/Post）**：对应类④的全部 3 个 action。实体本身保留，仅解除中间表关联；bind feedable → ✅ `feedable_id/type` 正常可用，前端可以看到群组名称、标签名称、文章标题等完整数据
+4. **①②③⑦⑧ 无删除语义**：创建/更新/绑定关联/联系人级/Toggle 共 25 个 action 不涉及删除，feedable 状态见 2.4.3 节总表
 
 ### 2.6 特殊的双向动态操作（Toggle 模式）
 
@@ -638,37 +663,64 @@ return Inertia::render('Vault/Dashboard/Index', [
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 38 个常量 × 35 个Service × 4 种删除语义 × 2 种映射方式
+### 6.2 8 大类技术分类 × 35 个 Action × 多态关联保留状态（以 2.4.3 节为唯一基准）
 
 ```
 Action 常量 (38 个, 定义在 ContactFeedItem)
     │
-    ├─ 实际被 Service 使用: 35 个
+    ├─ 实际被 Service 使用: 35 个（按 2.4.3 节 8 大类技术分类）
     │     │
-    │     ├─ create/update 类 (~17 个)
-    │     │     └─► 全部调用 feedItem()->save()
-    │     │         → feedable_id/type ✅ 有效绑定
+    │     ├─ ① 创建实体 (7 个)  →  均调用 feedItem()->save()
+    │     │     · important_date_created, note_created, contact_information_created
+    │     │     · address_created, pet_created, goal_created, mood_tracking_event_added
+    │     │     └─► feedable_id/type  ✅ 有效绑定（实体存在）
     │     │
-    │     ├─ 解绑 pivot 类 (5 个: label/group/post added/removed + address_created)
-    │     │     └─► 全部调用 feedItem()->save()
-    │     │         → 实体本身保留, feedable ✅ 有效
+    │     ├─ ② 更新实体 (6 个)  →  均调用 feedItem()->save()
+    │     │     · important_date_updated, note_updated, contact_information_updated
+    │     │     · pet_updated, goal_updated, mood_tracking_event_updated
+    │     │     └─► feedable_id/type  ✅ 有效绑定（实体存在）
     │     │
-    │     ├─ 纯 delete 实体类 (6 个: pet/goal/ci/date/mood destroyed + note_destroyed)
-    │     │     └─► 均不调用 feedItem()->save()
-    │     │         → feedable_id/type ❌ 为 NULL
+    │     ├─ ③ 绑定关联（attach，新增 pivot，3 个）→  均调用 feedItem()->save()
+    │     │     · label_assigned, added_to_group, added_to_post
+    │     │     └─► feedable_id/type  ✅ 实体保留（pivot 新增，Label/Group/Post 原已存在）
     │     │
-    │     └─ 条件删除 (1 个: address_destroyed)
-    │           └─► 先 detach，可能 delete，但仍 save feedable
-    │               → feedable_id/type ⚠️ 有值，但实体可能不存在
+    │     ├─ ④ 解绑关联（仅 detach pivot，不删实体，3 个）→  均调用 feedItem()->save()
+    │     │     · label_removed, removed_from_group, removed_from_post
+    │     │     └─► feedable_id/type  ✅ 实体保留（pivot 删除，Label/Group/Post 仍存在）
+    │     │
+    │     ├─ ⑤ 解绑 + 条件删除（1 个 address_destroyed）→  调用 feedItem()->save()
+    │     │     · detach 关联 pivot → 无其他引用则 delete 实体 → 最后 save feedable
+    │     │     └─► feedable_id/type  ⚠️ 有值但实体可能不存在（dangling 关联）
+    │     │
+    │     ├─ ⑥ 纯删除实体（6 个，无论先删后记还是先记后删均不 bind）
+    │     │     · important_date_destroyed, note_destroyed（先记后删特例，仍不 bind）
+    │     │     · contact_information_destroyed, pet_destroyed
+    │     │     · goal_destroyed, mood_tracking_event_deleted
+    │     │     └─► feedable_id/type  ❌ 为 NULL（完全丢失多态关联）
+    │     │
+    │     ├─ ⑦ 联系人级操作（无实体可关联，5 个）→  无 feedable 绑定
+    │     │     · contact_created, information_updated, changed_avatar
+    │     │     · job_information_updated, religion_updated
+    │     │     └─► feedable_id/type  ❌ 语义上不需要关联实体
+    │     │
+    │     └─ ⑧ Toggle 双向标记（无实体可关联，4 个）→  无 feedable 绑定
+    │           · archived, unarchived, favorited, unfavorited
+    │           └─► feedable_id/type  ❌ 语义上不需要关联实体
     │
-    └─ 未被使用: 3 个 (loan_created, loan_updated, address_updated)
+    └─ 未被使用（仅定义常量）: 3 个
+          · loan_created（CreateLoan Service 未实现 createFeedItem）
+          · loan_updated（无对应 UpdateLoan Service 创建 feed）
+          · address_updated（地址更新在 Vault 级 UpdateAddress，不创建 Feed）
 
 12 个 feedItem() 反向关联模型
     │
-    ├─ 10 个实际使用: Note, Address, Goal, ContactInformation, Label,
-    │               MoodTrackingEvent, Pet, ContactImportantDate, Group, Post
+    ├─ 10 个实际使用，与类①~⑤的实体一一对应：
+    │     Note, Address, Goal, ContactInformation, Label,
+    │     MoodTrackingEvent, Pet, ContactImportantDate, Group, Post
     │
-    └─ 2 个定义了未用: Loan (有常量但Service未实现), Tag (连常量都没有)
+    └─ 2 个定义了但未实际接入：
+          · Loan（有 ACTION_LOAN_CREATED/UPDATED 常量，但 Service 未实现）
+          · Tag（模型上有 feedItem()，但 ContactFeedItem 中无任何 ACTION_TAG_* 常量）
 
 ModuleFeedViewHelper::getData()
       │
@@ -691,26 +743,27 @@ ModuleFeedViewHelper::getSentence()
 
 ---
 
-## 七、设计要点总结
+## 七、设计要点总结（全文统一口径：以 2.4.3 节 8 大类技术分类为基准）
 
 1. **Feed 是"操作日志"，Timeline Event 是"生活记事"**——前者由系统自动产生，后者由用户手动创建。两者在模型、查询、映射层都完全独立，仅在 Vault 仪表盘前端通过 Tab 切换统一呈现。
 
-2. **多态关联实现统一 Feed 表**：`ContactFeedItem.feedable` 使用 Laravel 的 `nullableNumericMorphs`，将 10 种实际使用的实体统一收纳进同一张表。这是"不同类型活动条目合并成时间线"的核心数据库机制。
+2. **多态关联实现统一 Feed 表**：`ContactFeedItem.feedable` 使用 Laravel 的 `nullableNumericMorphs`，将 8 大类中类①~⑤涉及的 10 种实体（Note、Address、Goal、ContactInformation、Label、MoodTrackingEvent、Pet、ContactImportantDate、Group、Post）统一收纳进同一张表。这是"不同类型活动条目合并成时间线"的核心数据库机制。
 
 3. **关联边界的缺口**：12 个模型定义了 `feedItem()` 反向关联，但 `Loan`（有常量无实现）和 `Tag`（无常量无实现）实际未接入；38 个 action 常量中有 3 个未使用。
 
-4. **38 个常量 × 35 个 Service**：模型定义了 38 个 action 常量，35 个 Service 文件实际调用 `ContactFeedItem::create()`。Feed 条目的创建散布在各领域 Service 中（而非事件监听器）。
+4. **38 个常量 × 35 个 Service × 8 大类技术分类**：模型定义了 38 个 action 常量，35 个 Service 文件实际调用 `ContactFeedItem::create()`。按技术性质归为 ①~⑧ 共 8 类（见 2.4.3 节总表）。Feed 条目的创建散布在各领域 Service 中（而非事件监听器）。
 
-5. **4 种删除/解绑语义对 feedable 的影响**：
-   - 纯删除实体（6 种）：feedable_id/type 为 NULL
-   - DestroyNote 特例（1 种）：先记后删仍不 bind → NULL
-   - 条件删除 address_destroyed（1 种）：feedable 有值但实体可能不存在
-   - 仅解绑 pivot（3 种 label/group/post removed）：feedable 正常可用
-   - **结论：绝大多数删除类操作丢失了 feedable 关联，只能靠 description 文本兜底**
+5. **8 大类 × 多态关联保留精确对应**：
+   - ① 创建实体（7 个）、② 更新实体（6 个）→ ✅ feedable_id/type 有效绑定
+   - ③ 绑定关联（3 个）、④ 解绑关联仅 detach（3 个）→ ✅ 实体保留，关联有效
+   - ⑤ 解绑 + 条件删除（1 个 address_destroyed）→ ⚠️ 有值但实体可能不存在（dangling）
+   - ⑥ 纯删除实体（6 个，含 DestroyNote 先记后删特例）→ ❌ feedable_id/type 为 NULL
+   - ⑦ 联系人级操作（5 个）、⑧ Toggle 双向标记（4 个）→ ❌ 语义上本就无需关联实体
+   - **总计 feedable 关联情况**：13 个有效绑定 + 6 个实体保留 = 19 个 ✅；1 个 dangling ⚠️；6 个 NULL + 9 个无需关联 = 15 个 ❌
 
 6. **映射层覆盖缺口**：
-   - `getData()` 中 **16 个实际产生 Feed 的 action** 走 default 分支，其中 7 个（重要日期、群组、文章的 added/removed）Service 实际写入了 `description` 字段但 `ActionFeedGenericContactInformation` 未读取返回
-   - `getSentence()` 有 4 个 model 常量未覆盖（mood_updated/deleted 会在前端显示 "unknown action" 但 data 字段完整）
+   - `getData()` 中 **16 个实际产生 Feed 的 action** 走 default 分支，其中 7 个（重要日期 3 个、群组/文章 added/removed 各 2 个）Service 实际写入了 `description` 字段但 `ActionFeedGenericContactInformation` 未读取返回
+   - `getSentence()` 有 4 个 model 常量未覆盖（loan_created/updated + mood_updated/deleted，后者会在前端显示 "unknown action" 但 data 字段完整）
    - `address_updated` 是死代码（ViewHelper 全覆盖但无 Service 产生）
 
 7. **前后不一致的隐患**：
