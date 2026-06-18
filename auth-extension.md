@@ -667,3 +667,314 @@ private function createUser(SocialiteUser $socialite): User
 7. **Webauthn 路由全部由包注册**：项目代码中看不到 `/webauthn/auth`、`/webauthn/store` 等路由的定义，它们由 `WebauthnServiceProvider::configureRoutes()` 自动注册，挂载在 `config/webauthn.php#L55` 的 `prefix` 下。对于不熟悉该包的开发者，找路由会有些"魔法"感。
 
 8. **`WebauthnLogin` 事件被派发两次**：一次在 `EloquentWebAuthnProvider::validateCredentials()` 中（带 `true` 第二参数），一次在 `Webauthn::login()` 中（不带）。两次派发的语义差异需要查阅包源码才能理解，项目代码中无法直接看到这一行为。
+
+---
+
+## 十二、敏感操作确认链路（ConfirmsPassword + WebauthnTest + webauthn.key.confirm）
+
+**链路状态：✅ 真实生效**
+
+这是用户在应用内执行敏感操作（删除密钥、启用 2FA 等）时的二次身份验证流程，支持"密码确认"和"安全密钥确认"两种方式。
+
+### 12.1 前端入口：ConfirmsPassword.vue 的使用
+
+`resources/js/Components/Jetstream/ConfirmsPassword.vue` 在项目中被 8 处使用：
+
+| 位置 | 触发的操作 |
+|------|----------|
+| `resources/js/Pages/Webauthn/WebauthnKeys.vue#L164` | 删除安全密钥 |
+| `resources/js/Pages/Webauthn/WebauthnKeys.vue#L177` | 注册新安全密钥 |
+| `resources/js/Pages/Profile/Partials/TwoFactorAuthenticationForm.vue#L205` | 启用双因素认证 |
+| `resources/js/Pages/Profile/Partials/TwoFactorAuthenticationForm.vue#L213` | 确认双因素认证 |
+| `resources/js/Pages/Profile/Partials/TwoFactorAuthenticationForm.vue#L224` | 重新生成恢复码 |
+| `resources/js/Pages/Profile/Partials/TwoFactorAuthenticationForm.vue#L230` | 显示恢复码 |
+| `resources/js/Pages/Profile/Partials/TwoFactorAuthenticationForm.vue#L236` | 禁用双因素认证 |
+| `resources/js/Pages/Profile/Partials/TwoFactorAuthenticationForm.vue#L242` | 确认禁用双因素 |
+
+### 12.2 ConfirmsPassword.vue 的条件分支逻辑
+
+`resources/js/Components/Jetstream/ConfirmsPassword.vue` 的核心逻辑：
+
+```
+点击触发按钮
+  → startConfirmingPassword()
+    → GET password.confirmation（检查 session 中 auth.password_confirmed_at 是否在有效期内）
+    ├─ 已确认 → 直接 emit('confirmed')
+    └─ 未确认 → 弹出确认对话框
+         ├─ hasKey === true（用户有 Webauthn 密钥）
+         │    └─ 渲染"Confirm your passkey or security key"按钮
+         │       → 点击 → webauthn.start() → 触发 WebauthnTest 组件
+         └─ 始终渲染密码输入框（无论是否有密钥）
+              → 输入密码 → confirmPassword()
+                 → POST password.confirm（Jetstream 内置路由）
+                 → 成功后写 session auth.password_confirmed_at
+                 → confirm() → emit('confirmed')
+```
+
+**hasKey 的来源**（`app/Http/Middleware/HandleInertiaRequests.php#L34-L40`）：Inertia 全局共享属性，判断当前登录用户是否拥有至少一条 WebauthnKey 记录。
+
+### 12.3 WebauthnTest.vue 的密钥确认流程
+
+`resources/js/Pages/Webauthn/WebauthnTest.vue` 的两步流程：
+
+```
+webauthn.start() 被调用
+  ├─ 第 1 步：POST route('webauthn.auth.options')
+  │     → 包的 AuthenticateController::create() 返回断言挑战公钥
+  │     → 注意：与登录不同，此处 POST 不带任何用户参数，
+  │       因为当前用户已登录，包内部从 Auth::user() 获取用户身份
+  │
+  └─ 第 2 步：调用浏览器 startAuthentication({ optionsJSON: publicKey })
+       → 用户完成安全密钥交互
+       → POST route('webauthn.key.confirm')，提交断言数据
+       → 成功后 emit('success') → ConfirmsPassword.confirm() → emit('confirmed')
+```
+
+### 12.4 服务端：ConfirmableKeyController（包源码验证）
+
+**可验证事实（包源码 `ConfirmableKeyController::store()`）**：
+
+```php
+public function store(Request $request): Responsable
+{
+    $confirmed = app(ConfirmKey::class)(
+        $this->guard, $request
+    );
+
+    if ($confirmed) {
+        $request->session()->put('auth.password_confirmed_at', Date::now()->unix());
+    }
+
+    return $confirmed
+        ? app(KeyConfirmedResponse::class)
+        : app(FailedKeyConfirmedResponse::class);
+}
+```
+
+关键点：
+- 调用 `ConfirmKey` action 执行断言验证
+- 验证成功后写入 `auth.password_confirmed_at` 到 session（与密码确认使用同一个 session 键）
+- 返回 `KeyConfirmedResponse`（包内置）：Inertia 请求下返回 JSON `{ confirmed: true }`，普通请求重定向到 `config('webauthn.redirects.key-confirmation')`（项目中配置为 `/user/profile`）
+
+### 12.5 ConfirmKey action（包源码验证）
+
+**可验证事实（包源码 `ConfirmKey::__invoke()`）**：
+
+```php
+public function __invoke(StatefulGuard $guard, Request $request): bool
+{
+    return is_null(Webauthn::$confirmKeyUsingCallback)
+        ? $guard->attempt($this->getParams($request))
+        : $this->confirmKeyUsingCustomCallback($request);
+}
+```
+
+项目未设置 `$confirmKeyUsingCallback`，因此走 `$guard->attempt()` 分支——**与登录时的断言校验使用完全相同的路径**（`EloquentWebAuthnProvider::retrieveByCredentials()` → `validateCredentials()`）。
+
+此时用户已登录，`$request->user()` 非空，但 `$guard->attempt()` 仍会执行完整的凭据校验流程（根据断言中的 credentialId 查找密钥并验证签名）。
+
+---
+
+## 十三、密钥最后使用时间（used_at）更新链路
+
+**链路状态：✅ 真实生效**
+
+### 13.1 数据库字段与模型
+
+- 迁移文件 `database/migrations/2025_05_05_101750_webauthn_used_at.php` 为 `webauthn_keys` 表添加了 `used_at` nullable timestamp 字段
+- `app/Models/WebauthnKey.php#L16-L18` 将 `used_at` 标记为 fillable、visible、datetime cast
+- 展示位置：`app/Actions/Jetstream/UserProfile.php#L30` 通过 `optional($key->used_at)->diffForHumans()` 显示为"last_used"
+
+### 13.2 WebauthnAuthenticateListener
+
+`app/Listeners/WebauthnAuthenticateListener.php` 是更新 `used_at` 的核心：
+
+```php
+public function handle(AuthenticatorAssertionResponseValidationSucceededEvent $event)
+{
+    $webauthnKey = WebauthnKey::where('user_id', $event->userHandle)
+        ->where('credentialId', Base64UrlSafe::encode($event->publicKeyCredentialSource->publicKeyCredentialId))
+        ->first();
+
+    if ($webauthnKey !== null) {
+        $webauthnKey->used_at = now();
+        $webauthnKey->save();
+    }
+}
+```
+
+### 13.3 事件来源与监听器注册机制
+
+**关键事实**：该监听器监听的**不是** Laravel Webauthn 包的 `WebauthnLogin` 事件，而是 **webauthn-lib 底层库**的 `Webauthn\Event\AuthenticatorAssertionResponseValidationSucceededEvent`。
+
+这是 web-authn/webauthn-lib（FIDO2/WebAuthn 规范的 PHP 实现）在断言验证成功时派发的底层事件。
+
+**注册机制**：项目中没有 `EventServiceProvider.php`，也没有在 `AppServiceProvider` 中显式调用 `Event::listen()` 注册该监听器。Laravel 11 通过**事件自动发现**机制工作：框架扫描 `app/Listeners/` 目录，根据 `handle()` 方法的类型提示自动推断监听器与事件的对应关系。
+
+**可验证事实（包源码 `WebauthnServiceProvider::bindWebAuthnPackage()`）**：
+
+```php
+$this->app->resolving(CanDispatchEvents::class,
+    fn (CanDispatchEvents $object) => $object->setEventDispatcher(
+        $this->app[EventDispatcherInterface::class]
+    ));
+```
+
+包在 `WebauthnServiceProvider` 中将 PSR-14 `EventDispatcherInterface` 绑定到 `LaravelWebauthn\Events\EventDispatcher`（适配 Laravel 事件系统），并在解析所有 `CanDispatchEvents` 对象时注入这个 dispatcher。这样 webauthn-lib 底层派发的 PSR-14 事件会被桥接到 Laravel 的事件系统，从而触发 `WebauthnAuthenticateListener`。
+
+### 13.4 触发场景
+
+以下所有场景都会触发 `used_at` 更新：
+1. ✅ 登录页 Passkey 首因登录（断言校验成功）
+2. ✅ 双因素挑战页的 Webauthn 二因验证（断言校验成功）
+3. ✅ 敏感操作确认的密钥确认（`webauthn.key.confirm` 路由，断言校验成功）
+
+只要 webauthn-lib 的 `AuthenticatorAssertionResponseValidator` 成功验证了一个断言签名，就会派发该事件，监听器就会更新对应密钥的 `used_at`。
+
+---
+
+## 十四、WebauthnMiddleware 实际使用情况分析
+
+**链路状态：❌ 残留/未接入——仅注册别名，未被任何路由使用**
+
+### 14.1 注册位置
+
+`bootstrap/app.php#L9` 和 `#L29`：
+
+```php
+use LaravelWebauthn\Http\Middleware\WebauthnMiddleware;
+// ...
+$middleware->alias([
+    // ...
+    'webauthn' => WebauthnMiddleware::class,
+]);
+```
+
+### 14.2 实际使用情况验证
+
+对项目所有 PHP 文件执行 grep `middleware.*webauthn` 和 `webauthn.*middleware`，结果为 **0 匹配**。具体检查：
+
+| 检查范围 | 结果 |
+|---------|------|
+| `routes/web.php`（含所有路由分组） | 无任何 `->middleware('webauthn')` 或 `'middleware' => 'webauthn'` |
+| `routes/api.php` | 无 |
+| 所有控制器的 `$middleware` 属性 | 无 |
+| 所有控制器的构造函数 `$this->middleware()` | 无 |
+
+### 14.3 包源码中的 WebauthnMiddleware 作用（推测）
+
+包的 `WebauthnMiddleware`（`LaravelWebauthn\Http\Middleware\WebauthnMiddleware`）通常用于以下场景：
+- 拦截需要 Webauthn 二次验证的请求
+- 检查 session 中 `webauthn_auth` 标记是否存在
+- 如果未通过 Webauthn 验证，重定向到挑战页
+
+但项目中所有需要 Webauthn 验证的场景都通过**前端主动触发**（`WebauthnLogin.vue` 或 `WebauthnTest.vue`），不依赖后端中间件拦截。因此该中间件别名只是注册了但从未使用，属于**残留代码**。
+
+---
+
+## 十五、自动登录 cookie 命名分析：return vs webauthn_remember
+
+**链路状态：✅ 生产代码真实生效，❌ 测试代码过时不匹配**
+
+### 15.1 生产代码的 cookie 命名：`return`
+
+**写入位置**（`app/Listeners/LoginListener.php#L15-L19`）：
+
+```php
+public function handle(Login $event)
+{
+    if ($event->remember && $event->user->webauthnKeys()->count() > 0) {
+        Cookie::queue('return', 'true', 60 * 24 * 365);
+    }
+}
+```
+
+- cookie 名称：**`return`**
+- cookie 值：**`'true'`**（字符串布尔值）
+- 有效期：1 年（60 × 24 × 365 分钟）
+- 触发条件：用户登录时勾选了"记住我"（`$event->remember === true`）**且**用户拥有至少一个 Webauthn 密钥
+
+**读取位置**（`app/Http/Controllers/Auth/LoginController.php#L36`）：
+
+```php
+$data['autologin'] = $request->cookie('return') === 'true';
+```
+
+读取后传递给前端 `Login.vue`，当 `autologin === true` 且设备支持平台认证器时，自动触发 Passkey 登录流程。
+
+### 15.2 测试代码的 cookie 命名：`webauthn_remember`（过时/错误）
+
+`tests/Feature/Controllers/Auth/LoginControllerTest.php#L47`：
+
+```php
+$response = $this->withCookie('webauthn_remember', $user->id)
+    ->get('/login', [/* Inertia headers */]);
+```
+
+- cookie 名称：**`webauthn_remember`**
+- cookie 值：**`$user->id`**（用户 ID，整数）
+
+### 15.3 不一致分析
+
+| 维度 | 生产代码（LoginListener + LoginController） | 测试代码（LoginControllerTest） |
+|------|------------------------------------------|-------------------------------|
+| cookie 名称 | `return` | `webauthn_remember` |
+| cookie 值 | `'true'`（字符串） | `$user->id`（整数） |
+| 匹配性 | ✅ 写入和读取一致 | ❌ 与生产代码不匹配 |
+
+**结论**：测试使用的是早期版本的 cookie 命名方案（`webauthn_remember` + 用户 ID），后来生产代码改为了更简洁的 `return` + `'true'`，但测试代码未同步更新。该测试目前应该**无法通过**（因为 `LoginController` 读取 `cookie('return')` 而非 `cookie('webauthn_remember')`），除非测试框架有特殊的 cookie 处理逻辑。
+
+---
+
+## 十六、链路生效状态总览：真实生效 vs 残留/未接入
+
+### ✅ 真实生效的链路
+
+| 链路 | 入口代码 | 核心实现 |
+|------|---------|---------|
+| **Passkey 首因登录** | 登录页 `WebauthnLogin.vue` → `webauthn.auth` | 包内置管线 `[AttemptToAuthenticate, PrepareAuthenticatedSession]` → `EloquentWebAuthnProvider` |
+| **Webauthn 二因验证** | 2FA 挑战页 `WebauthnLogin.vue` → `webauthn.auth` | 同上，共享同一端点和管线 |
+| **邮箱密码登录 + 2FA 拦截** | `POST /login` → Fortify 管线 | 自定义 `RedirectIfTwoFactorAuthenticatable` 替换 Fortify 默认 |
+| **OAuth 登录 + 2FA 拦截** | `auth/{driver}/callback` → 独立 Pipeline | 自定义 `AttemptToAuthenticateSocialite` |
+| **敏感操作密钥确认** | `ConfirmsPassword.vue` → `WebauthnTest.vue` → `webauthn.key.confirm` | 包的 `ConfirmableKeyController` → `ConfirmKey` action → `guard->attempt()` |
+| **敏感操作密码确认** | `ConfirmsPassword.vue` → `POST password.confirm` | Jetstream 内置 |
+| **密钥 used_at 时间更新** | 任何断言校验成功时自动触发 | `WebauthnAuthenticateListener` 监听 webauthn-lib 的 `AuthenticatorAssertionResponseValidationSucceededEvent` |
+| **自动登录 cookie（return）** | 登录成功后 `LoginListener` 写入 | `Cookie::queue('return', 'true')` + `LoginController` 读取 |
+| **Webauthn 密钥注册/更新/删除** | 设置页 `WebauthnKeys.vue` → `webauthn.store/update/destroy` | 包控制器 + 自定义响应类 `WebauthnUpdateResponse` / `WebauthnDestroyResponse` |
+
+### ❌ 残留/未接入/死代码
+
+| 代码 | 位置 | 状态说明 |
+|------|------|---------|
+| **`AttemptToAuthenticateWebauthn`** | `app/Actions/AttemptToAuthenticateWebauthn.php` | 是包内置 `AttemptToAuthenticate` 的简化副本，但未通过任何配置或回调接入 Webauthn 管线，仅自身和单元测试引用 |
+| **`WebauthnMiddleware` 别名** | `bootstrap/app.php#L29` 注册别名 `'webauthn'` | 全项目无任何路由或控制器使用该中间件别名，仅注册未使用 |
+| **测试中的 `webauthn_remember` cookie** | `tests/Feature/Controllers/Auth/LoginControllerTest.php#L47` | 测试使用旧命名 `webauthn_remember` + 用户 ID，生产代码已改为 `return` + `'true'`，测试与生产不一致 |
+
+---
+
+## 十七、事实层级标注（续：新增核对点）
+
+| 描述 | 事实层级 |
+|------|---------|
+| `ConfirmsPassword.vue` 在 8 处使用（WebauthnKeys 2 处 + TwoFactorAuthenticationForm 6 处） | 项目可验证（grep） |
+| `WebauthnTest.vue` POST 到 `webauthn.auth.options` 再 POST 到 `webauthn.key.confirm` | 项目可验证（组件源码） |
+| `ConfirmableKeyController::store()` 成功后写 `auth.password_confirmed_at` session | 包源码可验证 |
+| `ConfirmKey` action 调用 `$guard->attempt()` 与登录共享校验路径 | 包源码可验证 |
+| `WebauthnAuthenticateListener` 监听 webauthn-lib 的 `AuthenticatorAssertionResponseValidationSucceededEvent`（非包的 `WebauthnLogin`） | 项目可验证（监听器源码 use 语句 + handle 参数类型） |
+| 项目无 EventServiceProvider，通过 Laravel 11 事件自动发现注册监听器 | 项目可验证（文件不存在 + Laravel 11 机制） |
+| 包通过 `CanDispatchEvents` 解析回调将 PSR-14 事件桥接到 Laravel 事件系统 | 包源码可验证（`WebauthnServiceProvider::bindWebAuthnPackage()`） |
+| `bootstrap/app.php` 注册了 `webauthn` 中间件别名但无任何路由使用 | 项目可验证（grep 0 匹配） |
+| `LoginListener` 写入 `cookie('return', 'true')`，`LoginController` 读取 `cookie('return')` | 项目可验证 |
+| 测试使用 `cookie('webauthn_remember', $user->id)` 与生产代码不一致 | 项目可验证（测试源码 vs 生产源码对比） |
+
+---
+
+## 十八、代码走向的"为什么让人困惑"（续）
+
+9. **Webauthn 两种确认流程共享同一校验路径但入口完全不同**：登录（首因/二因）使用 `webauthn.auth` 路由走完整的登录管线（含 session 再生、Webauthn::login() 等），而敏感操作确认使用 `webauthn.key.confirm` 路由只做断言校验 + 写 `password_confirmed_at`。两者底层都通过 `guard->attempt()` → `EloquentWebAuthnProvider` 校验断言，但外层包装完全不同。
+
+10. **WebauthnAuthenticateListener 监听的是底层库事件而非包事件**：直觉上会以为它监听 Laravel Webauthn 包的 `WebauthnLogin` 事件，但实际上它监听的是 web-authn/webauthn-lib 的 `AuthenticatorAssertionResponseValidationSucceededEvent`——这是一个 PSR-14 事件，通过包的 `EventDispatcher` 桥接才能被 Laravel 事件系统捕获。不了解这层桥接会疑惑"这个监听器到底能不能被触发"。
+
+11. **测试与生产的 cookie 命名不一致**：测试使用 `webauthn_remember`，生产使用 `return`，如果只看测试会误以为系统使用 `webauthn_remember` cookie，但实际运行的代码完全不同。
+
+12. **WebauthnMiddleware 注册了但不用**：作为中间件别名注册在 `bootstrap/app.php` 中，看起来像是项目使用了这个中间件，但实际上全项目没有任何路由挂载它。它的存在容易让阅读者以为存在"通过中间件自动拦截 Webauthn 验证"的链路。
