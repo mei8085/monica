@@ -87,7 +87,7 @@ class ReminderTriggered extends Notification
 |----------|---------------|
 | [validate-email.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/resources/views/emails/notifications/validate-email.blade.php#L1-L14) | UserNotificationChannelEmailCreated |
 | [test-notification.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/resources/views/emails/notifications/test-notification.blade.php#L1-L10) | TestEmailSent |
-| `emails.user.invitation` | UserInvited |
+| [invitation.blade.php](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/resources/views/emails/user/invitation.blade.php#L1-L12) | UserInvited |
 
 视图中使用 `@lang()` 进行国际化翻译，使用 `{{ $variable }}` 输出变量，通过 `@component('mail::message')` 套用邮件布局。
 
@@ -281,9 +281,30 @@ private function schedule(): void
 
 #### 5.1.4 发送后的重调度
 
-[RescheduleContactReminderForChannel](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannel.php#L13-L88) 在每次提醒成功发送后，根据提醒类型计算下一次触发时间：
+[RescheduleContactReminderForChannel](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannel.php#L13-L88) 在每次提醒成功发送后，根据提醒类型计算下一次触发时间。
+
+**完整执行流程**：
+
+```
+execute(array $data)
+  ├─ validateRules() → 校验 contact_reminder_id、user_notification_channel_id、contact_reminder_scheduled_id
+  ├─ 加载 ContactReminder 和 UserNotificationChannel
+  ├─ 检查渠道是否 active，非活跃则抛出异常
+  └─ 检查提醒类型：
+      ├─ 若为 TYPE_ONE_TIME → DELETE FROM contact_reminder_scheduled WHERE id = ?
+      └─ 若为其他类型 → 执行 schedule()
+          ├─ 读取当前调度记录的 scheduled_at
+          ├─ 根据类型计算下一次时间：
+          │   ├─ TYPE_RECURRING_DAY → addDay()
+          │   ├─ TYPE_RECURRING_MONTH → addMonth()
+          │   └─ TYPE_RECURRING_YEAR → addYear()
+          └─ syncWithoutDetaching() → UPDATE 同一条记录的 scheduled_at
+```
+
+**关键代码**：
 
 ```php
+// 计算下一次时间
 switch ($this->contactReminder->type) {
     case ContactReminder::TYPE_RECURRING_DAY:
         $this->upcomingDate = $this->upcomingDate->addDay();
@@ -295,9 +316,16 @@ switch ($this->contactReminder->type) {
         $this->upcomingDate = $this->upcomingDate->addYear();
         break;
 }
+
+// 更新同一调度记录，不创建新记录
+$this->contactReminder->userNotificationChannels()->syncWithoutDetaching([
+    $this->userNotificationChannel->id => [
+        'scheduled_at' => $this->upcomingDate,
+    ]
+]);
 ```
 
-一次性提醒（`one_time`）发送后直接删除调度记录。
+> **重要**：时间计算基于上一次的 `scheduled_at` 而非当前时间，确保周期准确性（例如每月 31 日的提醒不会因为跨月而偏移）。
 
 ### 5.2 定时触发：Cron 调度
 
@@ -316,20 +344,37 @@ Schedule::job(ProcessScheduledContactReminders::class, 'minutes', 1);
 ```
 1. 获取当前时间（秒清零，避免时间窗口问题）
 2. 查询 contact_reminder_scheduled 中 scheduled_at <= 当前时间 的所有记录
-3. 逐条处理：
+3. 逐条处理（try 块内）：
    a. 加载 UserNotificationChannel 和 ContactReminder、Contact
-   b. 检查渠道是否 active
-   c. 通过 NameHelper 格式化联系人姓名
-   d. 根据渠道类型调用 Notification::route() 发送
-   e. 更新 triggered_at 标记已触发
-   f. 递增提醒触发次数 number_times_triggered
-   g. 调用 RescheduleContactReminderForChannel 安排下一次
-4. 异常处理：
+   b. 如果 contact !== null，调用 triggerNotification()
+      ├─ 检查渠道是否 active，非激活则直接返回
+      ├─ NameHelper::formatContactName() → 格式化联系人姓名
+      ├─ Notification::route($type, $channel->content)
+      │   └─ notify(new ReminderTriggered(...))
+      │       ├─ via() → 根据 type 返回 ['mail'] 或 ['telegram']
+      │       └─ toMail() / toTelegram()
+      │           ├─ 创建 UserNotificationSent 记录（sent_at = 当前时间）
+      │           └─ 构建 MailMessage / TelegramMessage（含 trans() 变量替换）
+      ├─ updateNumberOfTimesTriggered() → 递增 number_times_triggered
+      └─ RescheduleContactReminderForChannel.execute() → 安排下一次
+   c. updateScheduledContactReminderTriggeredAt() → 更新 triggered_at 时间标记
+4. 异常处理（catch 块）：
    a. 记录错误日志
-   b. 在 user_notification_sent 中记录错误
+   b. 在 user_notification_sent 中记录错误信息
    c. 累加渠道 fails 计数
    d. 失败次数 >= max_notification_failures（默认10）时自动停用渠道
 ```
+
+**关键执行顺序（经代码核准）**：
+
+| 顺序 | 操作 | 代码位置 | 说明 |
+|------|------|----------|------|
+| 1 | 发送通知 | [ProcessScheduledContactReminders@triggerNotification#L115-L116](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php#L115-L116) | 内部先创建 UserNotificationSent 记录 |
+| 2 | 递增触发次数 | [ProcessScheduledContactReminders@triggerNotification#L118](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php#L118) | `number_times_triggered` + 1 |
+| 3 | 重调度 | [ProcessScheduledContactReminders@triggerNotification#L120-L124](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php#L120-L124) | 一次性提醒删除调度记录，周期性更新 `scheduled_at` |
+| 4 | 标记触发时间 | [ProcessScheduledContactReminders@handle#L53](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php#L53) | 设置 `triggered_at` = 当前时间，**在 triggerNotification 返回后执行** |
+
+> **重要**：即使 `contact === null`（联系人已删除），仍会执行 `updateScheduledContactReminderTriggeredAt()` 标记为已触发，避免重复执行。
 
 **核心发送代码**：
 
@@ -396,7 +441,47 @@ CreateUserNotificationChannel.execute()
                               └─ Blade 渲染 + trans() 变量替换
 ```
 
-### 7.2 链路二：联系人提醒通知（核心链路）
+### 7.2 链路二：用户邀请邮件发送（从创建到排队）
+
+```
+UserController@store() [POST /settings/users]
+  └─ InviteUser.execute($data)
+      ├─ validateRules() → 校验 account_id、author_id、email、is_administrator
+      │   └─ 检查 email 在 users 表中唯一性
+      ├─ createUser() → 创建受邀用户记录
+      │   └─ User::create([
+      │          'account_id' => ...,
+      │          'email' => $data['email'],
+      │          'invitation_code' => (string) Str::uuid(),
+      │          'is_account_administrator' => $data['is_administrator'],
+      │       ])
+      └─ sendEmail() → 将邮件推入队列
+          └─ Mail::to($this->user->email)
+              └─ queue(new UserInvited($this->user, $this->author))
+                  └─ UserInvited 实现 ShouldQueue 接口 → 进入队列系统
+                      └─ Queue Worker 处理
+                          └─ UserInvited.build()
+                              ├─ 生成邀请链接：route('invitation.show', ['code' => $invitedUser->invitation_code])
+                              └─ markdown('emails.user.invitation')
+                                  ├─ with('userName', $this->user->name)
+                                  ├─ with('url', $invitationRoute)
+                                  └─ Blade 渲染
+                                      └─ invitation.blade.php → trans(':UserName invites you...', ['userName' => $userName])
+
+用户接受邀请（可选后续）：
+AcceptInvitation.execute()
+  ├─ findUserByInvitationCode() → 根据 invitation_code 查找用户
+  ├─ updateUser() → 设置姓名、密码、invitation_accepted_at、email_verified_at
+  └─ createNotificationChannel() → 自动创建默认邮件渠道（直接设置 verified_at 和 active）
+```
+
+**关键细节说明**：
+- [InviteUser](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Settings/ManageUsers/Services/InviteUser.php#L45-L70) 使用 `Mail::to()->queue()` 而非 `send()`，确保邮件异步发送不阻塞请求
+- [UserInvited](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Mail/UserInvited.php#L11-L42) 显式实现 `ShouldQueue` 接口，即使调用 `send()` 也会自动入队
+- 邀请邮件的收件人直接从 `User.email` 字段获取，不经过 UserNotificationChannel
+- 接受邀请时自动创建的邮件渠道跳过验证流程（`verify_email` = false），直接标记为已验证并激活
+
+### 7.3 链路三：联系人提醒通知（核心链路，执行顺序经代码核准）
 
 ```
 CreateContactReminder / UpdateContactReminder
@@ -407,21 +492,43 @@ Cron（每分钟）
   └─ ProcessScheduledContactReminders::dispatch()
       └─ Queue Worker 处理
           └─ ProcessScheduledContactReminders.handle()
-              ├─ 查询所有到期的 contact_reminder_scheduled 记录
-              └─ triggerNotification()
-                  ├─ NameHelper::formatContactName() → 变量替换格式化姓名
-                  ├─ Notification::route($type, $channel->content)
-                  │   └─ notify(new ReminderTriggered($channel, $label, $contactName))
-                  │       ├─ via() → 根据 type 返回 ['mail'] 或 ['telegram']
-                  │       ├─ toMail() / toTelegram()
-                  │       │   ├─ 创建 UserNotificationSent 记录
-                  │       │   └─ 构建 MailMessage / TelegramMessage（含 trans() 变量替换）
-                  │       └─ 实际发送（SwiftMailer / Telegram Bot API）
-                  ├─ increment('number_times_triggered')
-                  └─ RescheduleContactReminderForChannel.execute() → 安排下一次
+              ├─ $currentDate = Carbon::now(); $currentDate->second = 0;
+              ├─ 查询 contact_reminder_scheduled WHERE scheduled_at <= $currentDate
+              └─ foreach ($scheduledContactReminders as $scheduledReminder) {
+                  try {
+                      加载 UserNotificationChannel、ContactReminder、Contact
+                      if ($contact !== null) {
+                          triggerNotification($channel, $contact, $contactReminder, $scheduledReminder)
+                            │
+                            ├─ 【顺序 1】发送通知
+                            │   ├─ NameHelper::formatContactName() → 变量替换格式化姓名
+                            │   ├─ Notification::route($type, $channel->content)
+                            │   │   └─ notify(new ReminderTriggered($channel, $label, $contactName))
+                            │   │       ├─ via() → 根据 type 返回 ['mail'] 或 ['telegram']
+                            │   │       └─ toMail() / toTelegram()
+                            │   │           ├─ ✅ 创建 UserNotificationSent 记录（sent_at = 当前时间）
+                            │   │           └─ 构建消息（含 trans() 变量替换）
+                            │   └─ 实际发送（SwiftMailer / Telegram Bot API）
+                            │
+                            ├─ 【顺序 2】递增次数
+                            │   └─ updateNumberOfTimesTriggered() → number_times_triggered + 1
+                            │
+                            └─ 【顺序 3】重调度
+                                └─ RescheduleContactReminderForChannel.execute()
+                                    ├─ 检查渠道是否 active
+                                    ├─ 一次性提醒 → DELETE FROM contact_reminder_scheduled
+                                    └─ 周期性提醒 → 计算下一次时间 UPDATE scheduled_at
+                      }
+                      // 【顺序 4】标记触发时间（在 triggerNotification 之后）
+                      updateScheduledContactReminderTriggeredAt() → SET triggered_at = NOW()
+                  } catch (\Exception $e) {
+                      记录错误日志 + UserNotificationSent（含 error 字段）
+                      渠道 fails + 1，超过阈值自动停用
+                  }
+                }
 ```
 
-### 7.3 链路三：测试通知发送
+### 7.4 链路四：测试通知发送
 
 ```
 NotificationsTestController
@@ -433,8 +540,30 @@ NotificationsTestController
 
 ## 八、关键设计要点
 
+### 8.1 通用设计
+
 1. **多渠道抽象**：通过 Laravel Notification 的 `via()` 方法统一分发，新增渠道只需添加类型常量和对应的 `toXxx()` 方法
 2. **时区处理**：调度时将 UTC 时间转换为用户时区，结合用户偏好时间（`preferred_time`）计算实际触发时间
 3. **容错机制**：单条提醒发送失败不影响整体流程，连续失败超过阈值自动停用渠道
 4. **重复调度策略**：周期性提醒在每次发送后自动计算下一次触发时间，支持按天/月/年重复
 5. **发送可追溯**：所有发送行为（含失败）均写入 `user_notification_sent` 表，便于审计和排查
+
+### 8.2 用户邀请流程设计
+
+6. **异步非阻塞**：邀请邮件采用 `Mail::to()->queue()` 异步发送，避免阻塞 HTTP 请求
+7. **受邀用户预创建**：受邀用户在发送邀请前即创建账户（含 `invitation_code`），接受邀请时补全用户信息
+8. **邮件渠道自动创建**：接受邀请时自动创建邮件通知渠道，跳过验证流程直接激活
+
+### 8.3 提醒通知执行顺序设计
+
+9. **发送记录先于统计更新**：`UserNotificationSent` 记录在 `toMail()`/`toTelegram()` 开头创建，确保发送行为可追溯，即使后续步骤失败也有记录
+10. **触发时间标记后置**：`triggered_at` 在 `triggerNotification()` 完成后才更新，确保只有被正确执行完毕后才标记为已触发
+11. **重调度与发送解耦**：重调度逻辑在发送成功后独立执行，避免发送失败时仍可标记为已触发（即使重调度失败）
+12. **容错边界处理**：即使联系人已删除（`contact === null`）仍标记为已触发，避免僵尸调度记录重复执行
+
+### 8.4 重调度机制细节
+
+- **一次性提醒**：发送后直接 `DELETE` 调度记录，不再保留
+- **周期性提醒**：`UPDATE` 同一条调度记录的 `scheduled_at` 为下一次时间，避免创建新记录
+- **渠道状态校验**：重调度前检查 `userNotificationChannel.active`，确保渠道未被停用
+- **类型驱动计算**：基于上一次 `scheduled_at` 计算下一次时间，而非当前时间，确保周期准确
