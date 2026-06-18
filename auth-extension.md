@@ -727,8 +727,22 @@ webauthn.start() 被调用
   └─ 第 2 步：调用浏览器 startAuthentication({ optionsJSON: publicKey })
        → 用户完成安全密钥交互
        → POST route('webauthn.key.confirm')，提交断言数据
-       → 成功后 emit('success') → ConfirmsPassword.confirm() → emit('confirmed')
+       → 服务端返回 JsonResponse('', 201)（空 body + 201 状态码）
+       → 前端 .then(() => { emit('success') }) 检测到 2xx 即触发
 ```
+
+**成功回调传递链**（3 层 emit 传递）：
+
+```
+WebauthnTest.vue
+  → emit('success')                                    // 第 1 层：密钥确认成功
+  → ConfirmsPassword.vue @success="confirm()"
+    → confirm() { closeModal(); nextTick().then(() => emit('confirmed')) }  // 第 2 层：关闭弹窗
+    → 父组件 @confirmed="实际操作"
+      → 执行删除密钥、启用 2FA 等敏感操作                // 第 3 层：执行实际动作
+```
+
+密码确认走的是同样的传递链，只是第 1 层从 `WebauthnTest.emit('success')` 替换为 `confirmPassword()` 中 `axios.post('password.confirm')` 成功后的 `confirm()` 调用。两条路径的区别在于服务端写入 `auth.password_confirmed_at` 的位置不同（密码确认由 `PasswordConfirmationController` 写入，密钥确认由 `ConfirmableKeyController` 写入），但前端最终都汇合到同一个 `confirm()` 方法关闭弹窗并 `emit('confirmed')`。
 
 ### 12.4 服务端：ConfirmableKeyController（包源码验证）
 
@@ -754,7 +768,21 @@ public function store(Request $request): Responsable
 关键点：
 - 调用 `ConfirmKey` action 执行断言验证
 - 验证成功后写入 `auth.password_confirmed_at` 到 session（与密码确认使用同一个 session 键）
-- 返回 `KeyConfirmedResponse`（包内置）：Inertia 请求下返回 JSON `{ confirmed: true }`，普通请求重定向到 `config('webauthn.redirects.key-confirmation')`（项目中配置为 `/user/profile`）
+- 验证失败时返回 `FailedKeyConfirmedResponse`：JSON 请求抛 `ValidationException`（422 状态码，字段 `key`，消息 `__('Invalid key.')`）；普通请求 `back()->withErrors()`
+
+**可验证事实（包源码 `KeyConfirmedResponse::toResponse()`）**：
+
+```php
+public function toResponse($request)
+{
+    return $request->wantsJson()
+        ? new JsonResponse('', 201)
+        : redirect()->intended(Webauthn::redirects('key-confirmation'));
+}
+```
+
+- **JSON / Inertia 请求**：返回 `JsonResponse('', 201)`——**空 body** + HTTP 201 Created 状态码。前端 `WebauthnTest.vue#L57` 的 `.then(() => { emit('success') })` 只关心请求成功（2xx），不读取响应体内容
+- **普通请求**：重定向到 `config('webauthn.redirects.key-confirmation')`（项目中配置为 `/user/profile`）
 
 ### 12.5 ConfirmKey action（包源码验证）
 
@@ -771,7 +799,17 @@ public function __invoke(StatefulGuard $guard, Request $request): bool
 
 项目未设置 `$confirmKeyUsingCallback`，因此走 `$guard->attempt()` 分支——**与登录时的断言校验使用完全相同的路径**（`EloquentWebAuthnProvider::retrieveByCredentials()` → `validateCredentials()`）。
 
-此时用户已登录，`$request->user()` 非空，但 `$guard->attempt()` 仍会执行完整的凭据校验流程（根据断言中的 credentialId 查找密钥并验证签名）。
+**`$guard->attempt()` 在已登录用户上执行的副作用**：
+
+1. `retrieveByCredentials()` 根据断言中的 credentialId 查找密钥 → 找到关联用户
+2. `validateCredentials()` 调用 `Webauthn::validateAssertion()` 验证断言签名 → 验证通过 → 派发 `WebauthnLogin` 事件（带 `true` 第二参数）
+3. `$guard->attempt()` 内部调用 `Auth::login()` → **重新认证用户**（再生 session ID、派发 `Login` 事件、更新 `viaRemember` 标记）
+
+副作用 3 意味着密钥确认过程中：
+- `Login` 事件会被派发 → `LoginListener` 会被触发 → 如果用户有 Webauthn 密钥且 `remember` 为 true，会再次设置 `return` cookie
+- Session ID 会被再生 → 之前的 session 数据保持，但 ID 变化
+
+这些副作用在实践中通常无害（用户本已登录），但值得关注：密钥确认并非"只做校验"，它实际上**执行了一次完整的重新登录**。
 
 ---
 
@@ -809,7 +847,56 @@ public function handle(AuthenticatorAssertionResponseValidationSucceededEvent $e
 
 这是 web-authn/webauthn-lib（FIDO2/WebAuthn 规范的 PHP 实现）在断言验证成功时派发的底层事件。
 
-**注册机制**：项目中没有 `EventServiceProvider.php`，也没有在 `AppServiceProvider` 中显式调用 `Event::listen()` 注册该监听器。Laravel 11 通过**事件自动发现**机制工作：框架扫描 `app/Listeners/` 目录，根据 `handle()` 方法的类型提示自动推断监听器与事件的对应关系。
+**注册机制**：项目中没有 `App\Providers\EventServiceProvider.php`，也没有在 `AppServiceProvider` 中显式调用 `Event::listen()` 注册该监听器。事件自动发现通过 Laravel 11 的 `Application::configure()` 默认机制工作。
+
+**可验证事实（框架源码 `Illuminate\Foundation\Application::configure()`）**：
+
+```php
+public static function configure(?string $basePath = null)
+{
+    return (new Configuration\ApplicationBuilder(new static($basePath)))
+        ->withKernels()
+        ->withEvents()     // ← 默认调用
+        ->withCommands()
+        ->withProviders();
+}
+```
+
+**可验证事实（框架源码 `ApplicationBuilder::withEvents()`）**：
+
+```php
+public function withEvents(array|bool $discover = [])
+{
+    if (is_array($discover) && count($discover) > 0) {
+        AppEventServiceProvider::setEventDiscoveryPaths($discover);
+    }
+    if ($discover === false) {
+        AppEventServiceProvider::disableEventDiscovery();
+    }
+    if (! isset($this->pendingProviders[AppEventServiceProvider::class])) {
+        $this->app->booting(function () {
+            $this->app->register(AppEventServiceProvider::class);
+        });
+    }
+    $this->pendingProviders[AppEventServiceProvider::class] = true;
+    return $this;
+}
+```
+
+**完整的事件发现链路**：
+
+1. `bootstrap/app.php` 中 `Application::configure()` 默认调用 `->withEvents()`
+2. `withEvents()` 在 `app->booting()` 回调中注册 `Illuminate\Foundation\Support\Providers\EventServiceProvider`（框架内置的 `AppEventServiceProvider`）
+3. 该服务提供者的 `register()` 方法调用 `getEvents()`
+4. `getEvents()` 检查事件缓存（`bootstrap/cache/events.php`）：
+   - **有缓存** → 加载缓存中的事件映射
+   - **无缓存** → 调用 `discoveredEvents()` → `shouldDiscoverEvents()` → `discoverEvents()`
+5. `shouldDiscoverEvents()` 对基类 `EventServiceProvider` 本身返回 `true`（因为 `get_class($this) === __CLASS__`）
+6. `discoverEvents()` 使用 `DiscoverEvents::within()` 扫描 `app/Listeners` 目录，通过 `handle()` 方法的参数类型提示推断事件-监听器映射
+
+**结论**：虽然项目没有自定义 `EventServiceProvider`，但 `Application::configure()` → `withEvents()` 会自动注册框架内置的 `EventServiceProvider`。该提供者扫描 `app/Listeners/` 目录，根据 `handle()` 方法的参数类型提示自动发现 `WebauthnAuthenticateListener`（监听 `AuthenticatorAssertionResponseValidationSucceededEvent`）和 `LoginListener`（监听 `Login`）等监听器并注册。
+
+**生产环境注意**：`shouldDiscoverEvents()` 在非 local 环境下仍返回 `true`（对基类本身始终如此），但如果事件已被缓存（`php artisan event:cache`），则直接从缓存加载，跳过扫描。
 
 **可验证事实（包源码 `WebauthnServiceProvider::bindWebAuthnPackage()`）**：
 
@@ -822,14 +909,27 @@ $this->app->resolving(CanDispatchEvents::class,
 
 包在 `WebauthnServiceProvider` 中将 PSR-14 `EventDispatcherInterface` 绑定到 `LaravelWebauthn\Events\EventDispatcher`（适配 Laravel 事件系统），并在解析所有 `CanDispatchEvents` 对象时注入这个 dispatcher。这样 webauthn-lib 底层派发的 PSR-14 事件会被桥接到 Laravel 的事件系统，从而触发 `WebauthnAuthenticateListener`。
 
-### 13.4 触发场景
+### 13.4 触发场景与生效边界
 
-以下所有场景都会触发 `used_at` 更新：
-1. ✅ 登录页 Passkey 首因登录（断言校验成功）
-2. ✅ 双因素挑战页的 Webauthn 二因验证（断言校验成功）
-3. ✅ 敏感操作确认的密钥确认（`webauthn.key.confirm` 路由，断言校验成功）
+`WebauthnAuthenticateListener` 的触发取决于 webauthn-lib 的 `AuthenticatorAssertionResponseValidator` 是否成功完成了一次断言验证。事件派发点在 `Webauthn::validateAssertion()` 内部（由 `EloquentWebAuthnProvider::validateCredentials()` 调用），通过 PSR-14 → `LaravelWebauthn\Events\EventDispatcher` 桥接到 Laravel 事件系统。
 
-只要 webauthn-lib 的 `AuthenticatorAssertionResponseValidator` 成功验证了一个断言签名，就会派发该事件，监听器就会更新对应密钥的 `used_at`。
+**✅ 会触发 `used_at` 更新的场景**：
+
+1. **Passkey 首因登录**（`POST /webauthn/auth`）
+   - `AuthenticateController::store()` → `loginPipeline()` → `AttemptToAuthenticate::attemptLogin()` → `$guard->attempt()` → `validateCredentials()` → `Webauthn::validateAssertion()` ✓
+
+2. **Webauthn 二因验证**（`POST /webauthn/auth`，从 2FA 挑战页提交）
+   - 同首因登录，走完全相同的路径 ✓
+
+3. **密钥确认（敏感操作）**（`POST /webauthn/confirm-key`）
+   - `ConfirmableKeyController::store()` → `ConfirmKey::__invoke()` → `$guard->attempt()` → `validateCredentials()` → `Webauthn::validateAssertion()` ✓
+
+**❌ 不会触发 `used_at` 更新的场景**：
+
+1. **密钥注册/更新**（Attestation 流程）：使用 `AuthenticatorAttestationResponseValidator`，派发的是 `AuthenticatorAttestationResponseValidationSucceededEvent`（不同事件类）
+2. **密码登录**：不经过 `Webauthn::validateAssertion()`
+3. **OAuth 登录**：不经过 `Webauthn::validateAssertion()`
+4. **TOTP 二因验证**：走 Fortify 内置的 `TwoFactorAuthenticateAction`，不涉及断言校验
 
 ---
 
@@ -936,7 +1036,7 @@ $response = $this->withCookie('webauthn_remember', $user->id)
 | **Webauthn 二因验证** | 2FA 挑战页 `WebauthnLogin.vue` → `webauthn.auth` | 同上，共享同一端点和管线 |
 | **邮箱密码登录 + 2FA 拦截** | `POST /login` → Fortify 管线 | 自定义 `RedirectIfTwoFactorAuthenticatable` 替换 Fortify 默认 |
 | **OAuth 登录 + 2FA 拦截** | `auth/{driver}/callback` → 独立 Pipeline | 自定义 `AttemptToAuthenticateSocialite` |
-| **敏感操作密钥确认** | `ConfirmsPassword.vue` → `WebauthnTest.vue` → `webauthn.key.confirm` | 包的 `ConfirmableKeyController` → `ConfirmKey` action → `guard->attempt()` |
+| **敏感操作密钥确认** | `ConfirmsPassword.vue` → `WebauthnTest.vue` → `webauthn.key.confirm` | 包的 `ConfirmableKeyController` → `ConfirmKey` action → `guard->attempt()`（⚠️ 副作用：重新登录 + 派发 Login 事件） |
 | **敏感操作密码确认** | `ConfirmsPassword.vue` → `POST password.confirm` | Jetstream 内置 |
 | **密钥 used_at 时间更新** | 任何断言校验成功时自动触发 | `WebauthnAuthenticateListener` 监听 webauthn-lib 的 `AuthenticatorAssertionResponseValidationSucceededEvent` |
 | **自动登录 cookie（return）** | 登录成功后 `LoginListener` 写入 | `Cookie::queue('return', 'true')` + `LoginController` 读取 |
@@ -960,8 +1060,14 @@ $response = $this->withCookie('webauthn_remember', $user->id)
 | `WebauthnTest.vue` POST 到 `webauthn.auth.options` 再 POST 到 `webauthn.key.confirm` | 项目可验证（组件源码） |
 | `ConfirmableKeyController::store()` 成功后写 `auth.password_confirmed_at` session | 包源码可验证 |
 | `ConfirmKey` action 调用 `$guard->attempt()` 与登录共享校验路径 | 包源码可验证 |
+| `KeyConfirmedResponse::toResponse()` 对 JSON 请求返回 `JsonResponse('', 201)`（空 body + 201 状态码） | 包源码可验证 |
+| `FailedKeyConfirmedResponse::toResponse()` 对 JSON 请求抛 `ValidationException`（422，字段 key，消息 "Invalid key."） | 包源码可验证 |
+| `WebauthnTest.vue` 的 `.then()` 只检测 2xx 状态码即 emit('success')，不读取响应体 | 项目可验证（组件源码） |
+| `ConfirmKey` 调用 `$guard->attempt()` 会导致 `Auth::login()` 重新认证已登录用户（再生 session、派发 Login 事件） | 包源码 + 框架源码可验证 |
+| `ConfirmsPassword.vue` 密码确认与密钥确认共享同一个 `confirm()` → `emit('confirmed')` 出口 | 项目可验证（组件源码） |
 | `WebauthnAuthenticateListener` 监听 webauthn-lib 的 `AuthenticatorAssertionResponseValidationSucceededEvent`（非包的 `WebauthnLogin`） | 项目可验证（监听器源码 use 语句 + handle 参数类型） |
-| 项目无 EventServiceProvider，通过 Laravel 11 事件自动发现注册监听器 | 项目可验证（文件不存在 + Laravel 11 机制） |
+| 事件自动发现通过 `Application::configure()` → `withEvents()` 注册框架内置 `EventServiceProvider` 实现 | 框架源码可验证（`ApplicationBuilder::withEvents()` + `EventServiceProvider::register()` + `discoverEvents()`） |
+| `shouldDiscoverEvents()` 对基类 `EventServiceProvider` 本身返回 `true`，因此自动发现默认启用 | 框架源码可验证（`get_class($this) === __CLASS__` 条件） |
 | 包通过 `CanDispatchEvents` 解析回调将 PSR-14 事件桥接到 Laravel 事件系统 | 包源码可验证（`WebauthnServiceProvider::bindWebAuthnPackage()`） |
 | `bootstrap/app.php` 注册了 `webauthn` 中间件别名但无任何路由使用 | 项目可验证（grep 0 匹配） |
 | `LoginListener` 写入 `cookie('return', 'true')`，`LoginController` 读取 `cookie('return')` | 项目可验证 |
@@ -975,6 +1081,10 @@ $response = $this->withCookie('webauthn_remember', $user->id)
 
 10. **WebauthnAuthenticateListener 监听的是底层库事件而非包事件**：直觉上会以为它监听 Laravel Webauthn 包的 `WebauthnLogin` 事件，但实际上它监听的是 web-authn/webauthn-lib 的 `AuthenticatorAssertionResponseValidationSucceededEvent`——这是一个 PSR-14 事件，通过包的 `EventDispatcher` 桥接才能被 Laravel 事件系统捕获。不了解这层桥接会疑惑"这个监听器到底能不能被触发"。
 
-11. **测试与生产的 cookie 命名不一致**：测试使用 `webauthn_remember`，生产使用 `return`，如果只看测试会误以为系统使用 `webauthn_remember` cookie，但实际运行的代码完全不同。
+11. **事件发现机制是隐式的**：项目中没有 `App\Providers\EventServiceProvider`，也没有任何 `Event::listen()` 调用注册 `LoginListener` 和 `WebauthnAuthenticateListener`。它们的注册完全依赖 `Application::configure()` → `withEvents()` 自动注册的框架内置 `EventServiceProvider`。这个机制在项目代码中完全看不到，需要追踪框架源码才能理解。
 
-12. **WebauthnMiddleware 注册了但不用**：作为中间件别名注册在 `bootstrap/app.php` 中，看起来像是项目使用了这个中间件，但实际上全项目没有任何路由挂载它。它的存在容易让阅读者以为存在"通过中间件自动拦截 Webauthn 验证"的链路。
+12. **密钥确认的 `$guard->attempt()` 有副作用**：直觉上密钥确认应该"只做校验"，但 `ConfirmKey` action 调用的 `$guard->attempt()` 实际上执行了一次完整的重新登录（包括 `Auth::login()`、再生 session、派发 `Login` 事件），在已登录用户身上产生意料之外的副作用。
+
+13. **测试与生产的 cookie 命名不一致**：测试使用 `webauthn_remember`，生产使用 `return`，如果只看测试会误以为系统使用 `webauthn_remember` cookie，但实际运行的代码完全不同。
+
+14. **WebauthnMiddleware 注册了但不用**：作为中间件别名注册在 `bootstrap/app.php` 中，看起来像是项目使用了这个中间件，但实际上全项目没有任何路由挂载它。它的存在容易让阅读者以为存在"通过中间件自动拦截 Webauthn 验证"的链路。
