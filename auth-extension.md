@@ -1,8 +1,8 @@
 # Monica 登录认证扩展层代码走向
 
-Monica 的认证体系基于 Laravel 生态的三层扩展框架搭建：**Fortify**（无 UI 的后端认证管线）、**Jetstream**（Inertia 前端脚手架）和 **Laravel Webauthn**（asbiin/laravel-webauthn，Passkey / 安全密钥认证）。在此基础上，项目通过 Socialite 接入了外部 OAuth/SAML 提供商。
+Monica 的认证体系基于 Laravel 生态的三层扩展框架搭建：**Fortify**（无 UI 的后端认证管线）、**Jetstream**（Inertia 前端脚手架）和 **Laravel Webauthn**（asbiin/laravel-webauthn v5.3.0，Passkey / 安全密钥认证）。在此基础上，项目通过 Socialite 接入了外部 OAuth/SAML 提供商。
 
-下面按代码执行顺序，重点讲清 **Webauthn 安全密钥登录**的完整链路（从登录页、双因素挑战页到服务端断言校验），并对比三条登录管线的关系。
+下面按代码执行顺序，讲清 **Webauthn 安全密钥登录**的完整链路（从登录页、双因素挑战页到服务端断言校验），严格区分项目内可验证事实与依赖包机制，并对比三条登录管线的关系。
 
 ---
 
@@ -12,7 +12,7 @@ Monica 的认证体系基于 Laravel 生态的三层扩展框架搭建：**Forti
 
 `config/auth.php#L38-L43` 定义了唯一的 guard `web`，使用 `session` 驱动。
 
-**关键设计点**：User Provider 的驱动被设为 `webauthn`（而非默认的 `eloquent`）——这意味着用户检索逻辑经过了 Laravel Webauthn 包的包装。实质上仍以 `App\Models\User` 为模型，但在用户认证环节增加了 Webauthn 凭据的感知与校验能力。
+**关键设计点**：User Provider 的驱动被设为 `webauthn`（而非默认的 `eloquent`）：
 
 `config/auth.php#L62-L66`：
 ```php
@@ -24,7 +24,7 @@ Monica 的认证体系基于 Laravel 生态的三层扩展框架搭建：**Forti
 ],
 ```
 
-这个 `webauthn` 驱动来自 asbiin/laravel-webauthn 包，它会在 `Guard::attempt()` 时判断提交的凭据是密码还是 Webauthn 断言数据，并据此走不同的认证分支。
+**可验证事实（包源码）**：`webauthn` 驱动由 `WebauthnServiceProvider::passwordLessWebauthn()` 注册，对应类为 `LaravelWebauthn\Auth\EloquentWebAuthnProvider`。它继承 `EloquentUserProvider`，在 `retrieveByCredentials()` 中增加了凭据 ID 查用户的能力，在 `validateCredentials()` 中增加了 WebAuthn 断言校验和密码 fallback 逻辑。
 
 ### 2. Fortify Pipeline 自定义
 
@@ -49,11 +49,13 @@ Fortify 默认管线中的 `RedirectIfTwoFactorAuthenticatable` 是包内置的�
 - `guard` 为 `web`，与 Fortify 使用同一个 guard
 - `prefix` 为 `webauthn`，所有 Webauthn 路由将挂载在 `/webauthn/*` 路径下
 - `middleware` 为 `['web']`，应用 session 中间件
+- `limiters.login` 为 `'login'`（非 null），这意味着 Webauthn 认证管线中的 `EnsureLoginIsNotThrottled` 会被跳过，改由路由中间件 `throttle:login` 处理限流
 - `userless` 由 `WEBAUTHN_USERLESS` 环境变量控制，默认为 `true`——即支持"无用户名登录"（Passkey 一键登录，无需输入邮箱）
 - `redirects.login` 指向 `/vaults`
 - `views.authenticate` 和 `views.register` 均为 `null`，表示不使用包内置的 Blade 视图，全部走 Inertia 前端
 - `session_name` 为 `webauthn_auth`，用于存储已通过 Webauthn 验证的状态
 - `model` 使用自定义的 `App\Models\WebauthnKey`（扩展了 `used_at` 字段）
+- **没有 `pipelines.login` 配置项**——这是决定 Webauthn 认证管线是否被自定义的关键配置
 
 ### 4. Webauthn 中间件注册
 
@@ -61,13 +63,13 @@ Fortify 默认管线中的 `RedirectIfTwoFactorAuthenticatable` 是包内置的�
 
 ### 5. Webauthn 响应类绑定
 
-`app/Providers/AppServiceProvider.php#L154-L155` 在 boot() 中将 Webauthn 密钥创建和删除的响应类绑定到了项目自定义实现：
+`app/Providers/AppServiceProvider.php#L154-L155` 在 boot() 中将 Webauthn 密钥更新和删除的响应类绑定到了项目自定义实现：
 ```php
 Webauthn::updateViewResponseUsing(WebauthnUpdateResponse::class);
 Webauthn::destroyViewResponseUsing(WebauthnDestroyResponse::class);
 ```
 
-这两个类 (`app/Http/Controllers/Profile/WebauthnUpdateResponse.php` 和 `WebauthnDestroyResponse.php`) 实现了包提供的契约，控制 Inertia 请求下的重定向行为。
+**可验证事实**：项目**没有**调用 `Webauthn::loginSuccessResponseUsing()`、`Webauthn::loginViewResponseUsing()`、`Webauthn::authenticateThrough()`、`Webauthn::authenticateUsing()` 中的任何一个。这意味着 Webauthn 登录流程完全使用包内置的默认行为。
 
 ### 6. 外部登录提供商
 
@@ -75,7 +77,35 @@ Webauthn::destroyViewResponseUsing(WebauthnDestroyResponse::class);
 
 ---
 
-## 二、Webauthn 登录路径一：登录页 Passkey 首因登录
+## 二、Webauthn 路由注册（包源码验证）
+
+**可验证事实（包源码 `routes/routes.php`）**：asbiin/laravel-webauthn v5.3.0 注册了以下路由：
+
+| 路由名 | 方法 | 路径 | 控制器 | 中间件 |
+|--------|------|------|--------|--------|
+| `webauthn.auth.options` | POST | `/webauthn/auth/options` | `AuthenticateController::create` | `web` + `throttle:login` |
+| `webauthn.auth` | POST | `/webauthn/auth` | `AuthenticateController::store` | `web` + `throttle:login` |
+| `webauthn.login` | GET | `/webauthn/auth` | `AuthenticateController::create` | `web` + `throttle:login`（**仅当** `config('webauthn.views.authenticate') !== null` 时注册） |
+| `webauthn.store.options` | POST | `/webauthn/keys/options` | `WebauthnKeyController::create` | `web` + `auth:web` |
+| `webauthn.store` | POST | `/webauthn/keys` | `WebauthnKeyController::store` | `web` + `auth:web` |
+| `webauthn.destroy` | DELETE | `/webauthn/keys/{id}` | `WebauthnKeyController::destroy` | `web` + `auth:web` |
+| `webauthn.update` | PUT | `/webauthn/keys/{id}` | `WebauthnKeyController::update` | `web` + `auth:web` |
+| `webauthn.key.confirm` | POST | `/webauthn/confirm-key` | `ConfirmableKeyController::store` | `web` + `auth:web` |
+
+**注意**：`webauthn.login` GET 路由因为 `config('webauthn.views.authenticate')` 为 `null`，**不会被注册**。项目只使用 `webauthn.auth.options` 和 `webauthn.auth` 两个认证路由。
+
+路由注册代码位于 `WebauthnServiceProvider::configureRoutes()`：
+```php
+$this->app['router']->group([
+    'namespace' => 'LaravelWebauthn\Http\Controllers',
+    'domain' => config('webauthn.domain', null),
+    'prefix' => config('webauthn.prefix', 'webauthn'),
+], fn () => $this->loadRoutesFrom(__DIR__.'/../routes/routes.php'));
+```
+
+---
+
+## 三、Webauthn 登录路径一：登录页 Passkey 首因登录
 
 这是"无密码登录"场景——用户在登录页直接使用 Passkey/安全密钥完成认证，无需输入邮箱和密码。
 
@@ -91,7 +121,7 @@ Webauthn::destroyViewResponseUsing(WebauthnDestroyResponse::class);
     └─ 渲染 Auth/Login.vue，传递 publicKey、userless、autologin、providers 等数据
 ```
 
-**代码证据**：`app/Http/Controllers/Auth/LoginController.php#L33-L37`
+**代码证据**（`app/Http/Controllers/Auth/LoginController.php#L33-L37`）：
 ```php
 if (Webauthn::userless()) {
     $data['publicKey'] = Webauthn::prepareAssertion(null);
@@ -153,64 +183,147 @@ authForm
   .post(route('webauthn.auth'), { ... });
 ```
 
-路由 `webauthn.auth` 由 Laravel Webauthn 包自动注册，挂载在 `/webauthn/auth`（路径前缀来自 `config/webauthn.php#L55`）。
+### 第 5 步：服务端 Webauthn 认证管线
 
-### 第 5 步：服务端 Webauthn 管线与自定义 AttemptToAuthenticateWebauthn
+POST 请求到达 `/webauthn/auth`，由包的 `AuthenticateController::store()` 处理。
 
-Laravel Webauthn 包在内部有类似 Fortify 的 Pipeline 机制，将登录请求按管道顺序处理。**项目自定义的 `app/Actions/AttemptToAuthenticateWebauthn.php` 就是这个管线中的核心认证管道**（替代或扩展了包内置的对应动作）。
-
-`AttemptToAuthenticateWebauthn::handle()`（`app/Actions/AttemptToAuthenticateWebauthn.php#L32-L42`）：
+**可验证事实（包源码 `AuthenticateController::store()`）**：
 ```php
-public function handle(Request $request, $next)
+public function store(WebauthnLoginRequest $request): LoginSuccessResponse
 {
+    return $this->loginPipeline($request)->then(function ($request) {
+        Webauthn::login($request->user());
+        return app(LoginSuccessResponse::class);
+    });
+}
+```
+
+**可验证事实（包源码 `AuthenticateController::loginPipeline()`）**：管线选择逻辑按优先级：
+1. 如果 `Webauthn::$authenticateThroughCallback` 不为 null → 使用回调返回的管道数组
+2. 如果 `config('webauthn.pipelines.login')` 是数组 → 使用配置的管道数组
+3. 否则使用默认管线
+
+**项目实际走第 3 条**（可验证：`config/webauthn.php` 无 `pipelines.login` 键，项目无 `authenticateThrough` 调用）。
+
+默认管线代码：
+```php
+return (new Pipeline(app()))->send($request)->through(array_filter([
+    config('webauthn.limiters.login') !== null ? null : EnsureLoginIsNotThrottled::class,
+    AttemptToAuthenticate::class,
+    PrepareAuthenticatedSession::class,
+]));
+```
+
+因为 `config('webauthn.limiters.login')` 为 `'login'`（非 null），`EnsureLoginIsNotThrottled` 被 `array_filter` 移除。**实际管线为 `[AttemptToAuthenticate, PrepareAuthenticatedSession]`**。
+
+### 第 6 步：包内置 AttemptToAuthenticate 的 OR 短路逻辑
+
+**可验证事实（包源码 `LaravelWebauthn\Actions\AttemptToAuthenticate::handle()`）**：
+```php
+public function handle(Request $request, Closure $next): mixed
+{
+    if (Webauthn::$authenticateUsingCallback !== null) {
+        return $this->handleUsingCustomCallback($request, $next);
+    }
     if ($this->attemptValidateAssertion($request)
         || $this->attemptLogin($this->filterCredentials($request), $request->boolean('remember'))) {
         return $next($request);
     }
-
     $this->throwFailedAuthenticationException($request);
     return null;
 }
 ```
 
-这里用了一个短路 OR `||`，按顺序尝试两种认证模式：
+项目没有设置 `Webauthn::$authenticateUsingCallback`，所以走 OR 短路逻辑：
 
-**模式 A：`attemptValidateAssertion()`（2FA 场景，用户已登录）**
+**模式 A：`attemptValidateAssertion()`**（`$request->user()` 非空时）
 - 检查 `$request->user()` 是否非空
-- 如果已登录，调用 `WebauthnFacade::validateAssertion($user, $credentials)` 验证断言——此时用户身份已知，只校验密钥签名
-- 验证失败则触发 Failed 事件并抛异常
+- 如果已登录，调用 `WebauthnFacade::validateAssertion($user, $credentials)` 验证断言
+- 用于"已登录用户再次验证 WebAuthn"的场景（如敏感操作确认）
 
-**模式 B：`attemptLogin()`（Passkey 首因登录，用户未登录）**
+**模式 B：`attemptLogin()`**（`$request->user()` 为 null 时）
 - 调用 `$this->guard->attempt($credentials, $remember)`
-- 因为 auth.providers.users.driver 是 `webauthn`，Guard 的 attempt() 会调用 Webauthn UserProvider
-- UserProvider 先根据断言中的 `userHandle` 或邮箱查找用户，再验证签名有效性
-- 验证通过后完成标准 Laravel session 登录
+- `$credentials` 来自 `filterCredentials()`：`$request->only(['id', 'rawId', 'response', 'type'])`
+- Guard 使用 `webauthn` 驱动的 `EloquentWebAuthnProvider`
 
-在**登录页 Passkey 登录场景**中，用户尚未登录，所以 `attemptValidateAssertion()` 返回 `false`，自动进入 `attemptLogin()` 分支。
+在**登录页 Passkey 登录场景**中，用户尚未登录，`$request->user()` 为 null，`attemptValidateAssertion()` 返回 false，走 `attemptLogin()` 分支。
 
-`filterCredentials()`（`app/Actions/AttemptToAuthenticateWebauthn.php#L109-L112`）只保留 Webauthn 断言字段：
+### 第 7 步：EloquentWebAuthnProvider 的凭据 ID 查找与断言校验
+
+**可验证事实（包源码 `EloquentWebAuthnProvider`）**：
+
+`retrieveByCredentials()`：
 ```php
-protected function filterCredentials(Request $request): array
+public function retrieveByCredentials(array $credentials): ?User
 {
-    return $request->only(['id', 'rawId', 'response', 'type']);
+    if ($this->isSignedChallenge($credentials)) {
+        try {
+            $webauthnKey = (Webauthn::model())::where('credentialId', Base64UrlSafe::encode(Base64::decode($credentials['id'])))
+                ->orWhere('credentialId', Base64UrlSafe::encodeUnpadded(Base64::decode($credentials['id'])))
+                ->firstOrFail();
+            return $this->retrieveById($webauthnKey->user_id);
+        } catch (ModelNotFoundException $e) {
+            return null;
+        }
+    }
+    return parent::retrieveByCredentials($credentials);
 }
 ```
 
-### 第 6 步：管线后续处理与登录成功
+当 `$credentials` 包含 `id`、`rawId`、`type`、`response`（即 WebAuthn 断言数据）时，`isSignedChallenge()` 返回 true，Provider 根据 `credentialId` 查找 `webauthn_keys` 表，找到关联的密钥记录，再通过 `user_id` 返回用户。
 
-`AttemptToAuthenticateWebauthn` 认证通过后，`return $next($request)` 将请求传递给 Webauthn 管线的后续管道。包内后续的默认管道通常包含：
-- 记录 WebauthnKey 的最后使用时间（`used_at` 字段）
-- 写入 `webauthn_auth` session（`config/webauthn.php#L158` 的 session_name）
-- 触发 `Login` 事件
-- 重定向到 `redirects.login`（`/vaults`）
+`validateCredentials()`：
+```php
+public function validateCredentials(User $user, array $credentials): bool
+{
+    if ($this->isSignedChallenge($credentials)
+        && Webauthn::validateAssertion($user, $credentials)) {
+        WebauthnLogin::dispatch($user, true);
+        return true;
+    }
+    if ($this->fallback) {
+        return parent::validateCredentials($user, $credentials);
+    }
+    return false;
+}
+```
 
-`Login` 事件触发后，`app/Listeners/LoginListener.php#L15-L19` 会检查：如果用户勾选了 "记住我" 且拥有 Webauthn 密钥，则设置 `return` cookie（有效期一年），下次自动触发 Passkey 登录。
+验证通过后派发 `WebauthnLogin` 事件（带第二个参数 `true`，表示来自断言校验）。如果凭据不是 WebAuthn 格式且 `fallback` 为 `true`（默认），则回退到密码校验。
+
+`$guard->attempt()` 内部会依次调用 `retrieveByCredentials()` 和 `validateCredentials()`，两者都通过后调用 `Auth::login()` 建立登录 session。
+
+### 第 8 步：管线后续与登录完成
+
+管线后续管道：
+1. **`PrepareAuthenticatedSession`**（包内置）：调用 `$request->session()->regenerate()` 再生 session、清除速率限制
+2. **管线 then 回调**：调用 `Webauthn::login($request->user())`
+
+**可验证事实（包源码 `Webauthn::login()`）**：
+```php
+public static function login(?User $user): void
+{
+    session([static::sessionName() => true]);
+    if ($user !== null) {
+        WebauthnLogin::dispatch($user);
+    }
+}
+```
+
+`Webauthn::login()` 做两件事：
+- 将 `webauthn_auth = true` 写入 session（标记"已通过 Webauthn 验证"）
+- 派发 `WebauthnLogin` 事件（不带第二个参数，与 `validateCredentials` 中的派发不同）
+
+**注意**：`WebauthnLogin` 事件在此流程中被**派发了两次**——一次在 `EloquentWebAuthnProvider::validateCredentials()` 中（带 `true` 参数），一次在 `Webauthn::login()` 中（不带 `true` 参数）。
+
+3. **`LoginSuccessResponse`**（包内置，未被项目覆盖）：对于 Inertia 请求（wantsJson），返回 JSON `{ result: true, callback: '/vaults' }`；对于普通请求，重定向到 `/vaults`。
+
+`Login` 事件触发后，`app/Listeners/LoginListener.php#L15-L19` 会检查：如果用户勾选了"记住我"且拥有 Webauthn 密钥，则设置 `return` cookie（有效期一年），下次自动触发 Passkey 登录。
 
 此外，`app/Providers/AppServiceProvider.php#L157` 订阅了包内的 `LoginViaRemember` 监听器，用于处理 Laravel 记住我 cookie 触发的自动登录中的 Webauthn 相关逻辑。
 
 ---
 
-## 三、Webauthn 登录路径二：双因素挑战页的第二因素验证
+## 四、Webauthn 登录路径二：双因素挑战页的第二因素验证
 
 这是"用户先输入邮箱密码，然后再用安全密钥做第二因素"的场景。
 
@@ -219,7 +332,7 @@ protected function filterCredentials(Request $request): array
 用户提交邮箱密码到 `/login`，请求进入 Fortify Pipeline：
 1. **管道 1**：`app/Actions/Fortify/RedirectIfTwoFactorAuthenticatable.php#L28-L38`
    - `validateCredentials()` 通过 email 查用户并验证密码（此时不登录，只验证凭据）
-   - 判断是否需要 2FA（`config/fortify.php#L32-L34`）：
+   - 判断是否需要 2FA（`app/Actions/Fortify/RedirectIfTwoFactorAuthenticatable.php#L32-L34`）：
      ```php
      if ((optional($user)->two_factor_secret && ! is_null(optional($user)->two_factor_confirmed_at))
          || Webauthn::enabled($user)) {
@@ -256,7 +369,9 @@ public function toResponse($request)
 }
 ```
 
-**注意与登录页的区别**：此处调用 `Webauthn::prepareAssertion($user)` 传入了**具体用户对象**，生成的是针对该用户的断言挑战（非 userless 模式）。浏览器只会查找属于该用户的安全密钥，不会列出所有 Passkey。
+**与登录页的关键区别**：此处调用 `Webauthn::prepareAssertion($user)` 传入了**具体用户对象**，生成的是针对该用户的断言挑战（非 userless 模式）。浏览器只会查找属于该用户的安全密钥，不会列出所有 Passkey。
+
+**`login.id` session 的作用**：仅用于 `TwoFactorChallengeView` 渲染挑战页时获取用户信息，以便调用 `Webauthn::prepareAssertion($user)` 生成绑定该用户的公钥挑战。`login.id` **不参与**后续的 WebAuthn 断言校验流程。
 
 ### 第 3 步：双因素挑战页前端逻辑
 
@@ -275,34 +390,56 @@ public function toResponse($request)
 
 ### 第 4 步：服务端断言校验（2FA 场景）
 
-POST 到 `webauthn.auth` 后，再次进入 Laravel Webauthn 的管线和自定义 `AttemptToAuthenticateWebauthn`。
+POST 到 `webauthn.auth` 后，进入与首因登录**完全相同**的管线和控制器逻辑。
 
-但这次走**模式 A**：
-- `attemptValidateAssertion()` 中 `$request->user()` 为 `null`（用户还未登录，session 中只有 `login.id`）
-- 等等，这里有个关键点需要理清：此时用户到底有没有登录？
+关键问题：此时用户尚未被 guard 登录（Fortify 只验证了密码，未调用 `Auth::login()`），`$request->user()` 为 null。流程如何找到正确用户？
 
-实际流程是：**Fortify 的 RedirectIfTwoFactorAuthenticatable 只验证了密码，没有调用 `Auth::login()`**。用户在 session 中的状态只有 `login.id`，并未被 Laravel guard 识别为已认证。
+**可验证事实（包源码）**：`AttemptToAuthenticate::handle()` 中：
+1. `attemptValidateAssertion()` → `$request->user()` 为 null → 返回 false
+2. `attemptLogin()` → 调用 `$this->guard->attempt($credentials, $remember)`
+3. `$credentials` 为 `{id, rawId, response, type}` — 来自前端 WebAuthn 断言
+4. `EloquentWebAuthnProvider::retrieveByCredentials()` 检测到 `isSignedChallenge()` 为 true，**根据 `credentials['id']`（凭据 ID）查 `webauthn_keys` 表**，找到密钥记录的 `user_id`，再通过 `retrieveById()` 返回用户
+5. `EloquentWebAuthnProvider::validateCredentials()` 调用 `Webauthn::validateAssertion($user, $credentials)` 验证签名
+6. 验证通过后 `$guard->attempt()` 调用 `Auth::login()` 建立登录 session
 
-那 Webauthn 包是如何知道验证哪个用户的？答案是：**Webauthn 包内部从 session 中读取 `login.id`，用它来确定目标用户。**这是 asbiin/laravel-webauthn 包的内部机制——包的控制器在处理 `webauthn.auth` 路由时，会优先检查 session 中的 `login.id`（Fortify 设置的），如果存在就以该用户为上下文验证断言，并在验证通过后完成登录流程（写入 session、触发 Login 事件等）。
+**核心结论**：2FA 场景下用户的查找**完全依赖断言数据中的凭据 ID**，而非 session 中的 `login.id`。`login.id` 仅用于渲染挑战页时生成绑定用户的公钥参数。
 
-因此在 2FA 场景下，`AttemptToAuthenticateWebauthn` 的实际行为是：
-- `attemptValidateAssertion()` 中 `$request->user()` 返回 null，返回 false
-- `attemptLogin()` 被调用，Webauthn UserProvider 不是根据密码而是根据断言中的凭据 ID 查找用户
-- 或者（更准确地说是包的内部工作方式）：Webauthn 包的控制器在进入管线之前就已经从 session 的 `login.id` 确定了目标用户，直接调用包内部的 `Webauthn::validateAssertion($userFromSession, $credentials)`，验证通过后再调用 `Auth::login()`
-
-无论哪种方式，最终结果一致：断言验证通过即完成登录，重定向到 `/vaults`。
+后续步骤与首因登录一致：`PrepareAuthenticatedSession` → `Webauthn::login()` → `LoginSuccessResponse`。
 
 ---
 
-## 四、Webauthn 密钥注册（安全密钥创建）流程
+## 五、`AttemptToAuthenticateWebauthn` 的定位与事实校准
+
+### 项目内的引用关系
+
+`app/Actions/AttemptToAuthenticateWebauthn.php` 在项目代码中**仅被以下文件引用**：
+- 其自身类定义文件
+- `tests/Unit/Actions/AttemptToAuthenticateWebauthnTest.php`（单元测试）
+
+**可验证事实**：该类没有出现在任何配置文件、服务提供者、控制器或其他 Action 中。具体来说：
+- `config/webauthn.php` 无 `pipelines.login` 键 → 未通过配置注入管线
+- 项目无 `Webauthn::authenticateThrough()` 调用 → 未通过回调注入管线
+- 项目无 `Webauthn::authenticateUsing()` 调用 → 未通过回调替换认证逻辑
+- 该类不被任何服务提供者绑定为契约实现
+
+### 与包内置 `AttemptToAuthenticate` 的关系
+
+**可验证事实（包源码）**：项目的 `AttemptToAuthenticateWebauthn` 是包内置 `LaravelWebauthn\Actions\AttemptToAuthenticate` 的**简化副本**：
+- 相同的 OR 短路逻辑：`attemptValidateAssertion() || attemptLogin()`
+- 相同的 `filterCredentials()`、`attemptLogin()`、`fireFailedEvent()` 方法
+- 差异：项目版本**移除了** `authenticateUsingCallback` 分支，将 `trans()` 改为 `trans_ignore()`
+
+由于管线未被自定义，实际运行时使用的是**包内置版本**，`AttemptToAuthenticateWebauthn` 是未被接入管线的**死代码**。它保留了完整的认证逻辑和单元测试，但不会在运行时被调用。
+
+---
+
+## 六、Webauthn 密钥注册（安全密钥创建）流程
 
 用户登录后，在个人设置页面可以添加新的安全密钥。这是 Webauthn 的"注册"（Attestation）流程，与登录的"断言"（Assertion）是两个不同阶段。
 
 ### 第 1 步：用户设置页加载密钥管理
 
-`app/Actions/Jetstream/UserProfile.php` 是 Jetstream 用户资料页的数据钩子，它向 Inertia 页面注入 `webauthnKeys` 列表：
-
-`app/Actions/Jetstream/UserProfile.php#L25-L32`：
+`app/Actions/Jetstream/UserProfile.php#L25-L32` 向 Inertia 页面注入 `webauthnKeys` 列表：
 ```php
 $webauthnKeys = $request->user()->webauthnKeys
     ->map(fn (WebauthnKey $key) => [
@@ -328,11 +465,11 @@ axios.post(route('webauthn.store.options'))
   })
 ```
 
-路由 `webauthn.store.options` 由 Laravel Webauthn 包注册，返回用于创建新密钥的公钥挑战参数（包含用户信息、Relying Party、允许的算法等）。
+路由 `webauthn.store.options` 由 Laravel Webauthn 包注册（需要 `auth:web` 中间件），返回用于创建新密钥的公钥挑战参数。
 
 ### 第 4 步：浏览器生成新密钥对并提交注册响应
 
-`registerWaitForKey()`（`resources/js/Pages/Webauthn/WebauthnKeys.vue#L68-L74`）调用 `@simplewebauthn/browser` 的 `startRegistration(publicKey)`，浏览器弹出安全密钥交互提示，生成新密钥对后，由 `webauthnRegisterCallback()` 将注册响应（包含公钥、密钥句柄、认证器信息等）连同密钥名称一起 POST 到 `route('webauthn.store')`。
+`registerWaitForKey()`（`resources/js/Pages/Webauthn/WebauthnKeys.vue#L68-L74`）调用 `@simplewebauthn/browser` 的 `startRegistration(publicKey)`，浏览器弹出安全密钥交互提示，生成新密钥对后，由 `webauthnRegisterCallback()` 将注册响应连同密钥名称一起 POST 到 `route('webauthn.store')`。
 
 ### 第 5 步：服务端保存密钥
 
@@ -345,29 +482,30 @@ axios.post(route('webauthn.store.options'))
 
 ---
 
-## 五、三条登录管线的关系与差异对比
+## 七、三条登录管线的关系与差异对比
 
 | 维度 | 邮箱密码登录 | Webauthn Passkey 登录 | 外部 OAuth/SAML 登录 |
 |------|-------------|---------------------|---------------------|
 | **前端入口** | `Login.vue` 表单提交 | `Login.vue` / `TwoFactorChallenge.vue` → `WebauthnLogin.vue` | `ExternalProviders.vue` 按钮点击 |
 | **POST 路由** | `POST /login` (Fortify) | `POST /webauthn/auth` (Laravel Webauthn 包) | `GET /auth/{driver}` → 第三方 → `GET/POST /auth/{driver}/callback` |
-| **后端管线** | Fortify Pipeline（配置于 `config/fortify.php#L145-L151`） | Webauthn 包内置 Pipeline（含自定义 `AttemptToAuthenticateWebauthn`） | 独立 `Illuminate\Pipeline\Pipeline` 实例（在 `SocialiteCallbackController#L62-L66` 中手动构建） |
-| **自定义认证动作** | `RedirectIfTwoFactorAuthenticatable`（替换 Fortify 默认） | `AttemptToAuthenticateWebauthn`（替换/扩展包默认） | `AttemptToAuthenticateSocialite`（项目自建） |
+| **后端管线** | Fortify Pipeline（配置于 `config/fortify.php#L145-L151`） | Webauthn 包内置 Pipeline（`AuthenticateController::loginPipeline()`，**未被项目自定义**） | 独立 `Illuminate\Pipeline\Pipeline` 实例（在 `SocialiteCallbackController#L62-L66` 中手动构建） |
+| **实际认证动作** | `RedirectIfTwoFactorAuthenticatable`（项目自定义，替换 Fortify 默认） | `LaravelWebauthn\Actions\AttemptToAuthenticate`（**包内置，未被替换**） | `AttemptToAuthenticateSocialite`（项目自建） |
 | **用户密码校验** | `guard->validateCredentials()` 在 2FA 拦截中完成 | 不涉及（用密钥断言替代） | 不涉及（由第三方保证） |
 | **2FA 检查位置** | Fortify Pipeline 的第一个管道（登录前拦截） | **不检查**——Webauthn 本身既是首因也可作为二因 | 自定义管线 `AttemptToAuthenticateSocialite` 中，在 `guard->login()` 之前 |
-| **2FA 判断条件** | TOTP 已启用 OR Webauthn 有密钥（两处代码完全一致） | 无——Webauthn 包自行处理 session 中的 login.id | 同左 |
-| **用户 Provider** | `webauthn` driver，但在 2FA 拦截阶段已手动查用户 | `webauthn` driver，处理断言认证 | `webauthn` driver，但用户由 Socialite driver_id 查 UserToken 关联得到 |
-| **登录成功后** | `AttemptToAuthenticate` → `PrepareAuthenticatedSession` | 包内管道：更新 used_at、写 session、触发 Login 事件 | `PrepareAuthenticatedSession`（复用 Fortify 内置） |
-| **触发 Login 事件** | Fortify 内置动作触发 | Webauthn 包触发 + 自定义 `LoginListener` 设置 `return` cookie | `guard->login()` 触发 |
-| **速率限制** | Fortify 的 `login` limiter | Webauthn 的 `login` limiter（`config/webauthn.php#L94-L96`） | `oauth2-socialite` limiter（`AppServiceProvider#L152`，每分钟 5 次） |
+| **2FA 判断条件** | TOTP 已启用 OR Webauthn 有密钥（两处代码完全一致） | 无——Webauthn 包自行根据凭据 ID 查找用户 | 同左 |
+| **用户查找方式** | `EloquentWebAuthnProvider::retrieveByCredentials()` 按 email 查（回退到密码） | `EloquentWebAuthnProvider::retrieveByCredentials()` 按 credentialId 查 `webauthn_keys` 表 | 通过 `UserToken` 按 driver_id + driver 查关联用户 |
+| **登录成功后** | `AttemptToAuthenticate` → `PrepareAuthenticatedSession` | `PrepareAuthenticatedSession` → `Webauthn::login()` 写 session 标记 → `LoginSuccessResponse` | `PrepareAuthenticatedSession`（复用 Fortify 内置） |
+| **WebAuthn session 标记** | 不写入（非 WebAuthn 认证） | `webauthn_auth = true`（由 `Webauthn::login()` 写入） | 不写入 |
+| **触发 Login 事件** | Fortify 内置动作触发 | `$guard->attempt()` → `Auth::login()` 触发 + `LoginListener` 设置 `return` cookie | `guard->login()` 触发 |
+| **速率限制** | Fortify 的 `login` limiter | 路由中间件 `throttle:login`（因为 `config('webauthn.limiters.login')` 非空，包内置 `EnsureLoginIsNotThrottled` 被跳过） | `oauth2-socialite` limiter（`AppServiceProvider#L152`，每分钟 5 次） |
 
 ### 三者的连接点
 
-1. **共享同一个 `web` guard 和 `webauthn` user provider**：无论走哪条路径，最终都通过同一个 guard 建立 session，所以登录态完全互通。
+1. **共享同一个 `web` guard 和 `EloquentWebAuthnProvider`**：无论走哪条路径，最终都通过同一个 guard 建立 session，登录态完全互通。Provider 的 `fallback = true`（默认）意味着它同时支持 WebAuthn 断言和密码两种凭据格式。
 
 2. **共享同一套 2FA 判断逻辑**：
-   - `RedirectIfTwoFactorAuthenticatable.php#L32-L34`
-   - `AttemptToAuthenticateSocialite.php#L51-L54`
+   - `app/Actions/Fortify/RedirectIfTwoFactorAuthenticatable.php#L32-L34`
+   - `app/Actions/AttemptToAuthenticateSocialite.php#L51-L54`
    两处用了完全相同的条件表达式：
    ```php
    (optional($user)->two_factor_secret && ! is_null(optional($user)->two_factor_confirmed_at))
@@ -380,11 +518,11 @@ axios.post(route('webauthn.store.options'))
    - 首因：登录页 Passkey，用户跳过邮箱密码输入，直接使用安全密钥
    - 二因：邮箱密码或 OAuth 登录后，再使用安全密钥通过 2FA 挑战
 
-5. **AttemptToAuthenticateWebauthn 设计的巧妙之处**：handle() 方法中先试 `attemptValidateAssertion()`（用户已登录时的断言验证）再试 `attemptLogin()`（用户未登录时走 guard attempt），使得同一个类可以同时服务于"2FA 二因验证"和"Passkey 首因登录"两种使用模式。虽然 2FA 场景下 `$request->user()` 可能为 null（因为 Fortify 的 2FA 拦截只验证凭据不登录），但包的路由控制器会从 session `login.id` 中恢复用户上下文，最终效果等价。
+5. **两种场景共享同一个服务端认证端点**：`POST /webauthn/auth` → `AuthenticateController::store()`。首因登录和 2FA 二因验证走的是**完全相同的代码路径**——区别仅在于前端传入的 `publicKey` 参数不同（userless vs 绑定用户），以及 `autofill` 参数不同。
 
 ---
 
-## 六、注册场景
+## 八、注册场景
 
 ### 入口 A：标准注册
 
@@ -452,28 +590,22 @@ private function createUser(SocialiteUser $socialite): User
 
 ---
 
-## 七、注册场景（Webauthn 密钥注册）
-
-见第四节的"Webauthn 密钥注册流程"，该流程在用户已登录的设置页面进行。
-
----
-
-## 八、扩展层关键文件索引
+## 九、扩展层关键文件索引
 
 | 文件（仓库相对路径） | 角色 |
 |------|------|
 | `config/fortify.php` | Fortify 功能与登录管线配置，自定义了 `pipelines.login` |
 | `config/auth.php` | Guard、User Provider（`webauthn` driver）、外部登录提供商配置 |
-| `config/webauthn.php` | Webauthn 全局配置（路由前缀、userless、redirects、views 等） |
+| `config/webauthn.php` | Webauthn 全局配置（路由前缀、userless、redirects、limiters 等），**无 `pipelines.login` 键** |
 | `config/jetstream.php` | Jetstream 功能开关 |
 | `config/services.php` | 各 OAuth/SAML 提供商凭证配置 |
 | `bootstrap/app.php` | WebauthnMiddleware 别名注册 |
-| `app/Providers/AppServiceProvider.php` | Socialite 提供商事件监听注册、Webauthn 响应类绑定、LoginViaRemember 订阅 |
+| `app/Providers/AppServiceProvider.php` | Socialite 提供商事件监听注册、Webauthn 响应类绑定（仅 update/destroy，**未覆盖 login 管线**）、LoginViaRemember 订阅 |
 | `app/Providers/AuthServiceProvider.php` | Gate 定义（administrator、vault-viewer 等权限） |
 | `app/Actions/Fortify/RedirectIfTwoFactorAuthenticatable.php` | **Fortify 登录管线自定义 2FA 拦截点**，替换包内置版本 |
 | `app/Actions/Fortify/TwoFactorChallengeView.php` | 2FA 挑战页视图响应（含 Webauthn 公钥准备），替代 Fortify 默认 |
 | `app/Actions/Fortify/CreateNewUser.php` | 注册 Action，实现 Fortify 的 CreatesNewUsers 契约 |
-| `app/Actions/AttemptToAuthenticateWebauthn.php` | **Webauthn 登录管线自定义认证动作**，同时支持首因登录和 2FA 断言验证 |
+| `app/Actions/AttemptToAuthenticateWebauthn.php` | **死代码**——是包内置 `AttemptToAuthenticate` 的简化副本，未被接入任何管线，仅有单元测试引用 |
 | `app/Actions/AttemptToAuthenticateSocialite.php` | OAuth 登录管线核心（含注册/关联已有账户/2FA 检查） |
 | `app/Http/Controllers/Auth/LoginController.php` | 登录页渲染（userless 模式下生成无用户名断言公钥） |
 | `app/Http/Controllers/Auth/RegisterController.php` | 注册页渲染 |
@@ -495,23 +627,43 @@ private function createUser(SocialiteUser $socialite): User
 | `resources/js/Pages/Webauthn/WebauthnLogin.vue` | Webauthn 登录组件（调用 `@simplewebauthn/browser`，POST 到 `webauthn.auth`） |
 | `resources/js/Pages/Webauthn/WebauthnKeys.vue` | 用户设置页的密钥管理组件 |
 | `resources/js/Pages/Webauthn/Partials/RegisterKey.vue` | 新密钥注册向导（POST 到 `webauthn.store.options` + `webauthn.store`） |
+| `resources/js/Pages/Webauthn/WebauthnTest.vue` | 密钥确认组件（用于 `webauthn.key.confirm`，应用内敏感操作再验证） |
 
 ---
 
-## 九、代码走向的"为什么让人困惑"
+## 十、事实层级标注：项目可验证 vs 包源码可验证 vs 推断
 
-以下是导致扩展层代码走向难以直观理解的几个设计因素：
+| 描述 | 事实层级 |
+|------|---------|
+| `config/webauthn.php` 无 `pipelines.login` 键 | 项目可验证 |
+| 项目无 `authenticateThrough` / `authenticateUsing` 调用 | 项目可验证（grep 验证） |
+| `AttemptToAuthenticateWebauthn` 仅被自身和单元测试引用 | 项目可验证（grep 验证） |
+| `EloquentWebAuthnProvider` 是 `webauthn` 驱动的实现类 | 包源码可验证（`WebauthnServiceProvider::passwordLessWebauthn()`） |
+| `EloquentWebAuthnProvider::retrieveByCredentials()` 按 credentialId 查用户 | 包源码可验证 |
+| `EloquentWebAuthnProvider::validateCredentials()` 同时支持 WebAuthn 断言和密码 fallback | 包源码可验证 |
+| WebAuthn 认证管线实际为 `[AttemptToAuthenticate, PrepareAuthenticatedSession]` | 包源码可验证（`loginPipeline()` + 项目 `limiters.login` 配置） |
+| `Webauthn::login()` 写 `webauthn_auth = true` 到 session 并派发 `WebauthnLogin` 事件 | 包源码可验证 |
+| `WebauthnLogin` 事件在认证流程中被派发两次 | 包源码可验证（`validateCredentials` 一次 + `Webauthn::login()` 一次） |
+| `LoginSuccessResponse` 对 Inertia 请求返回 JSON、对普通请求重定向到 `/vaults` | 包源码可验证 |
+| 2FA 场景下 `login.id` 不参与 WebAuthn 断言校验 | 包源码可验证（`AuthenticateController::store()` 和 `AttemptToAuthenticate` 中无 `login.id` 读取逻辑） |
+| `login.id` 仅用于 `TwoFactorChallengeView` 生成绑定用户的公钥挑战 | 项目可验证（`TwoFactorChallengeView` 源码中读取 `login.id` 仅用于 `User::find()` + `Webauthn::prepareAssertion($user)`） |
 
-1. **三条管线各自独立**：邮箱密码走 Fortify Pipeline（`config/fortify.php`），OAuth 走独立实例化的 `Illuminate\Pipeline\Pipeline`（`SocialiteCallbackController` 内手动 new），Webauthn 走 asbiin/laravel-webauthn 包的内部管线。三条管线的配置位置、管道顺序、2FA 检查实现方式都不同，需要分别追踪。
+---
 
-2. **2FA 检查逻辑重复实现**：完全相同的条件表达式（TOTP OR Webauthn）在 `RedirectIfTwoFactorAuthenticatable` 和 `AttemptToAuthenticateSocialite` 中各写了一份——如果有朝一日增加第三种 2FA 方式，需要同步修改两处。
+## 十一、代码走向的"为什么让人困惑"
 
-3. **自定义与内置管道混用**：Fortify 管线中只有第一个管道被项目自定义，后两个仍使用 Fortify 内置版本；Webauthn 管线中 `AttemptToAuthenticateWebauthn` 是自定义的，但后续管道（更新 used_at、写 session、重定向）仍是包内置。这种"只换一环"的模式需要对框架内部机制有了解才能看全。
+1. **`AttemptToAuthenticateWebauthn` 是死代码但看起来像核心动作**：它完整实现了认证逻辑，有单元测试，放在 `app/Actions/` 目录下——但实际运行时使用的是包内置的同名类 `LaravelWebauthn\Actions\AttemptToAuthenticate`。项目没有通过任何机制将自定义类接入管线，导致阅读者误以为它参与了认证流程。
 
-4. **AttemptToAuthenticateWebauthn 的 OR 短路逻辑**：`handle()` 中用 `attemptValidateAssertion() || attemptLogin()` 这个看似简单的 OR 同时支持"已登录用户的 2FA 断言验证"和"未登录用户的 Passkey 首因登录"两种场景，但 `attemptValidateAssertion()` 中的 `$request->user()` 与 2FA 实际流程（session 中只有 login.id、guard 未登录）之间存在语义差异，实际依赖包的路由控制器在管线执行前先从 session 恢复用户上下文——这个隐含依赖单看项目代码难以察觉。
+2. **三条管线各自独立**：邮箱密码走 Fortify Pipeline（`config/fortify.php`），OAuth 走独立实例化的 `Illuminate\Pipeline\Pipeline`（`SocialiteCallbackController` 内手动 new），Webauthn 走包内置 Pipeline（`AuthenticateController::loginPipeline()`）。三条管线的配置位置、管道顺序、2FA 检查实现方式都不同，需要分别追踪。
 
-5. **隐式契约绑定**：`TwoFactorChallengeView`（通过 Fortify features 配置自动绑定）、`WebauthnUpdateResponse` / `WebauthnDestroyResponse`（在 AppServiceProvider 的 `updateViewResponseUsing` / `destroyViewResponseUsing` 中绑定）、`CreateNewUser`（Fortify 自动解析契约实现）等都属于"在配置文件或服务提供者中替换接口实现"的模式，IDE 的"查找引用"通常无法直接跳到调用方。
+3. **2FA 检查逻辑重复实现**：完全相同的条件表达式（TOTP OR Webauthn）在 `RedirectIfTwoFactorAuthenticatable` 和 `AttemptToAuthenticateSocialite` 中各写了一份。
+
+4. **自定义与内置管道混用**：Fortify 管线中只有第一个管道被项目自定义，后两个仍使用 Fortify 内置版本；Webauthn 管线则**完全没有被自定义**。这种"有的换有的不换"的模式容易让人误以为 Webauthn 管线也被换了。
+
+5. **隐式契约绑定**：`TwoFactorChallengeView`（通过 Fortify features 配置自动绑定）、`WebauthnUpdateResponse` / `WebauthnDestroyResponse`（在 AppServiceProvider 的 `updateViewResponseUsing` / `destroyViewResponseUsing` 中绑定）等都属于"在配置文件或服务提供者中替换接口实现"的模式，IDE 的"查找引用"通常无法直接跳到调用方。
 
 6. **User Provider 的 `webauthn` driver**：`config/auth.php` 中 `providers.users.driver` 从默认的 `eloquent` 改成了 `webauthn`，这改变了 `Guard::attempt()` 的内部行为——从纯密码校验变成"密码或断言二选一"。但因为改动只在配置文件中，代码搜索无法直接找到关联。
 
-7. **Webauthn 路由全部由包注册**：项目代码中看不到 `/webauthn/auth`、`/webauthn/store` 等路由的定义，它们由 `asbiin/laravel-webauthn` 包的 ServiceProvider 自动注册，挂载在 `config/webauthn.php#L55` 的 `prefix` 下。对于不熟悉该包的开发者，找路由会有些"魔法"感。
+7. **Webauthn 路由全部由包注册**：项目代码中看不到 `/webauthn/auth`、`/webauthn/store` 等路由的定义，它们由 `WebauthnServiceProvider::configureRoutes()` 自动注册，挂载在 `config/webauthn.php#L55` 的 `prefix` 下。对于不熟悉该包的开发者，找路由会有些"魔法"感。
+
+8. **`WebauthnLogin` 事件被派发两次**：一次在 `EloquentWebAuthnProvider::validateCredentials()` 中（带 `true` 第二参数），一次在 `Webauthn::login()` 中（不带）。两次派发的语义差异需要查阅包源码才能理解，项目代码中无法直接看到这一行为。
