@@ -324,10 +324,10 @@ ACTION_NOTE_DESTROYED = 'note_destroyed';
 |------|-------------------------|-------------------------|----------------------------------|
 | 创建位置 | [CreateNote.php:74-83](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageNotes/Services/CreateNote.php#L74-L83) | [UpdateNote.php:74-83](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageNotes/Services/UpdateNote.php#L74-L83) | [DestroyNote.php:60-68](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageNotes/Services/DestroyNote.php#L60-L68) |
 | 关联方式 | `$note->feedItem()->save()` | `$note->feedItem()->save()` | `ContactFeedItem::create()` |
-| feedable_id | **取决于是否被更新过**（见 5.4） | 被删 note 的 id | `null` |
-| feedable_type | 同上 | `App\Models\Note` | `null` |
+| feedable_id | 被删 note 的 id | 被删 note 的 id | `null` |
+| feedable_type | `App\Models\Note` | `App\Models\Note` | `null` |
 | description（DB字段） | 创建时 body 的前 10 词 | 更新时 body 的前 10 词 | 删除时 body 的前 10 词 |
-| `$item->feedable` 返回值（笔记删除后） | `null`（DB 行已不存在或关联已断开） | `null`（DB 行已不存在） | `null`（id 和 type 本就是 null） |
+| `$item->feedable` 返回值（笔记删除后） | `null`（notes 表行已硬删除，有 id 和 type 也找不到对应行） | `null`（同上） | `null`（id 和 type 本就是 null） |
 
 **ActionFeedNote::data() 的映射**，代码在 [ActionFeedNote.php](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedNote.php#L10-L35)：
 
@@ -420,7 +420,7 @@ return [
   └──────────────────────────┘
 ```
 
-⚠️ **但有个 MorphOne 陷阱**（见 5.5）：如果笔记被编辑过，note_created 的 feedable 关联会被 MorphOne 自动断开。不过这不影响删除后的显示——因为删除后 feedable 本来就是 null，显示的还是 description。
+> 💡 **笔记存在时**，这条记录的 `object` 不为 null（因为 feedable_id=N 有效，能加载到 Note），会显示 title + body 30 字截断。删除后才退化为 10 词摘要。
 
 #### B. note_updated（编辑笔记那条）
 
@@ -437,7 +437,7 @@ return [
   └──────────────────────────────┘
 ```
 
-如果笔记被编辑了 N 次，就会有 N 条 note_updated 记录，每条都能看到对应修改时刻的 10 词快照。
+如果笔记被编辑了 N 次，就会有 N 条 note_updated 记录，每条都能看到对应修改时刻的 10 词快照（删除后）或 30 字 body（笔记存在时）。
 
 #### C. note_destroyed（删除笔记那条）
 
@@ -456,9 +456,13 @@ return [
 
 ---
 
-### 5.5 MorphOne 陷阱：多次编辑会断开旧记录的 feedable 关联
+### 5.5 MorphOne 的真实行为：查询时 first()，保存时不强制一对一
 
-Note 模型上的 `feedItem()` 关系定义为 **MorphOne**（[Note.php:87-95](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Models/Note.php#L87-L95)）：
+**之前的理解是错误的**：MorphOne `save()` 不会把旧记录的 feedable_id/type 置空。下面是基于 Laravel 12 源码的纠正。
+
+#### Note 模型的关系定义
+
+[Note.php:87-95](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Models/Note.php#L87-L95)：
 
 ```php
 public function feedItem(): MorphOne
@@ -467,39 +471,92 @@ public function feedItem(): MorphOne
 }
 ```
 
-MorphOne 是一对一关系。当 `$note->feedItem()->save($newFeedItem)` 被调用时，Laravel 会：
-1. 给 `$newFeedItem` 设置 `feedable_id` 和 `feedable_type`
-2. 把**之前**关联的那条 feedItem 的 `feedable_id` / `feedable_type` 置为 null
+#### 继承链与 save() 方法的实际源码
 
-所以操作序列的实际 DB 状态是：
+```
+MorphOne
+  extends MorphOneOrMany   ← 没有重写 save()
+    extends HasOneOrMany   ← save() 源码如下
+```
 
-| 步骤 | 操作 | note_created 行 feedable_id | note_updated 行 feedable_id |
-|------|------|------------------------------|------------------------------|
-| 1 | 创建笔记 | = note.id | — |
-| 2 | 编辑笔记 | 被 MorphOne **置为 null** | = note.id |
-| 3 | 删除笔记 | 保持 null | 仍为 note.id（但 notes 表行已消失） |
+**Laravel 12 `HasOneOrMany::save()` 真实源码**（已从官方仓库确认）：
 
-这意味着：
-- 即使笔记没被删除，note_created 的 feedItem 通过 `$item->feedable` 也加载不到 Note（关联被 MorphOne 断开了），只能 fallback 到 description
-- 最近一次编辑的 note_updated，在笔记未删除时能通过 feedable 加载到完整 Note（显示 title + 30 字 body）
-- 笔记删除后，所有记录的 feedable 都返回 null，全部 fallback 到 description
+```php
+public function save(Model $model)
+{
+    $this->setForeignAttributesForCreate($model);  // 只设置外键
+    return $model->save() ? $model : false;         // 只调用 save()
+}
+```
+
+**Laravel 12 `MorphOneOrMany::setForeignAttributesForCreate()` 真实源码**：
+
+```php
+protected function setForeignAttributesForCreate(Model $model)
+{
+    $model->{$this->getForeignKeyName()} = $this->getParentKey();
+    $model->{$this->getMorphType()} = $this->morphClass;
+    // ... pendingAttributes 处理
+}
+```
+
+**结论**：`$note->feedItem()->save($feedItem)` 的完整 DB 操作就是：
+
+```
+1. 设置 $feedItem->feedable_id   = note.id
+2. 设置 $feedItem->feedable_type = 'App\Models\Note'
+3. $feedItem->save()  ← UPDATE 或 INSERT
+```
+
+**没有任何 UPDATE 旧记录的 SQL！不会把任何旧记录的 feedable_id/type 置空！**
+
+#### MorphOne 语义到底是什么：查询时的 first()，不是保存时的强制唯一
+
+MorphOne 的 "One" 体现在**查询端**，不是**保存端**：
+
+- **查询** `$note->feedItem` 时，`MorphOne::getResults()` 调用 `$this->query->first()`，所以永远只返回一条（取决于 DB 默认排序，通常是 id ASC 最早的那条）
+- **保存** `$note->feedItem()->save()` 时，只是给新记录设置关联字段然后 save，**不会清理或修改旧记录**
+
+#### 实际 DB 状态：多条记录共享相同的 feedable_id/type
+
+以操作序列「创建 → 编辑 → 再编辑 → 删除」为例：
+
+| 步骤 | 操作 | F1 note_created | F2 note_updated① | F3 note_updated② | Fd note_destroyed |
+|------|------|-----------------|------------------|------------------|-------------------|
+| 1 | 创建笔记 | id=N, type=Note | — | — | — |
+| 2 | 第一次编辑 | id=N, type=Note | id=N, type=Note | — | — |
+| 3 | 第二次编辑 | id=N, type=Note | id=N, type=Note | id=N, type=Note | — |
+| 4 | 删除笔记 | **id=N, type=Note（残留）** | **id=N, type=Note（残留）** | **id=N, type=Note（残留）** | id=NULL, type=NULL |
+
+**步骤 2 和 3 结束时，F1、F2、F3 的 feedable_id 都是 N，feedable_type 都是 Note！**三条记录共享同一个关联目标。
+
+#### MorphOne 查询的歧义：`$note->feedItem` 返回哪一条？
+
+因为三条记录都有 feedable_id=N、feedable_type=Note，而 `MorphOne::getResults()` 用的是 `$this->query->first()`，在没有显式 `orderBy` 的情况下，返回结果取决于：
+- Query Builder 的默认排序（通常是 DB 原生顺序）
+- MySQL InnoDB 默认是主键 id 升序 → 返回 **F1 最早的 note_created**
+- PostgreSQL 默认也是插入顺序 → 返回最早的一条
+
+但 **Note 模型和项目代码中从未使用过 `$note->feedItem` 这个动态属性**，只用它的 `save()` 方法建立关联。实际从 ContactFeedItem → Note 方向加载是走 `$feedItem->feedable`（MorphTo），它**精确按 id 查找**不存在歧义——只要有有效的 feedable_id 和 feedable_type，就一定能 find 到对应的 Note（如果 Note 还存在的话）。
+
+> **对本项目的影响**：MorphOne 保存时不强制唯一这个事实，意味着笔记存在时，**所有** note_created / note_updated 记录都能通过 `$item->feedable` 成功加载到完整 Note，而不是只有最近一条。
 
 ---
 
 ### 5.6 总结：删除后到底能看到什么？
 
-| Feed 中的记录 | 能看到内容吗？ | 显示内容来源 | 显示样式 |
-|--------------|----------------|--------------|----------|
-| note_created（创建） | ✅ 能 | DB description（创建时前 10 词） | 灰色标签 |
-| note_updated（每次编辑） | ✅ 能 | DB description（每次编辑时前 10 词） | 灰色标签 |
-| note_destroyed（删除操作本身） | ❌ 不能 | — | 只显示 "deleted a note"，无内容 |
+| Feed 中的记录 | 笔记存在时显示 | 笔记删除后显示 |
+|--------------|---------------|----------------|
+| note_created（创建） | ✅ title + body 30 字（通过 feedable 加载完整 Note） | ✅ 10 词摘要（description 快照） |
+| note_updated（每次编辑） | ✅ title + body 30 字（**所有记录都能加载到完整 Note**） | ✅ 10 词摘要（每条各自的快照） |
+| note_destroyed（删除操作本身） | — | ❌ **空**（前端 Bug，action 名不匹配） |
 
 **核心问题总结**：
 
 1. **前端 Bug**：[Feed.vue:139](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/resources/js/Shared/Modules/Feed.vue#L139) 条件写的是 `'note_deleted'`，而后端实际使用的是 `'note_destroyed'`，导致删除操作那条记录的 <note> 组件完全不渲染
-2. **数据链路正确**：后端 `ActionFeedNote::data()` 对三种 action 都返回了 `{object: null, description: "10词摘要"}`，数据是齐全的
+2. **数据链路正确**：后端 `ActionFeedNote::data()` 对三种 action 都返回了正确的结构，笔记存在时 object 有值，删除后 object 为 null 但 description 有值
 3. **历史记录可恢复性有限**：删除后只能看到每次操作时保存的 10 词摘要快照，完整 body 已随硬删除永久丢失
-4. **MorphOne 副作用**：多次编辑会自动断开更早记录的 feedable 关联，导致即使笔记未删除，旧的 note_created / note_updated 也只能 fallback 到 description 而无法加载完整笔记
+4. **MorphOne 语义澄清**：MorphOne 的 save() 不会断开旧关联，所有历史记录都持有有效的 feedable_id/type，**笔记存在时每条操作记录都能加载到完整 Note**（而不是只有最近一条）
 
 ---
 
@@ -518,8 +575,8 @@ MorphOne 是一对一关系。当 `$note->feedItem()->save($newFeedItem)` 被调
 
 **影响**：
 - Feed 中新增一条 "edited a note" 记录
-- Note 原来创建时的 feedItem 的 feedable_id/type 会被 MorphOne 自动置空（关联被断开，见第五节 5.5）
-- 新的 feedItem 通过 feedable 关联到 Note，是唯一能通过 `$item->feedable` 加载到完整 Note 的记录
+- **MorphOne save() 不会断开旧记录**：note_created 和之前所有 note_updated 的 feedable_id/type 仍然有效，都指向同一个 Note（值都为 N / 'App\Models\Note'）
+- 新旧 feedItem 都能通过 `$item->feedable` 加载到完整 Note（笔记存在时），所有操作记录都能显示 title + body 30 字截断
 
 ### 6.2 Note 删除
 
@@ -529,14 +586,15 @@ MorphOne 是一对一关系。当 `$note->feedItem()->save($newFeedItem)` 被调
 1. 验证权限
 2. **先创建 ContactFeedItem**（action = `note_destroyed`，description = body 摘要 10 词）
    - 注意：此处使用 `ContactFeedItem::create()` 而非 `$this->note->feedItem()->save()`
-   - 因此该 feedItem **没有 feedable_id/feedable_type**（因为 Note 马上要被删除）
+   - 因此该 feedItem **没有 feedable_id/feedable_type**（因为 Note 马上要被删除，关联也没有意义）
 3. 删除 Note 记录（硬删除）
 4. 更新 `contact.last_updated_at`
 
 **影响**：
 - Feed 中新增一条 "deleted a note" 记录
 - **由于前端 Bug**（action 名 `note_deleted` vs `note_destroyed` 不匹配），该记录的 <note> 组件不渲染，**看不到 description 中的 10 词摘要**，只能看到 "deleted a note" 这句话
-- Note 原来创建/更新时关联的 feedItem：其 `$item->feedable` 返回 null（notes 表行已被硬删除），但这些记录的 <note> 组件仍会渲染并显示各自保存的 description（10 词摘要）
+- Note 原来创建/更新时关联的 feedItem：feedable_id 仍然是 N，feedable_type 仍然是 'App\Models\Note'，但 `$item->feedable` 返回 null（因为 notes 表行已被硬删除，find(N) 找不到）
+- 因此这些旧记录的 <note> 组件走 else 分支，显示各自保存的 description（10 词摘要）
 - **Note 数据完全丢失，无法恢复**，只能从历史 feedItem 的 10 词摘要中看到片段
 - 不影响 Journal 和 Post
 
@@ -646,32 +704,48 @@ public function feedable(): MorphTo
 
 ### 8.2 `$note->feedItem()->save($feedItem)` 的精确 DB 行为
 
-CreateNote 和 UpdateNote 都用这段代码把 feedItem 与 Note 关联。MorphOne 的 `save()` 方法在 Laravel 内部做了**三件事**：
+CreateNote 和 UpdateNote 都用这段代码把 feedItem 与 Note 关联。根据 Laravel 12 的实际源码，这个方法做了**两步**，而不是之前错误说的三步：
 
 ```
 调用：$this->note->feedItem()->save($feedItem)
           │
           ▼
-1. 给 $feedItem 设置两个字段值：
-     $feedItem->feedable_id   = $this->note->id;
-     $feedItem->feedable_type = 'App\Models\Note';
-   （注意：fillable 里已经包含了这两个字段，所以允许批量赋值）
+继承链：MorphOne → MorphOneOrMany → HasOneOrMany
 
-2. $feedItem->save();  ← 持久化这两个字段到 DB
+HasOneOrMany::save() 源码（Laravel 12 官方仓库确认）：
+public function save(Model $model)
+{
+    $this->setForeignAttributesForCreate($model);  // ↓ 进入此方法
+    return $model->save() ? $model : false;
+}
+
+MorphOneOrMany::setForeignAttributesForCreate() 源码：
+protected function setForeignAttributesForCreate(Model $model)
+{
+    $model->{$this->getForeignKeyName()} = $this->getParentKey();
+    // 即 $feedItem->feedable_id = note.id
+
+    $model->{$this->getMorphType()} = $this->morphClass;
+    // 即 $feedItem->feedable_type = 'App\Models\Note'
+
+    // ... pendingAttributes 处理
+}
           │
           ▼
-3. ⚠️  MorphOne 的副作用：把 "之前" 关联的那条 feedItem 记录断开
-     UPDATE contact_feed_items
-     SET    feedable_id = NULL,
-            feedable_type = NULL
-     WHERE  feedable_id   = <note.id>
-       AND  feedable_type = 'App\Models\Note'
-       AND  id           != <new_feedItem.id>
+实际执行的 SQL：
+1. 设置内存中 $feedItem 的两个属性值（无 SQL）
+2. $feedItem->save()
+   ├─ 因为之前已经 ContactFeedItem::create() 过，$feedItem 存在主键
+   └─ 执行 UPDATE contact_feed_items
+          SET feedable_id   = N,
+              feedable_type = 'App\Models\Note'
+        WHERE id = <new_feedItem_id>
 ```
 
-**关键点**：步骤 3 把旧记录的 `feedable_id` 和 `feedable_type` 置为 `null`，但**不会删除旧记录**——那条 note_created / 早期 note_updated 的行仍然留在表里，只是无法通过 feedable 加载到 Note 了。
-
-这是 "一对一" 的必然结果：在任意时刻，一个 Note 只能有一条 feedItem 记录通过 feedable_id/type 关联到它。新的来了，旧的必须断开。
+**关键结论**：
+- **只做了"设置新记录关联字段 + 保存"两件事**
+- **没有任何 UPDATE 旧记录的 SQL**，不会把旧记录的 feedable_id/type 置空
+- MorphOne 的 "One" 语义仅体现在**查询端**（`$note->feedItem` 返回 `first()`），**不体现在保存端**
 
 ---
 
@@ -707,7 +781,7 @@ execute($data)
               ├─ 设置 $feedItem->feedable_id   = N
               ├─ 设置 $feedItem->feedable_type = 'App\Models\Note'
               ├─ $feedItem->save();             ← UPDATE F1，把两个关联字段写入
-              └─ （没有旧记录，所以 MorphOne 副作用不触发）
+              └─ （MorphOne 不会修改旧记录，这是 HasOneOrMany::save() 源码的既定行为，并非"副作用没触发"）
 ```
 
 **操作完成后的 DB 快照**：
@@ -723,7 +797,7 @@ execute($data)
 
 ---
 
-### 8.4 编辑笔记：完整代码追踪 + MorphOne 副作用
+### 8.4 编辑笔记：完整代码追踪
 
 **代码路径**：[UpdateNote.php:49-83](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageNotes/Services/UpdateNote.php#L49-L83)
 
@@ -746,38 +820,34 @@ execute($data)
         ├─ ContactFeedItem::create([           ← 新增一行 F2
         │    action       => 'note_updated',
         │    description  => Str::words($this->note->body, 10, '…'),
-        │    // ⚠️  此时 $this->note->body 是"新正文"（已 save 到 DB 的值）
+        │    // 此时 $this->note->body 是新正文
         │  ]);
         │
-        └─ $this->note->feedItem()->save($feedItem);   ← 关键！MorphOne 副作用触发
+        └─ $this->note->feedItem()->save($feedItem);
               │
-              ├─ 设置 F2.feedable_id=N, F2.feedable_type='App\Models\Note'
-              ├─ F2->save();
+              ├─ 设置 F2.feedable_id   = N
+              ├─ 设置 F2.feedable_type = 'App\Models\Note'
+              └─ F2->save();                      ← UPDATE F2
               │
-              └─ ⚠️  MorphOne 自动执行：
-                   UPDATE contact_feed_items
-                   SET    feedable_id = NULL,
-                          feedable_type = NULL
-                   WHERE  feedable_id   = N
-                     AND  feedable_type = 'App\Models\Note'
-                     AND  id           != F2;
-                   └─ 命中了 F1（note_created）的行！F1 的关联字段被置空
+              └─ ✅ 没有任何副作用！F1（note_created）保持不变
+                   F1.feedable_id   仍然是 N
+                   F1.feedable_type 仍然是 'App\Models\Note'
 ```
 
-**操作完成后的 DB 快照**（与创建后对比）：
+**操作完成后的 DB 快照（与创建后对比）**：
 
 | 表 | id | 关键字段变化 |
 |----|----|--------------|
 | notes | N | body = 新正文（UPDATE 覆盖） |
-| contact_feed_items | F1（note_created） | feedable_id=**NULL**, feedable_type=**NULL**<br>description 仍然是**旧正文**前10词（不变） |
-| contact_feed_items | F2（note_updated） | feedable_id=N, feedable_type='App\Models\Note'<br>description=新正文前10词 |
+| contact_feed_items | F1（note_created） | **feedable_id=N，不变**<br>**feedable_type='App\Models\Note'，不变**<br>description 仍然是旧正文前10词 |
+| contact_feed_items | F2（note_updated） | feedable_id=N<br>feedable_type='App\Models\Note'<br>description=新正文前10词 |
 
 **此时的摘要来源**：
-- F1.description = 创建时刻 body 的前 10 词（历史快照，**永远不再变化**）
-- F2.description = 编辑时刻 body 的前 10 词（也是历史快照，下次编辑也不再变化）
-- 注意：编辑时即使标题改了，两个 description 中的**词级截断快照**也不会互相影响，它们各自独立
+- F1.description = 创建时刻 body 的前 10 词（历史快照，永远不变）
+- F2.description = 编辑时刻 body 的前 10 词（也是历史快照，下次编辑也不变）
+- **F1 和 F2 都可以通过 `$item->feedable` 加载到同一个 Note N**（因为 feedable_id/type 都有效）
 
-> **如果再编辑一次**（第二次编辑产生 F3）：F3 获得 feedable 关联，F2 的关联字段被置空。F1 / F2 的 description 都是各自时刻的快照，永远不变。
+> **如果再编辑一次**（第二次编辑产生 F3）：F3 也被设置 feedable_id=N / Note，F1、F2 仍然保持不变。三条记录都指向同一个 Note N。三条记录都能加载到完整 Note。
 
 ---
 
@@ -800,9 +870,9 @@ execute($data)
   │          contact_id   => contact.id,
   │          action       => 'note_destroyed',
   │          description  => Str::words($this->note->body, 10, '…'),
-  │          // ⚠️  这里故意不传 feedable_id/type
-  │          //     也故意不调用 $note->feedItem()->save()
-  │          //     因为 note 马上就要被 DELETE 了，关联也没意义
+  │          // 故意不传 feedable_id/type
+  │          // 也故意不调用 $note->feedItem()->save()
+  │          // 因为 note 马上就要被 DELETE 了，关联也没意义
   │        ]);
   │
   ├─ 4. $this->note->delete();              ← DELETE FROM notes WHERE id=N
@@ -813,22 +883,21 @@ execute($data)
 
 **为何 DeleteNote 故意不走 MorphOne？**
 
-两种可能性分析：
-1. 如果调用 `$this->note->feedItem()->save($feedItem)`：Fd 会被设置 `feedable_id=N, feedable_type='App\Models\Note'`，同时把 F2（最近一次编辑的 feedItem）关联置空。然后 `$this->note->delete()` 也不会对 contact_feed_items 产生级联（因为没有外键约束），所以 Fd 的 `feedable_id=N, feedable_type='Note'` 会残留在表里，变成一条指向不存在记录的"死引用"。
-2. 直接 `ContactFeedItem::create()` 不设置关联字段：Fd 的 `feedable_id=NULL, feedable_type=NULL`，干净利落，指向性明确——这就是一条"目标已被删除"的记录。
+如果走关联 `$this->note->feedItem()->save($feedItem)`，Fd 会被设置 `feedable_id=N, feedable_type='App\Models\Note'`。然后 `$this->note->delete()` 硬删除 Note N，由于 contact_feed_items 没有外键约束，Fd 的 `feedable_id=N` 会残留，变成一条指向不存在记录的"悬空死引用"。
 
-代码选择了方案 2。
+直接 `ContactFeedItem::create()` 不设置关联字段，Fd 的 `feedable_id=NULL, feedable_type=NULL`，干净利落——语义上明确表示"目标已被删除，不再有有效关联"。
 
 **操作完成后的 DB 快照**：
 
 | 表 | id | 关键字段 |
 |----|----|----------|
 | notes | N | **行已消失**（DELETE） |
-| contact_feed_items | F1（note_created） | feedable_id=NULL, feedable_type=NULL<br>description=创建时刻前10词 |
-| contact_feed_items | F2（note_updated） | feedable_id=N（残留）, feedable_type='Note'（残留）<br>description=编辑时刻前10词 |
-| contact_feed_items | Fd（note_destroyed） | feedable_id=**NULL**, feedable_type=**NULL**<br>description=删除时刻前10词 |
+| contact_feed_items | F1（note_created） | **feedable_id=N（残留），feedable_type='App\Models\Note'（残留）**<br>description=创建时刻前10词 |
+| contact_feed_items | F2（note_updated①） | **feedable_id=N（残留），feedable_type='App\Models\Note'（残留）**<br>description=编辑时刻前10词 |
+| contact_feed_items | F3（note_updated②） | **feedable_id=N（残留），feedable_type='App\Models\Note'（残留）**<br>description=再编辑时刻前10词 |
+| contact_feed_items | Fd（note_destroyed） | **feedable_id=NULL，feedable_type=NULL**<br>description=删除时刻前10词 |
 
-注意 F2 的 `feedable_id=N` 因为没有外键约束而残留，这就是之前说的"悬空引用"。
+所有 F1/F2/F3 的 feedable_id/type 都保留了原值（因为 MorphOne save 不会修改旧记录），但指向的 Note N 已被硬删除，所以 `$item->feedable` 都会返回 null（find(N) 找不到）。
 
 ---
 
@@ -865,29 +934,43 @@ execute($data)
 
 | 记录 | feedable_id / type | ViewHelper 中 `$note = $item->feedable` | ViewHelper 输出 data.note | 前端渲染 |
 |------|-------------------|----------------------------------------|--------------------------|---------|
-| **F1 note_created** | id=NULL, type=NULL（被 MorphOne 在 F2 时断开） | `null`（找不到关联，就算 Note 存在也没用） | `{object: null, description: "今天和张三讨论了A项目的需求和下一步…"}` | Feed.vue action 匹配 ✅ → `<note>` 渲染 → `v-else` 分支 → **灰色标签显示 10 词摘要** |
-| **F2 note_updated** | id=NULL, type=NULL（被 MorphOne 在 F3 时断开） | `null` | `{object: null, description: "讨论之后确定了A项目的详细规格文档的编写…"}` | Feed.vue action 匹配 ✅ → `<note>` 渲染 → `v-else` 分支 → **灰色标签显示 10 词摘要** |
-| **F3 note_updated** | id=N, type='Note'（当前持有 MorphOne 关联） | `Note N`（通过 find(N) 找到） | `{object: {id, title, body（Str::limit 30字）}, description: "最终决定A项目Q3启动…"}` | Feed.vue action 匹配 ✅ → `<note>` 渲染 → `v-if` 分支 → **显示 title + body 30 字截断**（不是 10 词摘要！） |
+| **F1 note_created** | **id=N, type='Note'**（有效） | `Note N`（通过 `Note::find(N)` 找到） | `{object: {id, title, body（Str::limit 30字）}, description: "今天和张三…"}` | Feed.vue action 匹配 ✅ → `<note>` 渲染 → `v-if` 分支 → **显示 title + body 30 字截断** |
+| **F2 note_updated** | **id=N, type='Note'**（有效） | `Note N`（同上，同一个 Note） | `{object: {id, title, body（Str::limit 30字）}, description: "讨论之后确定…"}` | Feed.vue action 匹配 ✅ → `<note>` 渲染 → `v-if` 分支 → **显示 title + body 30 字截断** |
+| **F3 note_updated** | **id=N, type='Note'**（有效） | `Note N`（同上） | `{object: {id, title, body（Str::limit 30字）}, description: "最终决定A项目…"}` | Feed.vue action 匹配 ✅ → `<note>` 渲染 → `v-if` 分支 → **显示 title + body 30 字截断** |
 | **Fd** | 不存在（还没删） | — | — | — |
+
+**⚠️ 关键事实纠正**：与之前错误的分析不同，**笔记存在时，F1/F2/F3 三条记录都能加载到完整 Note**，都显示最新 Note 的 title + body 30 字。这意味着：
+
+- 所有历史操作记录在笔记存在时，都展示的是**最新的** body，而不是操作时刻的 body
+- 因为所有记录的 feedable_id 都是 N，都指向同一个最新的 Note
+- 如果想看到操作时刻的 body 快照，只能看每条记录各自独立保存的 `description` 10词摘要字段（但 v-if 分支不展示 description，只展示 object.body）
 
 **展示效果总结（笔记存在时）**：
 
 ```
-F3 最近一次编辑（持有关联）：
+F3 第二次编辑：
   John  edited a note          2025-01-03
   ┌─────────────────────────────────────┐
   │ （如果有 title 先显示 title）         │
-  │ 最终决定A项目Q3启动，相关资源已协调…  │  ← Str::limit 30字符，来自 Note 实时 body
+  │ 最终决定A项目Q3启动，相关资源已协调…  │  ← Str::limit 30字符，来自 Note 最新 body
   └─────────────────────────────────────┘
 
-F1 / F2 早期记录（关联已断开）：
+F2 第一次编辑：
+  John  edited a note           2025-01-02
+  ┌─────────────────────────────────────┐
+  │ （如果有 title 先显示 title）         │
+  │ 最终决定A项目Q3启动，相关资源已协调…  │  ← 也是最新 body（不是历史快照！）
+  └─────────────────────────────────────┘
+
+F1 创建：
   John  wrote a note            2025-01-01
-  ┌──────────────────────────────────────┐
-  │ [今天和张三讨论了A项目的需求和下一步…] │  ← 灰色标签，Str::words 10词快照
-  └──────────────────────────────────────┘
+  ┌─────────────────────────────────────┐
+  │ （如果有 title 先显示 title）         │
+  │ 最终决定A项目Q3启动，相关资源已协调…  │  ← 也是最新 body（不是创建时的原始 body！）
+  └─────────────────────────────────────┘
 ```
 
-**一个值得注意的细节**：即使笔记存在，**除了最近一次编辑之外**的所有历史记录也只能看到 10 词摘要，因为 MorphOne 的副作用把它们的 feedable 关联断开了。这意味着 MorphOne 在这里的语义其实是"当前最新版本"指针，而不是"每条记录都能回溯完整内容"。
+**设计含义**：MorphOne 不会断开旧关联，所以所有操作记录都指向最新的 Note 对象。历史操作记录在 Note 存在时展示的是最新状态，而不是操作发生时的状态。只有 Note 被删除后才会 fallback 到各自保存的 10词摘要快照。
 
 ---
 
@@ -897,10 +980,10 @@ F1 / F2 早期记录（关联已断开）：
 
 | 记录 | feedable_id / type | ViewHelper 中 `$note = $item->feedable` | ViewHelper 输出 data.note | 前端渲染 |
 |------|-------------------|----------------------------------------|--------------------------|---------|
-| **F1 note_created** | id=NULL, type=NULL | `null` | `{object: null, description: "今天和张三讨论了A项目的需求和下一步…"}` | Feed.vue action 匹配 ✅ → `<note>` 渲染 → `v-else` 分支 → **灰色标签显示 10 词摘要**（与笔记存在时相同，因为 description 是 DB 快照，不受 Note 删除影响） |
-| **F2 note_updated** | id=NULL, type=NULL | `null` | `{object: null, description: "讨论之后确定了A项目的详细规格文档的编写…"}` | 同上 → **灰色标签显示 10 词摘要** |
-| **F3 note_updated** | id=N**（残留值）**, type='Note'**（残留）** | `null`（因为 find(N) 找不到 Note 行，即使有 id 和 type 也没用） | `{object: null, description: "最终决定A项目Q3启动…"}` | Feed.vue action 匹配 ✅ → `<note>` 渲染 → `v-else` 分支 → **灰色标签显示 10 词摘要**（⚠️ 笔记存在时这里显示的是 30 字 body，删除后退化为 10 词摘要） |
-| **Fd note_destroyed** | id=NULL, type=NULL（故意不传） | `null` | `{object: null, description: "最终决定A项目Q3启动…"}` | **Feed.vue action 匹配 ❌**（条件写的是 `'note_deleted'`，实际 action 是 `'note_destroyed'`）→ **不渲染 `<note>` 组件**，也不走顶层 description fallback（ViewHelper 不返回顶层 description 字段）→ **只显示 sentence，什么内容都没有** |
+| **F1 note_created** | id=N**（残留）**, type='Note'**（残留）** | `null`（Note::find(N) 找不到，行已删除） | `{object: null, description: "今天和张三讨论了A项目的需求和下一步…"}` | Feed.vue action 匹配 ✅ → `<note>` 渲染 → `v-else` 分支 → **灰色标签显示 10 词摘要（创建时刻的快照）** |
+| **F2 note_updated** | id=N（残留）, type='Note'（残留） | `null` | `{object: null, description: "讨论之后确定了A项目的详细规格文档的编写…"}` | Feed.vue action 匹配 ✅ → `<note>` 渲染 → `v-else` 分支 → **灰色标签显示 10 词摘要（第一次编辑时刻的快照）** |
+| **F3 note_updated** | id=N（残留）, type='Note'（残留） | `null` | `{object: null, description: "最终决定A项目Q3启动…"}` | Feed.vue action 匹配 ✅ → `<note>` 渲染 → `v-else` 分支 → **灰色标签显示 10 词摘要（第二次编辑时刻的快照）** |
+| **Fd note_destroyed** | id=NULL, type=NULL（故意不传） | `null`（id 和 type 本就是 null） | `{object: null, description: "最终决定A项目Q3启动…"}` | **Feed.vue action 匹配 ❌**（条件写的是 `'note_deleted'`，实际 action 是 `'note_destroyed'`）→ **不渲染 `<note>` 组件**，也不走顶层 description fallback → **只显示 sentence，什么内容都没有** |
 
 **展示效果总结（笔记被删后）**：
 
@@ -908,27 +991,34 @@ F1 / F2 早期记录（关联已断开）：
 F1 创建记录：
   John  wrote a note            2025-01-01
   ┌──────────────────────────────────────┐
-  │ [今天和张三讨论了A项目的需求和下一步…] │  ← 灰色标签，10词摘要（DB 快照）
+  │ [今天和张三讨论了A项目的需求和下一步…] │  ← 灰色标签，10词摘要（创建时刻的快照）
   └──────────────────────────────────────┘
+    笔记存在时这里展示的是最新 body（可能和这完全不同），删除后才还原为历史快照
 
 F2 第一次编辑记录：
   John  edited a note           2025-01-02
   ┌─────────────────────────────────────────┐
-  │ [讨论之后确定了A项目的详细规格文档的编写…] │  ← 灰色标签，10词摘要
+  │ [讨论之后确定了A项目的详细规格文档的编写…] │  ← 灰色标签，10词摘要（第一次编辑时刻快照）
   └─────────────────────────────────────────┘
 
 F3 第二次（最近一次）编辑记录：
   John  edited a note           2025-01-03
   ┌──────────────────────────────────────┐
-  │ [最终决定A项目Q3启动，相关资源已协调…] │  ← ⚠️ 退化为灰色标签，10词摘要
+  │ [最终决定A项目Q3启动，相关资源已协调…] │  ← 灰色标签，10词摘要（第二次编辑时刻快照）
   └──────────────────────────────────────┘
-    （笔记存在时这里会显示更长的 30 字 body，删除后变短了）
+    笔记存在时显示的是 title + 30字 body，删除后退化为灰色标签的 10 词摘要
 
 Fd 删除记录（前端 Bug）：
   John  deleted a note          2025-01-04
     （空。。。什么内容预览都没有）
     （虽然 data.note.description 有值，但组件根本没渲染）
 ```
+
+**重要对比（笔记存在 vs 删除后）**：
+
+- **存在时**：所有 note_created / note_updated 都展示**同一个最新 Note** 的 body（30 字截断），历史操作的上下文差异仅体现在 sentence 动词不同（wrote vs edited）和时间戳不同
+- **删除后**：每条记录才分别展示各自操作时刻的 10 词摘要快照，能看到每次修改的内容演进轨迹
+- 某种程度上，只有删除后才能看到"真正的历史轨迹"；笔记存在时所有记录都只反映最新状态
 
 ---
 
@@ -937,8 +1027,9 @@ Fd 删除记录（前端 Bug）：
 | 问题 | 具体表现 | 位置 |
 |------|---------|------|
 | **前端 action 名 Bug** | `note_destroyed` 不匹配 `'note_deleted'`，删除操作的 <note> 组件完全不渲染 | [Feed.vue:139](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/resources/js/Shared/Modules/Feed.vue#L139) |
-| **MorphOne 历史记录断链** | 每次编辑都会把更早记录的 feedable_id/type 置空，导致即使笔记存在也只能从最近一次加载完整 body，历史记录全部 fallback 到 10 词摘要 | [UpdateNote:82](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageNotes/Services/UpdateNote.php#L82) — `$note->feedItem()->save()` |
-| **MorphOne 设计语义不符** | feedItem() 是一对一（MorphOne），但 ContactFeedItem 是**操作日志**应当是一对多（MorphMany）。一对多的设计下每条历史操作都能通过 feedable 回溯到完整 Note（只要 Note 还在） | [Note.php:92-95](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Models/Note.php#L92-L95) — `morphOne` 应改为 `morphMany` |
+| **MorphOne 语义澄清** | 之前误以为 MorphOne save() 会断开旧关联。**实际不会**：所有 note_created / note_updated 的 feedable_id/type 都保持有效，全部指向同一个 Note。只有查询端 `$note->feedItem` 用 `first()` 只返回一条 | — |
+| **历史记录展示"最新值"而非"操作时刻快照"** | 笔记存在时，所有操作记录都加载同一个最新 Note 对象并展示它的 body（30字截断），只有删除后才 fallback 到各自的 10词历史摘要。这意味着用户查看 Feed 时，无法通过"查看完整内容"的方式看到操作时刻的原始 body | [ActionFeedNote.php:17-21](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedNote.php#L17-L21) — `$note = $item->feedable` 加载最新 Note |
+| **MorphOne vs MorphMany 的思考** | feedItem() 定义为 MorphOne，但实际上 ContactFeedItem 是操作日志（多条记录对一），MorphOne 查询语义下 `$note->feedItem` 只会返回一条（取决于 DB 默认排序）。但因为本项目从不从 Note 方向查询 feedItem，所以这个设计差异没有造成实际影响 | [Note.php:92-95](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Models/Note.php#L92-L95) |
 | **顶层 description fallback 不起作用** | Feed.vue 有一个 `<div v-if="feedItem.description">` 兜底分支，但 ModuleFeedViewHelper 返回结构中没有顶层 description，对 note / post 类 action 永远不触发 | [ModuleFeedViewHelper.php:21-35](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/ModuleFeedViewHelper.php#L21-L35) |
 | **删除后完整内容不可恢复** | Note 硬删除后，body 的完整内容永久丢失，只能从各 feedItem 的 10 词摘要中看到碎片化信息 | [DestroyNote:54](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageNotes/Services/DestroyNote.php#L54) — `$this->note->delete()` |
 
