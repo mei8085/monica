@@ -6,6 +6,8 @@
 
 ## 一、搜索索引系统（Laravel Scout）
 
+> **版本锁定**：根据 `composer.lock:3139-3144`，本项目使用 **`laravel/scout: v10.17.0`**（reference: `66b064ab1f987560d1edfbc10f46557fddfed600`）。以下所有关于 Scout 内部方法链的分析均基于此锁定版本的实现模式。
+
 ### 1.1 驱动与总体架构
 
 系统使用 [Laravel Scout](https://laravel.com/docs/scout) 作为搜索抽象层，支持多种后端驱动：
