@@ -216,10 +216,11 @@ private function validate(): void
 
 ### 4.3 邮箱验证流程
 
-1. 创建邮箱渠道时生成 `verification_token` UUID
+1. 创建邮箱渠道时生成 `verification_token` UUID，`active` 默认 `false`
 2. 分发 [SendVerificationEmailChannel](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Settings/ManageNotificationChannels/Jobs/SendVerificationEmailChannel.php#L18-L53) 队列任务（high 优先级）
 3. 用户点击邮件中的验证链接 → 调用 [VerifyUserNotificationChannelEmailAddress](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Settings/ManageNotificationChannels/Services/VerifyUserNotificationChannelEmailAddress.php#L10-L74) 设置 `verified_at`
-4. 验证成功后触发 `ScheduleAllContactRemindersForNotificationChannel` 批量调度该渠道的所有提醒
+4. **验证成功后立即调用 `ScheduleAllContactRemindersForNotificationChannel` 批量插入排程**（此时 `active` 仍为 `false`）
+5. 用户需**手动激活渠道**（通过 ToggleUserNotificationChannel）才会设置 `active = true`
 
 ### 4.4 渠道激活/停用
 
@@ -775,3 +776,39 @@ NotificationsTestController
 - 仅在异常边界（联系人删除、渠道状态不一致）下出现
 - 代价很低（仅一次 UPDATE），不会造成通知重复发送
 - 属于**容错优先**的设计选择：宁可多标记几次，也不能漏掉应发送的提醒
+
+---
+
+### 8.6 渠道停用的删除行为设计
+
+#### 8.6.1 删除范围问题
+
+渠道停用时使用 `$channel->contactReminders->each->delete()`，这会删除 `ContactReminder` 模型本身（通过 BelongsToMany 关系），而非仅删除当前渠道的中间表记录。
+
+**删除的链式效应**：
+
+```
+each->delete() 对每个 ContactReminder 模型调用 delete()
+  └─ DELETE FROM contact_reminders WHERE id = ?
+      └─ 外键 cascadeOnDelete() 触发级联删除
+          └─ DELETE FROM contact_reminder_scheduled WHERE contact_reminder_id = ?
+              → 所有渠道的该提醒排程全部被清除
+```
+
+#### 8.6.2 跨渠道影响
+
+| 设计意图 | 实际结果 | 风险 |
+|----------|----------|------|
+| 仅清理当前渠道的排程 | 清理了所有渠道的该提醒 | 数据丢失，提醒永久消失 |
+| 重新激活渠道可恢复 | ContactReminder 已删除，无法恢复 | 用户需手动重新创建提醒 |
+| 各渠道相互独立 | 一个渠道失败导致所有渠道的同一提醒丢失 | 级联故障 |
+
+#### 8.6.3 失败阈值自动停用的风险
+
+失败阈值触发的自动停用是**最具破坏性**的场景：
+- Telegram 渠道因网络问题连续失败 10 次
+- 触发自动停用，调用 `contactReminders->each->delete()`
+- 同一用户的所有邮件渠道的同一提醒全部被级联删除
+- 用户未收到任何通知，却发现所有提醒"神秘消失"
+
+> **设计改进建议**：应使用 `$channel->contactReminders()->detach()` 或 `DB::table('contact_reminder_scheduled')->where('user_notification_channel_id', $channel->id)->delete()` 仅删除当前渠道的排程记录，保留 ContactReminder 模型。
