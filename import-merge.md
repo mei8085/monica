@@ -412,62 +412,235 @@ ImportVCard::execute(data)
 
 ### 4.2 推送链路（本地 → 远程）
 
-推送由 `PrepareJobsContactPush` 统一编排，分为**新增**、**变更**、**删除**三类，分别走不同的条件头策略。
+推送链路有两套入口：**普通同步** 走 `PrepareJobsContactPush`，**强制同步（force sync）** 走 `PrepareJobsContactPushMissed`。两者的条件头策略和回写行为有重要差异。
+
+#### 推送前统一获取卡片数据
+
+无论哪种入口，推送前都通过 `CardDAVBackend::getCard()` / `prepareCard()` 获取卡片数据，返回数组包含两组 ETag：
+- `etag` — **本地计算的**内容 ETag（`GetEtag` 服务基于当前 VCard 内容生成）
+- `distant_etag` — **远程服务器上次返回的** ETag（保存在 `contact.distant_etag` 字段）
+
+传给 `PushVCard` 构造函数的是 **`distant_etag`**（上一次从远程拿到的 ETag），不是本地 `etag`。
+
+---
+
+#### 4.2.1 普通同步：PrepareJobsContactPush
+
+普通同步由 [AddressBookSynchronizer::sync()](file:///d:/fz/0601-2/solo-dogfeeding/code/50-monica/app/Domains/Contact/DavClient/Services/Utils/AddressBookSynchronizer.php#L66-L92) 触发，通过 `SyncDAVBackend::getChangesForAddressBook()` 对比 sync_token 之后的变更，分为 **新增**、**变更**、**删除** 三类。
 
 ```
-AddressBookSynchronizer
+AddressBookSynchronizer::sync()
     │
-    ├─ SyncDAVBackend::getChangesForAddressBook()
-    │   └─ 对比 sync_token 之后的 created_at / updated_at / deleted_at
+    ├─ SyncDAVBackend::getChangesForAddressBook(sync_token_id, depth=1)
+    │   └─ 对比 created_at / updated_at / deleted_at
     │       → { added: [...], modified: [...], deleted: [...] }
     │
     ▼
-PrepareJobsContactPush
+PrepareJobsContactPush::execute(localChanges, changes)
     │
-    ├─ preparePushAddedContacts()
-    │   └─ 所有新增联系人 → PushVCard(MODE_MATCH_NONE)
-    │       不带 If-Match 头，直接 PUT
+    ├─ preparePushAddedContacts(added)
+    │   └─ 所有新增联系人
+    │       → new PushVCard(subscription, uri, card['distant_etag'],
+    │                         carddata, card['contact_id'])
+    │       // 不传 mode → 默认 MODE_MATCH_NONE
     │
-    ├─ preparePushChangedContacts()
+    ├─ preparePushChangedContacts(modified, changes)
     │   ├─ 排除刚从远程拉取的联系人（避免循环同步）
-    │   │   └─ 对比 refreshIds（本次拉取的联系人 UUID）
+    │   │   refreshIds = changes.map(contactDto → backend.getUuid(uri))
+    │   │   reject: uri 在 refreshIds 中
     │   │
-    │   ├─ 有 distant_etag → PushVCard(MODE_MATCH_ETAG)
-    │   │   If-Match: "<etag>"  乐观锁，仅当远程版本一致时更新
+    │   ├─ card['distant_etag'] !== null
+    │   │   → PushVCard(..., MODE_MATCH_ETAG)
     │   │
-    │   └─ 无 distant_etag → PushVCard(MODE_MATCH_ANY)
-    │       If-Match: "*"  只要远程存在就更新
+    │   └─ card['distant_etag'] === null
+    │       → PushVCard(..., MODE_MATCH_ANY)
     │
-    └─ prepareDeletedContacts()
-        └─ 所有已删除联系人 → DeleteVCard
+    └─ prepareDeletedContacts(deleted)
+        └─ DeleteVCard
     │
     ▼
-PushVCard
+PushVCard Job → 推送 → 状态回写（见 4.2.3）
+```
+
+---
+
+#### 4.2.2 强制同步：PrepareJobsContactPushMissed
+
+强制同步由 [AddressBookSynchronizer::forcesync()](file:///d:/fz/0601-2/solo-dogfeeding/code/50-monica/app/Domains/Contact/DavClient/Services/Utils/AddressBookSynchronizer.php#L97-L130) 触发（`--force` 参数）。它不依赖本地 sync_token，而是做**全量对比**：把本地所有联系人与远程所有联系人比对，找出「本地有但远程没有/没匹配上」的漏推联系人。
+
+```
+AddressBookSynchronizer::forcesync()
     │
-    ├─ 三种模式对应的请求头（headers() 方法）
-    │   ├─ MODE_MATCH_ETAG → If-Match: "<etag>"
-    │   ├─ MODE_MATCH_ANY  → If-Match: "*"
-    │   └─ MODE_MATCH_NONE → 无 If-Match 头
+    ├─ $localContacts = backend.getObjects(vault_id)    // 本地所有
+    │  $distContacts = getAllContactsEtag()              // 远程所有（addressbookQuery）
+    │
+    ├─ 拉取漏的：远程有本地没有的 → GetVCard（拉取）
+    │
+    ▼
+PrepareJobsContactPushMissed::execute(localChanges, distContacts, localContacts)
+    │
+    ├─ 第 1 部分：正常变更推送（同普通同步）
+    │   app(PrepareJobsContactPush)->execute(localChanges)
+    │
+    └─ 第 2 部分：漏推联系人推送
+       preparePushMissedContacts(added, distContacts, localContacts)
+       │
+       ├─ distUuids = distContacts.map(uri → getUuid(uri))
+       │  addedUuids = added.map(uri → getUuid(uri))
+       │
+       ├─ 筛选漏推：localContacts 中 reject
+       │   distUuids 包含 resource.id   // 远程有的排除
+       │   || addedUuids 包含 resource.id  // 已在新增列表的排除
+       │
+       └─ 每个漏推联系人 → PushVCard
+           - 有 distant_etag   → MODE_MATCH_ANY
+           - 无 distant_etag   → MODE_MATCH_NONE
+```
+
+**漏推联系人的判定**：本地存在，但既不在远程联系人列表里，也不在本次新增列表中的联系人。可能的原因：
+- 之前推送失败
+- 远程被他人删除但本地还保留
+- sync_token 不准确导致 added 列表遗漏
+
+**漏推的条件头策略比普通变更更「宽松」**：有 distant_etag 时用 `MODE_MATCH_ANY`（只要远程存在就更新），而不是 `MODE_MATCH_ETAG`（精确 etag 匹配）。因为既然已经是「漏推」，远程状态不确定，用更宽松的条件。
+
+---
+
+#### 4.2.3 三种推送场景的条件头对比
+
+| | 新增联系人（普通同步） | 变更联系人（有 distant_etag） | 变更联系人（无 distant_etag） | 漏推联系人（有 distant_etag） | 漏推联系人（无 distant_etag） |
+|---|---|---|---|---|---|
+| **入口** | `preparePushAddedContacts` | `preparePushChangedContacts` | `preparePushChangedContacts` | `preparePushMissedContacts` | `preparePushMissedContacts` |
+| **mode** | `MODE_MATCH_NONE`（默认 0） | `MODE_MATCH_ETAG`（1） | `MODE_MATCH_ANY`（2） | `MODE_MATCH_ANY`（2） | `MODE_MATCH_NONE`（0） |
+| **If-Match 头** | **不发送** | `If-Match: <distant_etag>` | `If-Match: *` | `If-Match: *` | 不发送 |
+| **etag 参数实际使用** | 不用 | 用作 If-Match 值 | 不用（写死 `*`） | 不用（写死 `*`） | 不用 |
+| **远程行为** | PUT 直接创建/覆盖 | 仅当远程 ETag 匹配时更新 | 只要远程存在就更新 | 只要远程存在就更新 | 直接 PUT |
+| **412 降级重试** | 不会触发 | 触发一次，降级 MODE_MATCH_NONE | 触发一次，降级 MODE_MATCH_NONE | 触发一次，降级 MODE_MATCH_NONE | 不会触发 |
+| **推送成功后回写** | 不回写 distant_etag | 回写 distant_etag | 不回写 distant_etag | 不回写 distant_etag | 不回写 distant_etag |
+
+> 注意：上表最后一行「回写」的差异不是 mode 决定的，而是由 `contact.distant_uri` 是否为 null 决定的——详见 4.2.5 节。
+
+---
+
+#### 4.2.4 PushVCard 执行流程与 412 降级
+
+[PushVCard::pushDistant()](file:///d:/fz/0601-2/solo-dogfeeding/code/50-monica/app/Domains/Contact/DavClient/Jobs/PushVCard.php#L80-L105) 递归执行，`depth` 初始为 1，最大重试 1 次：
+
+```
+pushDistant(depth=1)
+    │
+    ├─ headers() 根据 mode 构造请求头
+    │   ├─ MODE_MATCH_ETAG → ['If-Match' => $this->etag]
+    │   ├─ MODE_MATCH_ANY  → ['If-Match' => '*']
+    │   └─ MODE_MATCH_NONE → []
     │
     ├─ PUT 请求上传 VCard
     │
-    ├─ 遇到 412 Precondition Failed 时
-    │   └─ 自动降级为 MODE_MATCH_NONE 重试一次（深度=1）
+    ├─ 成功 → 返回响应头 ETag → 更新本地 distant_etag
     │
-    └─ 成功后更新本地 distant_etag
+    └─ 失败（RequestException）
+        ├─ status === 412 且 depth > 0
+        │   → mode = MODE_MATCH_NONE
+        │   → pushDistant(--depth)  递归重试一次
+        │
+        └─ 其他错误 → 记录日志 → fail() → 抛出
 ```
 
-#### 三种推送模式对比
+412 降级相当于乐观锁失败后的「强制覆盖」策略。降级后不再有 If-Match 约束，远程无论什么版本都会被覆盖。
 
-| 模式 | 常量 | If-Match 头 | 适用场景 | 行为 |
-|------|------|------------|----------|------|
-| MODE_MATCH_NONE | 0 | 无 | 新增联系人 | 服务器上有就覆盖，没有就创建 |
-| MODE_MATCH_ETAG | 1 | `"<etag>"` | 有远程版本记录的变更 | 仅当远程 ETag 匹配时才更新，否则 412 |
-| MODE_MATCH_ANY | 2 | `"*"` | 无远程版本记录但知道远程存在 | 只要远程有资源就更新，不管版本 |
+---
 
-#### 避免循环同步的机制
+#### 4.2.5 推送成功后的状态回写
 
-`preparePushChangedContacts()` 会将本次拉取中已经更新过的联系人（`$changes` 即 `refreshIds`）从推送列表中排除。这样刚从远程拉下来的变更不会又被推回去，避免了「拉 → 推 → 再拉 → 再推」的死循环。
+**重要发现**：PushVCard 推送成功后**只更新 `distant_etag`**，而且**仅当 `contact.distant_uri !== null` 时才更新**：
+
+```php
+// PushVCard::run()
+$etag = $this->pushDistant();
+
+if ($contact->distant_uri !== null) {
+    Contact::withoutTimestamps(function () use ($contact, $etag): void {
+        $contact->distant_etag = empty($etag) ? null : $etag;
+        $contact->save();
+    });
+}
+```
+
+- **不会设置** `distant_uri`
+- **不会设置** `distant_uuid`
+- **只会更新** `distant_etag`（前提是 distant_uri 已存在）
+
+`distant_uri` 和 `distant_uuid` 只在**拉取时**设置——也就是 `ImportContact::import()` 中 `$this->context->external == true` 的分支里：
+
+```php
+// ImportContact::import()
+if ($this->context->external && $contact->distant_uuid === null) {
+    $contact->distant_uuid = $this->getUid($vcard);
+    $contact->save();
+}
+
+return Contact::withoutTimestamps(function () use ($contact): Contact {
+    $uri = Arr::get($this->context->data, 'uri');
+    if ($this->context->external) {
+        $contact->distant_etag = Arr::get($this->context->data, 'etag');
+        $contact->distant_uri = $uri;
+        $contact->save();
+    }
+    return $contact;
+});
+```
+
+**实际影响**：本地新建的联系人推送到远程后，`distant_uri` 仍然是 null，`distant_etag` 也不会被更新。要等到**下一次拉取**（远程 → 本地）时，这三个远程同步字段才会被填充。
+
+---
+
+#### 4.2.6 三个远程同步字段的完整生命周期
+
+| 字段 | 拉取时（ImportContact, external=true） | 推送成功后（PushVCard） |
+|------|--------------------------------------|-----------------------|
+| `distant_uri` | 设置为 DAV 资源 URI | **不修改**（只在 distant_uri 非空时才更新 etag） |
+| `distant_uuid` | 设置为 VCard 的 UID | **不修改** |
+| `distant_etag` | 设置为远程响应头 ETag | 若 distant_uri 非空，则更新为新的响应头 ETag |
+
+```
+初始状态（本地新建联系人）：
+  distant_uri   = null
+  distant_uuid  = null
+  distant_etag  = null
+        │
+        ▼  PushVCard（新增推送，MODE_MATCH_NONE）
+        ▼  推送成功
+  distant_uri   = null    ← 不变！因为条件是 distant_uri !== null
+  distant_uuid  = null    ← 不变！PushVCard 不碰这个字段
+  distant_etag  = null    ← 不变！
+        │
+        ▼  下一次拉取（UpdateVCard → ImportVCard, external=true）
+        ▼  ImportContact::import()
+  distant_uri   = <远程 URI>
+  distant_uuid  = <VCard UID>
+  distant_etag  = <远程响应 ETag>
+        │
+        ▼  再次推送（变更推送，MODE_MATCH_ETAG）
+        ▼  推送成功
+  distant_uri   = 不变
+  distant_uuid  = 不变
+  distant_etag  = <新响应 ETag>   ← 只有这个更新
+```
+
+---
+
+#### 4.2.7 避免循环同步的机制
+
+普通同步的 `preparePushChangedContacts()` 会将本次拉取中远程已更新的联系人从推送列表排除：
+
+```php
+$refreshIds = $changes->map(fn (ContactDto $contact): string => $this->backend()->getUuid($contact->uri));
+
+return $this->filterContacts($contacts)
+    ->reject(fn (string $uri): bool => $refreshIds->contains($this->backend()->getUuid($uri)))
+```
+
+`$changes` 是本次远程拉取的变更列表。这样刚从远程拉下来的变更不会又被推回去，避免「拉 → 推 → 再拉 → 再推」的死循环。强制同步没有这个排除机制，因为强制同步的目的就是全量对齐。
 
 ### 4.3 CalDAV 链路（本地服务端）
 
