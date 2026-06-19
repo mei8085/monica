@@ -75,29 +75,50 @@ public function share(Request $request)
 }
 ```
 
-### 1.6 运行时缓存机制
+### 1.6 运行时缓存机制（分层说明）
 
-#### 1.6.1 Laravel 配置缓存（文件级，跨请求）
-- **触发方式**：执行 `php artisan config:cache` 命令
-- **存储位置**：`bootstrap/cache/config.php` - 所有配置被编译为单一 PHP 文件
-- **加载流程**：应用启动时检测到该文件存在则直接 `require` 加载，跳过解析所有 `config/*.php` 和 `.env` 文件
-- **清除方式**：执行 `php artisan config:clear` 删除编译文件
-- **适用范围**：生产环境部署时启用，显著加速配置加载
+#### 1.6.1 配置编译缓存（文件级，持久化磁盘）
+- **触发方式**：执行 `php artisan config:cache` Artisan 命令
+- **存储位置**：`bootstrap/cache/config.php` - 所有配置被编译为单一 PHP 文件直接返回数组
+- **加载行为**：框架启动时检测到该文件存在则：
+  1. 直接 `require` 此文件加载数组（一次 IO）
+  2. **完全跳过**解析所有 `config/*.php` 和 `.env` 文件
+  3. 此时 `env()` 函数返回值不再来自 `.env`，而是来自编译缓存
+- **清除方式**：执行 `php artisan config:clear` 删除 `bootstrap/cache/config.php`
+- **失效条件**：仅当编译文件被删除或重新生成时才失效，重启进程本身不会刷新此缓存（因为文件在磁盘上）
+- **适用场景**：生产环境标准部署操作，显著加速配置加载
 
-#### 1.6.2 服务容器内存驻留（进程级，跨请求）
-- **机制**：配置加载后存储于 `Illuminate\Config\Repository` 单例对象中，由服务容器管理
-- **生命周期**：
-  - FPM/传统 PHP：请求开始时创建/重置，请求结束后销毁
-  - Octane/Swoole：常驻内存，跨请求复用，直到进程重启
+#### 1.6.2 服务容器内存驻留（进程级，不同运行模式差异巨大）
+- **机制**：配置数组加载后存储于 `Illuminate\Config\Repository` 单例对象，通过服务容器全局可访问
 - **读取方式**：`config()` 辅助函数或 `Config` Facade 直接从内存数组读取，无额外 IO
+- **关键差异 - 取决于 PHP 运行模式**：
 
-#### 1.6.3 本项目未使用 `Cache` Facade 对此层级配置做额外缓存
+| 运行模式 | 进程生命周期 | 配置加载时机 | 容器内存跨请求？ | `.env` 修改何时生效 |
+|---------|------------|------------|----------------|------------------|
+| **FPM / CLI（本项目默认）** | 每个请求独立进程，请求结束即销毁 | 每个请求开始时重新加载配置 | ❌ **完全不跨请求**，每个请求全新容器 | 无编译缓存：**下一个请求立即生效**<br>有编译缓存：**执行 config:clear / config:cache 后生效** |
+| **Octane / Swoole（可选部署）** | 长驻进程，处理成百上千请求后才重启 | Worker 进程启动时加载一次 | ✅ **跨请求复用同一容器**，内存状态贯穿整个进程生命周期 | 无论有无编译缓存，**必须重启 Octane 进程才生效** |
+
+> **说明**：本项目 `composer.json` 未安装 `laravel/octane` 依赖，也无 `config/octane.php`，默认使用 **FPM 模式**。但文档保留 Octane 场景以供参考。
+
+#### 1.6.3 `.env` 修改生效条件汇总表
+
+| 场景 | 无 config:cache | 有 config:cache |
+|-----|----------------|----------------|
+| **FPM 模式** 修改 `.env` | 下一个请求立即生效（每个请求重新读取 `.env`） | ❌ 不生效（已跳过 `.env` 解析）。必须执行 `config:clear` 或重新 `config:cache` |
+| **Octane 模式** 修改 `.env` | ❌ 不生效（容器内存常驻，不重读 `.env`）。必须 `octane:reload` 重启进程 | ❌ 不生效。必须先 `config:clear` / `config:cache`，再 `octane:reload` |
+| Docker/K8s 环境变量注入 | 同 FPM / Octane 规则 | 同 FPM / Octane 规则，且需重新部署 Pod |
+
+#### 1.6.4 本项目未使用 `Cache` Facade 对此层级配置做额外缓存
 
 ### 1.7 界面写回
 **不支持界面写回。** 此层级配置修改方式：
-1. 直接编辑服务器上的 `.env` 文件
+1. 直接编辑服务器上的 `.env` 文件（或容器环境变量）
 2. 通过容器编排（Docker/K8s）的环境变量注入
-3. 修改后需执行 `php artisan config:clear` 或重启应用生效
+3. **生效操作**（按部署模式选择）：
+   - FPM 无编译缓存：无需额外操作，下一次请求自动生效
+   - FPM 启用了 `config:cache`：执行 `php artisan config:clear` 或重新 `config:cache`
+   - Octane 模式：执行 `php artisan octane:reload` 重启 Worker 进程
+   - Docker/K8s：重新构建镜像或滚动更新 Pod
 
 ---
 
