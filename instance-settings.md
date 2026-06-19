@@ -562,13 +562,39 @@ methods: {
 
 ## 四、运行时缓存边界详细对比
 
-| 缓存类型 | 作用范围 | 生命周期 | 存储介质 | 复用对象？ | 自动失效 | 代码位置 |
-|---------|---------|---------|---------|-----------|---------|---------|
-| **Laravel 配置缓存** | 全局 | 跨请求（直到 config:clear） | 文件 `bootstrap/cache/config.php` | N/A（配置是数组） | 手动清除 | 框架内置 |
-| **服务容器配置内存** | 全局 | 进程生命周期（FPM 请求级 / Octane 常驻） | PHP 内存数组 | N/A | 进程重启 | 框架内置 |
-| **Auth SessionGuard 用户缓存** | 当前认证用户 | 单次请求 | Guard 对象属性 | ✅ 是（同一请求内） | 请求结束 | 框架内置 |
-| **Eloquent 已加载关系** | 单个模型实例 | 实例生命周期（通常单次请求） | 模型 `$relations` 数组 | ✅ 是（同一实例内） | 实例销毁 / 调用 `unsetRelation()` | [BaseService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/35-monica/app/Services/BaseService.php) |
-| **Cache Array 驱动** | 全局 | 单次请求 | PHP 数组（`ArrayStore`） | ✅ 是（`serialize: false`） | 请求结束 | [VaultHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/35-monica/app/Helpers/VaultHelper.php#L40-L53) |
+### 4.1 缓存分层总表
+
+| 缓存类型 | 作用范围 | 存储介质 | 复用对象？ | 代码位置 |
+|---------|---------|---------|-----------|---------|
+| **配置编译缓存（config:cache）** | 全局 | 磁盘文件 `bootstrap/cache/config.php` | N/A（配置是数组） | 框架内置 |
+| **服务容器配置内存** | 全局 | PHP 内存（`Config\Repository` 单例） | N/A | 框架内置 |
+| **Auth SessionGuard 用户缓存** | 当前认证用户 | Guard 对象的 `$user` 属性 | ✅ 同一请求内 | 框架内置 |
+| **Eloquent 已加载关系** | 单个模型实例 | 模型 `$relations` 数组 | ✅ 同一实例内 | [BaseService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/35-monica/app/Services/BaseService.php) |
+| **Cache Array 驱动** | 当前进程全局 | PHP 数组（`ArrayStore` 单例） | ✅ 是（`serialize: false` 直接存引用） | [VaultHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/35-monica/app/Helpers/VaultHelper.php#L40-L53) |
+
+### 4.2 生命周期与失效条件（按运行模式对比）
+
+| 缓存类型 | 生命周期（FPM 模式，本项目默认） | 生命周期（Octane 模式，可选部署） | 失效条件（FPM） | 失效条件（Octane） |
+|---------|-------------------------------|-------------------------------|----------------|------------------|
+| **配置编译缓存** | 磁盘文件持久存在；每个请求启动时 `require` 一次 | 同左（磁盘文件不随进程生命周期消失） | `config:clear` / 重新 `config:cache`（重启进程本身**不会**刷新此缓存） | 同左（磁盘文件级别，与进程无关） |
+| **服务容器配置内存** | ❌ 仅当前请求有效；每个请求新建容器，请求结束**随请求销毁**（非"进程重启"） | ✅ Worker 启动时加载一次，跨所有请求复用 | 请求结束即销毁 | `octane:reload` / 进程重启 |
+| **Auth SessionGuard 用户缓存** | 单次请求内复用 | 单次请求内复用 | 请求结束随 Guard 一起销毁 | 请求结束（Octane 每请求重建 Guard） |
+| **Eloquent 已加载关系** | 实例生命周期（通常单次请求内创建和销毁） | 同左（每个请求独立查询得到新实例） | 实例销毁 / `unsetRelation()` | 同左 |
+| **Cache Array 驱动** | ❌ 仅当前请求有效；`ArrayStore` 随请求结束**随容器一起销毁** | ✅ **跨请求有效**；`ArrayStore` 是容器单例，Worker 常驻期间持续存在 | 请求结束随容器销毁 | TTL 过期（5s） / `octane:reload` 重启进程 |
+
+> **关键修正说明**：
+> 
+> - **服务容器在 FPM 模式下不是"进程重启"才失效**：FPM Worker 进程处理多个请求时，Laravel 框架为每个请求独立构建和销毁整个服务容器。配置内存在**请求结束**时即销毁，而非等到 Worker 进程重启。
+> 
+> - **Cache Array 在 Octane 模式下不是"单次请求"**：`Cache::store('array')` 返回的 `ArrayStore` 是服务容器中的单例。FPM 模式下容器随请求销毁所以 ArrayStore 也销毁；但 Octane 模式下容器常驻，ArrayStore 随之跨请求存活，直到 TTL（5s）过期或 Worker 重启。
+
+### 4.3 .env 修改生效条件（配置相关缓存联动）
+
+| 场景 | 无 config:cache | 有 config:cache |
+|-----|----------------|----------------|
+| **FPM 模式** 修改 `.env` | ✅ 下一个请求立即生效（每请求重建容器时重读 `.env`） | ❌ 不生效（已跳过 `.env` 解析）。必须 `config:clear` 或重新 `config:cache` |
+| **Octane 模式** 修改 `.env` | ❌ 不生效（容器常驻不重读 `.env`）。必须 `octane:reload` 重启 Worker | ❌ 不生效。必须先 `config:clear` / `config:cache`，再 `octane:reload` |
+| Docker/K8s 环境变量注入 | 同 FPM / Octane 规则 | 同 FPM / Octane 规则，且需重新部署 Pod |
 
 > **关键澄清 - 关于 Eloquent Identity Map**：
 > 
@@ -589,13 +615,16 @@ methods: {
 |------|-------------------|----------------------|---------------------|
 | **存储介质** | `.env` + `config/*.php` | 数据库（accounts 表 + 关联表） | 数据库 users 表字段 |
 | **读取入口** | `config('monica.xxx')` | `Auth::user()->account` 或 `Account::find()` | `Auth::user()->{field}` |
-| **运行时缓存** | 1. Laravel 配置缓存（文件级，可选）<br>2. 服务容器内存数组 | 1. Eloquent 已加载关系（实例级）<br>2. Cache Array 请求级缓存（衍生数据，5s） | 1. Auth SessionGuard 用户对象缓存（请求级）<br>2. Eloquent 已加载关系（实例级） |
-| **跨请求缓存** | ✅ 有（config:cache 文件） | ❌ storage_limit_in_mb 无；衍生数据视业务而定 | ❌ 无 |
+| **运行时缓存层次** | 1. 配置编译缓存（磁盘文件，`config:cache`）<br>2. 服务容器内存（FPM：每请求重建 / Octane：常驻） | 1. Eloquent 已加载关系（实例级 `$relations`）<br>2. Cache Array 请求级缓存（衍生数据，5s TTL） | 1. Auth SessionGuard 用户对象缓存（同请求内）<br>2. Eloquent 已加载关系（实例级 `$relations`） |
+| **跨请求状态（FPM 模式）** | ✅ 磁盘文件层面跨请求（编译缓存）<br>❌ 服务容器内存不跨请求 | ❌ 每次请求独立查库<br>✅ 衍生数据 Cache Array 跨路径（同请求内） | ❌ 每次请求独立查库<br>❌ Auth 缓存不跨请求 |
+| **跨请求状态（Octane 模式）** | ✅ 编译缓存 + 容器内存双重跨请求 | ❌ 每次请求独立查库<br>✅ Cache Array **真正跨请求**（Worker 常驻）+ TTL 双重约束 | ❌ 每次请求独立查库<br>❌ Auth 缓存不跨请求 |
+| **.env 修改生效** | 见 §1.6.3 汇总表（受 config:cache 和运行模式双重影响） | N/A | N/A |
 | **界面写回** | ❌ 不支持 | ✅ 关联数据支持（需账户管理员）；❌ storage_limit_in_mb 不支持 | ✅ 完全支持（用户本人操作） |
 | **写回 Service** | N/A | CreateGender / UpdateGender / DestroyGender 等 CRUD 服务 | Store{Preference} 系列服务（仅更新） |
 | **权限控制** | N/A | `author_must_be_account_administrator` | `author_must_belong_to_account` |
-| **对象复用机制** | N/A | 通过变量引用；Eloquent 关系缓存 | Auth::user() 缓存；Eloquent 关系缓存 |
-| **Identity Map** | N/A | ❌ 无 | ❌ 无 |
+| **对象复用边界** | N/A | 仅变量引用；Eloquent 关系缓存（同实例内） | Auth::user() 缓存（同请求）；关系缓存（同实例内） |
+| **Eloquent Identity Map** | N/A | ❌ 不存在（每次 `find()` 新 SQL + 新对象） | ❌ 不存在 |
+| **修改后需重启进程？** | FPM 无编译缓存：无需<br>FPM 有编译缓存：无需（清缓存文件即可）<br>Octane：必须 `octane:reload` | 写入后新请求自动读取最新数据 | 写入后新请求自动读取最新数据 |
 
 ---
 
