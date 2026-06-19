@@ -558,30 +558,59 @@ public static function data(Group $group): array
 
 这是整个搜索流程中最关键也最隐蔽的环节。
 
-#### 6.3.1 Scout 搜索执行的完整流程
+#### 6.3.1 Scout 搜索执行的完整流程（v10.17.0 源码核实）
 
-根据 [Laravel Scout 官方文档](https://laravel.com/docs/scout) 和代码设计，`Contact::search($term)->where('vault_id', $vault->id)->get()` 的执行过程如下：
+基于 Scout v10.17.0 真实源码（reference: `66b064ab1f987560d1edfbc10f46557fddfed600`），`Contact::search($term)->where('vault_id', $vault->id)->get()` 的执行过程如下：
 
 ```
 1. Contact::search($term)
+   → Searchable::search() (src/Searchable.php L232-238)
+   → app(Builder::class, ['model' => new static, 'query' => $query, ...])
    → 创建 Laravel\Scout\Builder 实例
-   → 保存搜索词 "John"
    
 2. ->where('vault_id', $vault->id)
-   → 在 Builder 的 $wheres 数组中保存 ['vault_id' => 'xxx']
+   → Builder::where() (src/Builder.php L170-174)
+   → $this->wheres['vault_id'] = $vault->id
+   → 返回 $this（链式调用）
    
 3. ->get()
-   ├─ 调用 Engine::search(Builder $builder)
-   │    ├─ Meilisearch/Algolia/Typesense 执行搜索
-   │    │   · 全文搜索关键词 "John"
-   │    │   · 应用过滤条件 vault_id = "xxx"
-   │    │   · 返回匹配文档的 ID 列表 [id1, id2, id3]
-   │    │
-   │    └─ Scout 用这些 ID 回查 MySQL
-   │         → SELECT * FROM contacts WHERE id IN (id1, id2, id3)
-   │         → 🔴 这里不会追加任何额外的 WHERE 条件！
+   → Builder::get() (src/Builder.php L288-291)
+   → return $this->engine()->get($this)
    │
-   └─ 返回 Eloquent Collection
+   └─ Engine::get() (src/Engines/Engine.php L154-159)
+      → return $this->map(
+            $builder,
+            $builder->applyAfterRawSearchCallback($this->search($builder)),
+            $builder->model
+        );
+      │
+      ├─ 步骤 A：$this->search($builder)
+      │   → 发送搜索请求到 Meilisearch/Algolia/Typesense
+      │   → 全文搜索关键词 + 应用 wheres 过滤 vault_id
+      │   → 返回原始搜索结果（含命中文档的 ID）
+      │
+      ├─ 步骤 B：applyAfterRawSearchCallback()
+      │   → 如果设置了 afterRawSearchCallback 则调用
+      │   → 本项目未设置，直接透传
+      │
+      └─ 步骤 C：$this->map($builder, $results, $model)
+          → 各 Engine 子类实现（如 MeilisearchEngine）
+          → 从 $results 中提取 ID 列表
+          → 调用 $model->getScoutModelsByIds($builder, $ids)
+          │
+          └─ Searchable::getScoutModelsByIds() (src/Searchable.php L275-278)
+             → return $this->queryScoutModelsByIds($builder, $ids)->get();
+             │
+             └─ Searchable::queryScoutModelsByIds() (src/Searchable.php L287-299)
+                → $query = static::usesSoftDelete()
+                    ? $this->withTrashed()   // Contact 有 SoftDeletes，走这条
+                    : $this->newQuery();
+                → if ($builder->queryCallback) { call_user_func($builder->queryCallback, $query); }
+                  // 🔴 本项目未用 query()，跳过
+                → $query->{$whereIn}($this->qualifyColumn($this->getScoutKeyName()), $ids)
+                  // 🔴 WHERE `contacts`.`id` IN ('id1','id2','id3')
+                  // 🔴 这里不会追加 vault_id / listed 等任何条件！
+                → return $query;  // 返回给上层 ->get() 执行
 ```
 
 #### 6.3.2 为什么回查不追加条件？
@@ -1139,25 +1168,36 @@ public function scopeActive(Builder $query): Builder
 
 ### 8.5 关键代码位置速查
 
+> **版本锁定说明**：本项目使用 `laravel/scout: v10.17.0`（composer.lock:3139-3144, reference `66b064ab1f987560d1edfbc10f46557fddfed600`）。
+
 | 概念 | 文件 | 行号 |
 |------|------|------|
+| Scout 版本锁定 | composer.lock | L3139-L3144 |
 | Searchable trait 引入（Contact）| [Contact.php:28](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L28) |
 | toSearchableArray | [Contact.php:88-97](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L88-L97) |
 | shouldBeSearchable | [Contact.php:104-107](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L104-L107) |
 | searchIndexShouldBeUpdated | [Contact.php:134-137](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L134-L137) |
-| scopeActive | [Contact.php:112-115](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L112-L115) |
+| scopeActive（但路径C未使用）| [Contact.php:112-115](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L112-L115) |
+| 创建联系人时 listed 硬编码为 true | [ContactController.php:83](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L83) |
 | ScoutHelper::isActivated | [ScoutHelper.php:15-30](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Helpers/ScoutHelper.php#L15-L30) |
-| ScoutHelper::id | [ScoutHelper.php:66-84](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Helpers/ScoutHelper.php#L66-L84) |
+| ScoutHelper::id（索引字段构造）| [ScoutHelper.php:66-84](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Helpers/ScoutHelper.php#L66-L84) |
 | group-owner Gate 定义 | [AuthServiceProvider.php:67-76](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Providers/AuthServiceProvider.php#L67-L76) |
 | contact-owner Gate 定义 | [AuthServiceProvider.php:56-65](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Providers/AuthServiceProvider.php#L56-L65) |
-| 路由 group-owner 中间件 | [web.php:398](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/routes/web.php#L398) |
-| 路由 contact-owner 中间件 | [web.php:250](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/routes/web.php#L250) |
+| 路由 vault-viewer 外层中间件 | [web.php:199](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/routes/web.php#L199) |
+| 路由 contact-owner 中间件分组 | [web.php:250](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/routes/web.php#L250) |
+| 路由 PUT toggle（归档入口） | [web.php:267](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/routes/web.php#L267) |
+| 路由 group-owner 中间件分组 | [web.php:398](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/routes/web.php#L398) |
+| ContactArchiveController@update（归档控制器） | [ContactArchiveController.php:12-29](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactArchiveController.php#L12-L29) |
+| ToggleArchiveContact（归档服务）| [ToggleArchiveContact.php:11-78](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Services/ToggleArchiveContact.php#L11-L78) |
 | Service group_must_belong_to_vault | [BaseService.php:220-230](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Services/BaseService.php#L220-L230) |
 | Service contact_must_belong_to_vault | [BaseService.php:205-215](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Services/BaseService.php#L205-L215) |
-| 路径A 主列表 | [ContactController.php:30-31](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L30-L31) |
-| 路径B 标签筛选 | [ContactLabelController.php:21-26](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactLabelController.php#L21-L26) |
-| 路径C 分组成员 | [GroupShowViewHelper.php:26-28](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupShowViewHelper.php#L26-L28) |
-| 路径D 模块搜索 | [VaultContactSearchViewHelper.php:14-19](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultContactSearchViewHelper.php#L14-L19) |
-| 路径E 全局搜索 | [VaultSearchIndexViewHelper.php:33-35](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultSearchIndexViewHelper.php#L33-L35) |
-| ToggleArchiveContact | [ToggleArchiveContact.php](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Services/ToggleArchiveContact.php) |
-| Gates 单元测试 | [GatesTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/tests/Unit/Controllers/GatesTest.php) |
+| 路径A 主列表 where('listed', true) | [ContactController.php:30-31](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L30-L31) |
+| 路径B 标签筛选 where('listed', true) | [ContactLabelController.php:21-26](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactLabelController.php#L21-L26) |
+| 路径C 分组成员①（按角色，无 listed） | [GroupShowViewHelper.php:26-28](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupShowViewHelper.php#L26-L28) |
+| 路径C 分组成员②（未分配角色，无 listed） | [GroupShowViewHelper.php:48-50](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupShowViewHelper.php#L48-L50) |
+| 路径D 模块内搜索 where('vault_id') | [VaultContactSearchViewHelper.php:14-19](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultContactSearchViewHelper.php#L14-L19) |
+| 路径E 全局搜索 where('vault_id')（Contact） | [VaultSearchIndexViewHelper.php:33-35](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultSearchIndexViewHelper.php#L33-L35) |
+| 路径E 全局搜索 where('vault_id')（Note） | [VaultSearchIndexViewHelper.php:50-52](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultSearchIndexViewHelper.php#L50-L52) |
+| 路径E 全局搜索 where('vault_id')（Group） | [VaultSearchIndexViewHelper.php:75-77](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultSearchIndexViewHelper.php#L75-L77) |
+| Meilisearch filterableAttributes | [scout.php:141-144](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/config/scout.php#L141-L144) |
+| Gates 单元测试 | [GatesTest.php:1-145](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/tests/Unit/Controllers/GatesTest.php#L1-L145) |
