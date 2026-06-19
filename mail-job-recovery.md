@@ -2,16 +2,19 @@
 
 ---
 
-## 关键纠正说明（含二次修正）
+## 关键纠正说明（含三次修正）
 
-| 初版错误 | 首次纠正 | 二次补充澄清 |
-|---------|---------|------------|
-| 取数含 `triggered_at IS NULL` | 取数只看 `scheduled_at <= NOW()` | —— |
-| triggered_at 是主防护 | triggered_at 仅审计/前端用 | —— |
-| 循环提醒创建新记录 | 更新同一条记录的 scheduled_at | Reschedule 用 syncWithoutDetaching 只改 scheduled_at，**不重置 triggered_at** |
-| 一次性提醒标记完成 | 一次性提醒直接 DELETE | —— |
-| Reschedule 在 triggered_at 之后 | 顺序：发送 → Reschedule → updateTriggeredAt | —— |
-| 短期建议：加 `triggered_at IS NULL` | —— | ❌ **此建议错误！会导致循环提醒只触发一次**，见第4节详解 |
+| 初版错误 | 首次纠正 | 二次补充 | 三次补充（本次） |
+|---------|---------|---------|----------------|
+| 取数含 `triggered_at IS NULL` | 取数只看 `scheduled_at <= NOW()` | —— | —— |
+| triggered_at 是主防护 | triggered_at 仅审计/前端用 | —— | —— |
+| 循环提醒创建新记录 | 更新同一条记录的 scheduled_at | Reschedule 只改 scheduled_at，**不重置 triggered_at** | —— |
+| 一次性提醒标记完成 | 一次性提醒直接 DELETE | —— | —— |
+| Reschedule 在 triggered_at 之后 | 顺序：发送 → Reschedule → updateTriggeredAt | —— | —— |
+| 加 triggered_at 过滤就够了 | —— | ❌ 会导致循环提醒只触发一次，需三处联动修改 | —— |
+| 通知同步发送，notify() 返回 = 邮件已发出 | —— | —— | ❌ 通知 use Queueable，队列驱动下 notify() 只是入队，邮件发送是异步的 |
+| UserNotificationSent 是"已发送"记录 | —— | —— | ❌ **写在 toMail() 里，发生在实际发送之前**，不能证明发送成功 |
+| catch 块中 error 记录和成功记录二选一 | —— | —— | ❌ sync 驱动下可能两条都有：toMail 先写一条"成功"记录，发送失败后 catch 又写一条 error 记录 |
 
 ---
 
@@ -281,9 +284,225 @@ $this->assertDatabaseHas('contact_reminder_scheduled', [
 
 ---
 
-## 4. triggered_at 过滤会不会影响循环提醒？—— 会！（加过滤必须同时重置）
+## 4. 三大边界深度分析：发送时序 / 并发取数 / 发送记录可信度
 
-### 4.1 初版建议的错误：只加过滤不重置 = 循环提醒只触发一次
+### 4.1 发送已发生但触发标记未写入？—— 不，是"通知发了但 scheduled 状态没更新"
+
+首先澄清：不是"邮件发了但 triggered_at 没写"那么简单。实际有**五层操作**，每一层之间都可能中断，产生不同的边界状态。
+
+#### 五层操作的完整时序（代码逐行拆解）
+
+在 `ProcessScheduledContactReminders::handle()` 的单条记录处理中，按执行顺序有五层关键操作：
+
+```
+Layer 1: notify() 发送通知
+  └─ Notification::route('mail', ...)->notify(new ReminderTriggered(...))
+       └─ 内部会调用 toMail()，toMail() 里会写 UserNotificationSent
+
+Layer 2: increment number_times_triggered
+  └─ UPDATE contact_reminders SET number_times_triggered = number_times_triggered + 1
+
+Layer 3: RescheduleContactReminderForChannel
+  └─ syncWithoutDetaching 更新 scheduled_at（循环提醒）或 DELETE（一次性提醒）
+
+Layer 4: updateTriggeredAt
+  └─ UPDATE contact_reminder_scheduled SET triggered_at = NOW()
+
+Layer 5: UserNotificationSent （注意：这层是在 Layer 1 的 toMail() 里写的，不是在最后）
+```
+
+**关键事实**：UserNotificationSent 的写入发生在 **toMail() 方法内**，也就是邮件真正发送**之前**。
+
+#### sync 驱动 vs database 驱动的时序差异
+
+**sync 驱动（本地开发）：**
+```
+notify() 调用
+  → toMail() 执行 → UserNotificationSent::create() （写DB，此时邮件还没发）
+  → 返回 MailMessage 对象
+  → Laravel 调用邮件驱动真正发送
+  → 发送成功 → notify() 返回
+  → 发送失败 → 抛出异常 → 进入 catch 块
+```
+sync 下：notify() 返回 = 邮件已发出。toMail() 内的 UserNotificationSent 是在发送**前**写的。
+
+**database 驱动（生产环境）：**
+```
+notify() 调用
+  → toMail() 执行 → UserNotificationSent::create() （写DB）
+  → 返回 MailMessage 对象
+  → Laravel 检测到通知 use Queueable
+  → 把通知 push 到队列（jobs 表）
+  → notify() 返回（此时邮件还没发！）
+```
+database 下：notify() 返回 ≠ 邮件已发出。邮件可能还在队列里，甚至可能永远发不出去。
+
+#### 各层中断后的边界状态
+
+| 中断点 | 邮件状态 | UserNotificationSent | number_times_triggered | scheduled_at | triggered_at | 下次是否重复 |
+|--------|---------|---------------------|----------------------|-------------|-------------|------------|
+| Layer 1 之前 | 未发 | ❌ 无 | ❌ 未变 | 过去 | null | ✅ 是（正常） |
+| Layer 1 中（toMail里） | 未发 | ⚠️ 可能有也可能无 | ❌ 未变 | 过去 | null | ✅ 是 |
+| Layer 1 后（notify返回） | sync:已发<br>database:队列中 | ✅ 有 | ❌ 未变 | 过去 | null | ❌ 重复发送 |
+| Layer 2 后 | 同上 | ✅ 有 | ✅ +1 | 过去 | null | ❌ 重复发送 |
+| Layer 3 后（Reschedule） | 同上 | ✅ 有 | ✅ +1 | 未来 | null | ✅ 否 |
+| Layer 4 后（triggered_at） | 同上 | ✅ 有 | ✅ +1 | 未来 | 有值 | ✅ 否 |
+
+**结论**：
+- database 驱动下，notify() 返回时邮件**可能还没发**，catch 块捕获不到发送异常
+- 如果在 Layer 1 之后、Layer 3 之前中断，邮件可能已发（或在队列中），但 scheduled_at 还是过去，下次调度**会重复**
+- 熔断器（channel->fails++）也不生效，因为 catch 块捕获不到发送异常
+
+---
+
+### 4.2 并发取数竞态—— 两个来源导致同批数据被重复处理
+
+并发取数的问题有两个来源：
+
+#### 来源1：retry_after 静默重试导致的并发
+
+回顾第1节：`retry_after = 90`，如果 Job 执行超过90秒，Laravel 会认为 Worker 死了，自动把任务放回队列，另一个 Worker 会领取并执行。
+
+对于 `ProcessScheduledContactReminders`：
+- 每分钟调度一次
+- 如果一批提醒很多，处理超过90秒
+- retry_after 触发，新 Worker 并发执行**同一批数据**
+- 取数 SQL：`WHERE scheduled_at <= NOW()`，**没有任何锁**
+- 两个 Worker 同时取到同一份数据 → 同时发送 → 重复邮件
+
+#### 来源2：每分钟调度叠加 retry_after 重试
+
+更极端的情况：
+- 第0分钟：Job A 启动，开始处理100条提醒
+- 第1分钟：调度器又触发 Job B（因为每分钟一次），此时 Job A 还在运行
+- 第1.5分钟：Job A 还没处理完，scheduled_at 还是过去，Job B 也取到了同样的数据
+- 两个 Job 并发处理同批数据
+
+注意：Laravel 的 withoutOverlapping 调度模式可以防止这个问题，但需要确认代码里有没有用。
+
+#### syncWithoutDetaching 的并发行为
+
+如果两个 Worker 同时处理同一条提醒，且都走到了 Reschedule：
+
+```
+Worker A: syncWithoutDetaching → scheduled_at = Day2
+Worker B: syncWithoutDetaching → scheduled_at = Day2 （相同的结果，因为都是基于原 scheduled_at 计算）
+```
+
+两个都执行 syncWithoutDetaching，结果是一样的（因为计算出的 upcomingDate 相同），所以 scheduled_at 不会有问题。
+
+但问题在于：**两个 Worker 都会执行 notify()**，导致重复发送邮件。
+
+更坏的情况：Worker A 执行到 Reschedule 之后（scheduled_at 已推到未来），Worker B 才开始取数。
+
+- 如果 Worker A 的事务还没提交，Worker B 可能还是读到旧的 scheduled_at（过去）→ 重复处理
+- 如果 Worker A 的事务已提交，Worker B 读到新的 scheduled_at（未来）→ 不重复
+
+**结论**：取数无锁 + 多并发源 → 重复发送是可能的，概率取决于提醒数量和处理速度。
+
+---
+
+### 4.3 发送记录可信度—— UserNotificationSent 不能证明邮件真的发出去了
+
+这是最关键的认知修正。
+
+#### UserNotificationSent 的写入时机
+
+**ReminderTriggered::toMail()**：[ReminderTriggered.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Notifications/ReminderTriggered.php)
+
+```php
+public function toMail($notifiable)
+{
+    UserNotificationSent::create([
+        ...
+        'notification_channel_id' => $this->notificationChannel->id,
+        'type' => 'reminder',
+        'error' => null,
+    ]);
+
+    return (new MailMessage)
+        ->subject(...)
+        ->line(...);
+}
+```
+
+**写在 toMail() 里，返回 MailMessage 之前**。也就是说：
+
+> UserNotificationSent 记录存在 ≠ 邮件发送成功
+> UserNotificationSent 记录存在 = 邮件**准备发送**的日志被写了
+
+#### sync 驱动下的可信度
+
+sync 驱动是同步的，发送失败会抛异常：
+
+```
+toMail() 执行
+  → UserNotificationSent::create() 成功（error=null）
+  → 返回 MailMessage
+  → 邮件驱动真正发送
+  → 发送失败 → 抛出异常
+  → 进入 catch 块
+  → 又写一条 UserNotificationSent（error=错误信息）
+```
+
+结果：**两条记录**
+- 一条 error=null（假成功，toMail 里写的）
+- 一条 error=xxx（真失败，catch 里写的）
+
+#### database 驱动下的可信度
+
+database 驱动下更混乱：
+
+```
+toMail() 执行
+  → UserNotificationSent::create() 成功（error=null）
+  → 返回 MailMessage
+  → 通知被 push 到队列
+  → notify() 返回（此时邮件还没发！）
+
+... 稍后 Worker 从队列里取到邮件发送任务 ...
+  → 发送成功 → 没有回调，不更新 UserNotificationSent
+  → 发送失败 → 队列重试，还是不更新 UserNotificationSent
+  → 最终失败 → 进入 failed_jobs，还是不更新 UserNotificationSent
+```
+
+结果：**只有一条 error=null 的记录，但邮件可能根本没发出去**。
+
+#### catch 块里的 UserNotificationSent
+
+catch 块里也会写一条 UserNotificationSent：
+
+```php
+catch (\Throwable $e) {
+    UserNotificationSent::create([
+        'error' => $e->getMessage(),
+        ...
+    ]);
+}
+```
+
+但 catch 块捕获的是 **handle() 方法内的异常**。对于 database 驱动：
+- notify() 只是把邮件推到队列，不会抛发送异常
+- catch 块捕获不到真正的邮件发送失败
+- 熔断器（channel->fails++）也只对 handle() 内的异常生效，不对队列里的发送失败生效
+
+#### 结论：目前没有可靠的方式判断邮件是否发送成功
+
+| 场景 | UserNotificationSent | 邮件实际状态 | 熔断器是否计数 |
+|------|---------------------|-------------|--------------|
+| sync 发送成功 | 1条 error=null | 成功 | 否 |
+| sync 发送失败 | 2条（1条成功+1条error） | 失败 | 是（catch住） |
+| database 队列中 | 1条 error=null | 待发送 | 否 |
+| database 发送成功 | 1条 error=null | 成功 | 否 |
+| database 发送失败 | 1条 error=null | 失败 | 否（catch不到） |
+
+**发送记录完全不可靠**，既不能用来做幂等判断，也不能用来统计真实发送成功率。
+
+---
+
+## 5. triggered_at 过滤会不会影响循环提醒？—— 会！（加过滤必须同时重置）
+
+### 5.1 初版建议的错误：只加过滤不重置 = 循环提醒只触发一次
 
 **之前的错误建议**：
 ```php
@@ -316,7 +535,7 @@ Day3 (2024-01-03)
 
 **根因**：Reschedule 只改 scheduled_at，**不重置 triggered_at**。第一次设了 triggered_at = NOW() 之后就再也清不掉了。
 
-### 4.2 为什么 TestReminders 有过滤却能正常工作？
+### 5.2 为什么 TestReminders 有过滤却能正常工作？
 
 对比看 [TestReminders.php#L43-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Console/Commands/TestReminders.php#L43-L71)：
 
@@ -338,7 +557,7 @@ foreach (...) {
 
 TestReminders 有过滤但**从来不设置 triggered_at**，所以不存在被卡死的问题。但它也因此**失去了 triggered_at 作为幂等边界的意义**。
 
-### 4.3 正确的 triggered_at 幂等方案：过滤 + Reschedule 时重置
+### 5.3 正确的 triggered_at 幂等方案：过滤 + Reschedule 时重置
 
 如果要用 triggered_at 作为幂等边界（防 retry_after 并发重复、防人工重试），必须**同时改两处**：
 
@@ -460,13 +679,13 @@ Day2:
 
 ---
 
-## 5. 人工重试会不会重复发送？—— 分情况（含并发场景）
+## 6. 人工重试会不会重复发送？—— 分情况（含并发场景）
 
-### 5.1 ProcessScheduledContactReminders 的特性
+### 6.1 ProcessScheduledContactReminders 的特性
 
 这个Job无构造参数、每次 handle() 都重新查询DB。人工重试 = 重新跑一遍完整的取数+处理逻辑。
 
-### 5.2 各场景判定矩阵
+### 6.2 各场景判定矩阵
 
 | 场景 | Reschedule 状态 | scheduled_at 状态 | channel 状态 | 人工重试结果 | 最多重复 |
 |------|----------------|------------------|-------------|-------------|---------|
@@ -477,9 +696,9 @@ Day2:
 | E：发送成、Reschedule未执行，进程被杀 | 未执行 | 过去 | active | ❌ **重复** | ≤3(tries)×N |
 | F：retry_after 并发 + Reschedule 部分成功 | 不同Worker执行到不同阶段 | — | — | ❌ **不确定**（取决于哪条Worker先改DB） | 高并发下难预估 |
 
-### 5.3 加上 triggered_at 幂等方案后的人工重试
+### 6.3 加上 triggered_at 幂等方案后的人工重试
 
-假设已实施了第4节的三处修改：
+假设已实施了第5节的三处修改：
 
 ```
 第一次执行（部分成功）：
@@ -499,9 +718,9 @@ Day2:
 
 ---
 
-## 6. 其他邮件任务的重试与恢复
+## 7. 其他邮件任务的重试与恢复
 
-### 6.1 验证邮件（SendVerificationEmailChannel）
+### 7.1 验证邮件（SendVerificationEmailChannel）
 
 - 无 `$tries` → 默认 tries=3
 - **无任何幂等性检查**：不检查 `verified_at`，不检查发送记录
@@ -509,20 +728,20 @@ Day2:
 - 人工重试 → 反序列化 $channel → 肯定重复发送
 - 缓解：添加 `verified_at` 检查
 
-### 6.2 邀请邮件（UserInvited）
+### 7.2 邀请邮件（UserInvited）
 
 - Mailable 自带 ShouldQueue
 - 无 tries、无幂等、人工重试必重复
 
-### 6.3 测试邮件（SendTestEmail）
+### 7.3 测试邮件（SendTestEmail）
 
 - 同步执行，不走队列，无重试问题
 
 ---
 
-## 7. 风险矩阵与关键风险点
+## 8. 风险矩阵与关键风险点
 
-### 7.1 重复发送风险矩阵
+### 8.1 重复发送风险矩阵
 
 | 任务类型 | tries | 幂等防护 | retry_after 并发风险 | 人工重试是否重复 |
 |---------|-------|----------|-------------------|-----------------|
@@ -531,7 +750,7 @@ Day2:
 | 邀请邮件 | 3 | 无 | ⚠️ 中（单任务执行快） | ✅ 是 |
 | DAV同步类 | 1 | etag/幂等接口 | ✅ 低 | ✅ 否 |
 
-### 7.2 最高风险：ProcessScheduledContactReminders 的 retry_after 并发
+### 8.2 最高风险：ProcessScheduledContactReminders 的 retry_after 并发
 
 - 每分钟调度一次，大量提醒时处理可能超过90秒
 - retry_after 触发后 attempts 自增，新 Worker 并发执行同一批数据
@@ -551,9 +770,9 @@ Day2:
 
 ---
 
-## 8. 代码走向流程图（完整纠正版）
+## 9. 代码走向流程图（完整纠正版）
 
-### 8.1 循环提醒的一次完整生命周期
+### 9.1 循环提醒的一次完整生命周期
 
 ```
 [初始状态]
@@ -607,7 +826,7 @@ handle()
                                 只看 scheduled_at 已 ≤ NOW()，所以会命中。
 ```
 
-### 8.2 retry_after / attempts / tries 交互图
+### 9.2 retry_after / attempts / tries 交互图
 
 ```
                          ┌──────────────────────┐
@@ -646,9 +865,9 @@ handle()
 
 ---
 
-## 9. 优化建议（纠正版）
+## 10. 优化建议（纠正版）
 
-### 9.1 短期优化（低风险）
+### 10.1 短期优化（低风险）
 
 #### ① 给 ProcessScheduledContactReminders 加 `$timeout = 60`
 
@@ -680,7 +899,7 @@ $scheduledContactReminders = DB::table('contact_reminder_scheduled')
 ```
 需要包在 DB::transaction() 中。并发Worker会排队而不是重复取数。
 
-### 9.2 中期优化（需同时修改多处）
+### 10.2 中期优化（需同时修改多处）
 
 #### ④ 三处联动修改，引入 triggered_at 作为幂等边界
 
@@ -690,7 +909,7 @@ $scheduledContactReminders = DB::table('contact_reminder_scheduled')
 
 **修改3**：在 ProcessScheduledContactReminders 中，把 `updateScheduledContactReminderTriggeredAt()` 的调用从 try 块末尾移到 `Reschedule` 调用之前（即 triggerNotification 方法内）
 
-三处必须联动，缺一不可（详见第4.3节）。
+三处必须联动，缺一不可（详见第5.3节）。
 
 #### ⑤ contact_reminder_scheduled 表加唯一索引
 
@@ -701,7 +920,7 @@ ADD UNIQUE KEY uk_channel_reminder
 ```
 防止 syncWithoutDetaching 在并发下产生重复 pivot 记录（目前代码逻辑上不会重复，但表结构无约束）。
 
-### 9.3 长期优化（高风险，架构调整）
+### 10.3 长期优化（高风险，架构调整）
 
 - 发件箱模式（Transactional Outbox）
 - 邮件服务商 Webhook 追踪投递状态
@@ -709,7 +928,7 @@ ADD UNIQUE KEY uk_channel_reminder
 
 ---
 
-## 10. 相关文件索引
+## 11. 相关文件索引
 
 | 类型 | 文件路径 | 关键内容 |
 |------|---------|----------|
