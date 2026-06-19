@@ -260,16 +260,65 @@ intersect = contactImportantDates ∩ bdays   （按日期字符串取交集）�
 
 [updateGroupMembers()](file:///d:/fz/0601-2/solo-dogfeeding/code/50-monica/app/Domains/Contact/ManageGroups/Dav/ImportMembers.php#L99-L142)
 
-这是一个特殊的合并策略——先按 `distant_uuid` 或 `id` 将现有成员分为 keep / remove 两组，再对 VCard 中的 MEMBER 列表筛选出不在 keep 中的新成员。
+成员的 MEMBER 字段是一个 UUID 字符串列表，既可以是联系人的 `distant_uuid`（远程标识），也可以是 `id`（本地标识）——导出时 [ExportMembers](file:///d:/fz/0601-2/solo-dogfeeding/code/50-monica/app/Domains/Contact/ManageGroups/Dav/ExportMembers.php#L34-L57) 优先用 `distant_uuid`，没有时才回退到 `id`。因此匹配时需要**双标识同时考虑**。
 
-```
-已有成员：
-  keep   = distant_uuid 或 id 在 MEMBER 列表中的成员
-  remove = 不在 MEMBER 列表中的成员 → RemoveContactFromGroup
+#### Step 1：删除旧成员
 
-新增成员：
-  MEMBER 列表中不在 keep 里的 → 查找 Contact（先 distant_uuid 再 id）→ AddContactToGroup
+对群组当前所有联系人，按 MEMBER 列表分为两组：
+
+```php
+$contacts = $group->contacts
+    ->groupBy(fn (Contact $contact): string =>
+        $members->contains($contact->distant_uuid) || $members->contains($contact->id)
+            ? 'keep'
+            : 'remove'
+    );
 ```
+
+- **keep**：`distant_uuid` 或 `id` 任意一个在 MEMBER 列表中 → 保留
+- **remove**：两个都不在 MEMBER 列表中 → 通过 `RemoveContactFromGroup` 从群组移除（high 队列）
+
+`RemoveContactFromGroup` 内部用 `$group->contacts()->detach([$contact_id])`，安全且幂等。
+
+#### Step 2：添加新成员
+
+从 MEMBER 列表中筛选出需要新增的成员，这里的判断条件用了 `||`（或）：
+
+```php
+$members->filter(fn (string $member): bool =>
+    ! $keep->contains('distant_uuid', $member)
+    || ! $keep->contains('id', $member)
+)
+```
+
+根据德摩根定律 `!A || !B = !(A && B)`，意思是：只有当 keep 集合中存在一个 Contact，它的 `distant_uuid == member` **并且** `id == member` 时，才跳过。
+
+**实际效果**：由于同一个 Contact 的 `distant_uuid` 和 `id` 几乎不可能相同（都是 UUID，但各自独立生成），**几乎所有 MEMBER 中的条目都会进入新增流程**。
+
+#### Step 3：新增时的重复避免
+
+进入新增流程并不代表会产生重复关系。每个 member 值都会按**先远程后本地**的顺序查找 Contact：
+
+```php
+$contact = Contact::firstWhere('distant_uuid', $member);
+if ($contact === null) {
+    $contact = Contact::find($member);
+}
+```
+
+找不到对应的 Contact（例如 member 指向的联系人尚未同步）则直接跳过。
+
+找到后调用 `AddContactToGroup`，其内部用 `syncWithoutDetaching` 实现**幂等**：
+
+```php
+$this->group->contacts()->syncWithoutDetaching([
+    $this->contact->id => ['group_type_role_id' => ...],
+]);
+```
+
+`syncWithoutDetaching` 在 pivot 关系已存在时不会重复插入，也不会抛异常。因此即使同一个成员在 MEMBER 中重复出现，或者因前述 `||` 条件而「误」入新增流程，也不会产生重复关系。
+
+> 总结：成员合并不依赖 filter 条件做精确去重，而是靠 `AddContactToGroup` 服务层的 `syncWithoutDetaching` 提供最终幂等保障。
 
 ---
 
@@ -363,6 +412,8 @@ ImportVCard::execute(data)
 
 ### 4.2 推送链路（本地 → 远程）
 
+推送由 `PrepareJobsContactPush` 统一编排，分为**新增**、**变更**、**删除**三类，分别走不同的条件头策略。
+
 ```
 AddressBookSynchronizer
     │
@@ -374,13 +425,18 @@ AddressBookSynchronizer
 PrepareJobsContactPush
     │
     ├─ preparePushAddedContacts()
-    │   └─ 所有新增联系人 → PushVCard(MODE_MATCH_ANY)
+    │   └─ 所有新增联系人 → PushVCard(MODE_MATCH_NONE)
+    │       不带 If-Match 头，直接 PUT
     │
     ├─ preparePushChangedContacts()
     │   ├─ 排除刚从远程拉取的联系人（避免循环同步）
     │   │   └─ 对比 refreshIds（本次拉取的联系人 UUID）
-    │   └─ 有 distant_etag → PushVCard(MODE_MATCH_ETAG)
-    │      无 distant_etag → PushVCard(MODE_MATCH_ANY)
+    │   │
+    │   ├─ 有 distant_etag → PushVCard(MODE_MATCH_ETAG)
+    │   │   If-Match: "<etag>"  乐观锁，仅当远程版本一致时更新
+    │   │
+    │   └─ 无 distant_etag → PushVCard(MODE_MATCH_ANY)
+    │       If-Match: "*"  只要远程存在就更新
     │
     └─ prepareDeletedContacts()
         └─ 所有已删除联系人 → DeleteVCard
@@ -388,15 +444,30 @@ PrepareJobsContactPush
     ▼
 PushVCard
     │
-    ├─ PUT 请求上传 VCard
-    │   ├─ MODE_MATCH_ETAG → If-Match: <etag>   （乐观锁，仅当远程版本一致时更新）
-    │   ├─ MODE_MATCH_ANY  → If-Match: *         （只要远程存在就更新）
-    │   └─ MODE_MATCH_NONE → 无 If-Match 头      （强制覆盖）
+    ├─ 三种模式对应的请求头（headers() 方法）
+    │   ├─ MODE_MATCH_ETAG → If-Match: "<etag>"
+    │   ├─ MODE_MATCH_ANY  → If-Match: "*"
+    │   └─ MODE_MATCH_NONE → 无 If-Match 头
     │
-    ├─ 412 Precondition Failed 时自动降级为 MODE_MATCH_NONE 重试一次
+    ├─ PUT 请求上传 VCard
+    │
+    ├─ 遇到 412 Precondition Failed 时
+    │   └─ 自动降级为 MODE_MATCH_NONE 重试一次（深度=1）
     │
     └─ 成功后更新本地 distant_etag
 ```
+
+#### 三种推送模式对比
+
+| 模式 | 常量 | If-Match 头 | 适用场景 | 行为 |
+|------|------|------------|----------|------|
+| MODE_MATCH_NONE | 0 | 无 | 新增联系人 | 服务器上有就覆盖，没有就创建 |
+| MODE_MATCH_ETAG | 1 | `"<etag>"` | 有远程版本记录的变更 | 仅当远程 ETag 匹配时才更新，否则 412 |
+| MODE_MATCH_ANY | 2 | `"*"` | 无远程版本记录但知道远程存在 | 只要远程有资源就更新，不管版本 |
+
+#### 避免循环同步的机制
+
+`preparePushChangedContacts()` 会将本次拉取中已经更新过的联系人（`$changes` 即 `refreshIds`）从推送列表中排除。这样刚从远程拉下来的变更不会又被推回去，避免了「拉 → 推 → 再拉 → 再推」的死循环。
 
 ### 4.3 CalDAV 链路（本地服务端）
 
