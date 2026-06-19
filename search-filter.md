@@ -721,3 +721,441 @@ shouldBeSearchable() 返回 false
 9. **Service 层权限**：写入操作是否声明了 `contact_must_belong_to_vault` 权限
 10. **Gate 参数顺序**：自定义 Gate 时注意参数顺序是 `($user, $vault, $contact)`，不要搞混
 11. **搜索回查安全性**：新增搜索路径时，务必添加 `where('vault_id', ...)`，不要只依赖搜索引擎的默认行为
+
+---
+
+## 八、代码顺序逐行分析
+
+### 8.1 搜索框架模型取回：从 `Contact::search()` 到 `get()` 的完整调用链
+
+本章节沿着代码执行顺序，逐行拆解搜索调用链。由于 Scout 代码在 vendor 中，以下分析基于 Laravel Scout 10.x 的标准实现模式 + 本项目的实际配置。
+
+#### 8.1.1 第一步：调用静态方法 `search()`
+
+**代码位置**：通过 `use Searchable;` trait 引入
+**触发点**：[VaultSearchIndexViewHelper.php:33](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultSearchIndexViewHelper.php#L33-L35)
+
+```php
+$contact = Contact::search($term)   // ① 创建 Builder
+    ->where('vault_id', $vault->id)  // ② 追加过滤条件
+    ->get();                          // ③ 执行搜索并取回模型
+```
+
+**`search()` 方法做了什么**（Searchable trait 提供）：
+1. 创建 `Laravel\Scout\Builder` 新实例
+2. 传入模型类名和搜索词 `$term`
+3. Builder 初始状态：
+   - `$model` = Contact 类
+   - `$query` = $term
+   - `$wheres` = []
+   - `$orders` = []
+   - `$limit` = null
+
+#### 8.1.2 第二步：`where('vault_id', $vault->id)`
+
+**Builder::where()** 的行为：
+1. 将 `['vault_id' => $vault->id]` 存入 `$this->wheres` 数组
+2. **注意**：这时候还没有发送给搜索引擎，只是暂存在 Builder 对象里
+
+本项目所有搜索路径都有这一步：
+- [VaultSearchIndexViewHelper.php:34](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultSearchIndexViewHelper.php#L34)
+- [VaultSearchIndexViewHelper.php:51](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultSearchIndexViewHelper.php#L51)
+- [VaultSearchIndexViewHelper.php:76](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultSearchIndexViewHelper.php#L76)
+- [VaultContactSearchViewHelper.php:15](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultContactSearchViewHelper.php#L15)
+
+**索引中的 vault_id 是怎么来的？**
+
+[ScoutHelper::id()](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Helpers/ScoutHelper.php#L66-L84) 被每个模型的 `toSearchableArray()` 调用：
+
+```php
+public static function id(Model $model): array
+{
+    if (config('scout.driver') === 'database') {
+        return [];  // database 驱动不需要，因为直接查 MySQL
+    }
+    // ...
+    return [
+        'id' => $id,
+        'vault_id'   => (string) $model->getAttribute('vault_id'),  // 🔴 字符串型
+        'created_at' => (int) ...,
+        'updated_at' => (int) ...,
+    ];
+}
+```
+
+**注意点**：`vault_id` 在索引中是**字符串**（因为 `(string)` 强制转换），而 `where()` 传入的是 `$vault->id` 也通常是字符串（UUID），所以类型匹配没问题。
+
+#### 8.1.3 第三步：`get()` — 搜索执行的核心
+
+`get()` 方法内部执行流程：
+
+```
+Builder::get()
+   │
+   ├─ 1. 解析 softDelete 配置
+   │
+   ├─ 2. 调用 Engine::search($builder)
+   │    │
+   │    ├─ 2.1 构造搜索请求
+   │    │   · 全文搜索关键词
+   │    │   · 应用 $builder->wheres 中的过滤条件
+   │    │   · 应用 $builder->orders 中的排序
+   │    │   · 应用 $builder->limit（如果有）
+   │    │
+   │    └─ 2.2 发送请求到搜索引擎
+   │         · Meilisearch: POST /indexes/contacts/search
+   │         · Algolia: 对应 search API
+   │         · Typesense: 对应 documents/search
+   │         · database: 直接执行 SQL MATCH AGAINST
+   │
+   ├─ 3. 提取搜索结果中的 ID 列表
+   │   （搜索引擎返回的 hits 中的 objectID / id）
+   │
+   ├─ 4. 🔴 关键步骤：模型回查（hydration）
+   │   调用 $this->model->getScoutModelsByIds($builder, $ids)
+   │    → $this->query()  （获取一个新的 Eloquent 查询构造器）
+   │    → whereKey($ids)  （WHERE id IN (...)）
+   │    → get()           （执行查询，返回 Collection）
+   │
+   ├─ 5. 按搜索结果顺序重排模型集合
+   │   （因为 WHERE id IN 不保证顺序）
+   │
+   └─ 6. 返回 Eloquent Collection
+```
+
+#### 8.1.4 为什么回查阶段**不追加** `where('vault_id', ...)
+
+**设计哲学**：Scout 假设「搜索引擎已经完成了所有过滤」，回查只负责取数据。
+
+**本项目的影响**：
+- 如果搜索引擎侧的 `vault_id` 过滤失效，回查阶段**不会纠正**
+- 可能返回其他 vault 的联系人（数据泄漏）
+
+**安全保障依赖的三道防线**：
+1. 收录时 `shouldBeSearchable()` — 只让 listed=true 的记录进索引
+2. 查询时 `where('vault_id', ...)` — 在搜索引擎侧过滤
+3. 路由层 `can:vault-viewer,vault` — 用户至少能访问该 vault
+
+**第4道缺失的防线**：回查时不检查 `listed` 和 `vault_id`
+
+#### 8.1.5 `database` 驱动的特殊情况
+
+当 `SCOUT_DRIVER=database` 时，Scout 的行为不同：
+
+- **没有独立的搜索引擎**，直接在 MySQL 上执行
+- `where('vault_id', ...)` 会**追加到 SQL 的 WHERE 子句**
+- 不存在「ID回查」的概念，因为查询本身就是完整的 SQL
+- 安全边界和普通 Eloquent 查询一样
+
+`isActivated()` 对 `database` 驱动返回 `true`，说明 database 驱动被视为**正常的 Scout 驱动**，不是降级模式。
+
+---
+
+### 8.2 分组所有权校验：从路由到 Service 的双重校验
+
+#### 8.2.1 路由层：`can:group-owner,vault,group`
+
+**代码位置**：[web.php:398](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/routes/web.php#L398-L403)
+
+```php
+Route::middleware('can:group-owner,vault,group')->prefix('groups')->group(function () {
+    Route::get('{group}', [GroupController::class, 'show'])->name('group.show');
+    Route::get('{group}/edit', [GroupController::class, 'edit'])->name('group.edit');
+    Route::put('{group}', [GroupController::class, 'update'])->name('group.update');
+    Route::delete('{group}', [GroupController::class, 'destroy'])->name('group.destroy');
+});
+```
+
+**Gate 定义**：[AuthServiceProvider.php:67-76](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Providers/AuthServiceProvider.php#L67-L76)
+
+```php
+Gate::define('group-owner', function (User $user, $vault, $group): bool {
+    if ($group instanceof Group) {
+        return $group->vault_id === static::id($vault);
+    }
+    return Group::where([
+        'id' => static::id($group),
+        'vault_id' => static::id($vault),
+    ])->exists();
+});
+```
+
+**逐行解读**：
+1. 参数顺序：`($user, $vault, $group)`，对应路由 `{vault}/groups/{group}`
+2. 如果 `$group` 已经是 Group 模型（路由模型绑定后），直接比较 `vault_id`
+3. 如果是 ID（手动调用），执行 `WHERE id=? AND vault_id=?` 查询
+4. **不检查用户权限**，只检查分组是否属于该 vault
+
+**单元测试验证**：[GatesTest.php:79-92](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/tests/Unit/Controllers/GatesTest.php#L79-L92)
+- 测试了两种调用方式：传 Group 对象 和 传 id 字符串
+- 验证了属于和不属于两种情况
+
+#### 8.2.2 Service 层：`group_must_belong_to_vault`
+
+以 `AddContactToGroup` 为例：[AddContactToGroup.php:37-46](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageGroups/Services/AddContactToGroup.php#L37-L46)
+
+```php
+public function permissions(): array
+{
+    return [
+        'author_must_belong_to_account',
+        'vault_must_belong_to_account',
+        'author_must_be_vault_editor',
+        'contact_must_belong_to_vault',
+        'group_must_belong_to_vault',
+    ];
+}
+```
+
+**依赖顺序**（BaseService 定义）：
+```
+group_must_belong_to_vault
+    ├─ vault_must_belong_to_account
+    └─ author_must_belong_to_account
+```
+
+**校验实现**：[BaseService.php:220-230](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Services/BaseService.php#L220-L230)
+
+```php
+public function validateGroupBelongsToVault(array $data): void
+{
+    if (isset($data['group_id'])) {
+        $this->group = $this->vault->groups()   // 通过 vault->groups() 关系查询
+            ->findOrFail($data['group_id']);    // = WHERE vault_id = ? AND id = ?
+
+        if ($this->group->vault_id !== $this->vault->id) {  // 防御性二次校验
+            throw new ModelNotFoundException;
+        }
+    }
+}
+```
+
+**逐行解读**：
+1. `$this->vault->groups()` 返回 `HasMany` 关系，已经隐含 `WHERE vault_id = $this->vault->id`
+2. `findOrFail($data['group_id'])` 在这个约束下查找分组
+3. 如果分组不在该 vault 中，抛出 `ModelNotFoundException`
+4. **还额外加了一次 `$this->group->vault_id !== $this->vault->id` 校验**，作为深度防御
+
+#### 8.2.3 为什么需要「路由层 Gate + Service 层校验」双重检查？
+
+| 场景 | 路由层 Gate | Service 层校验 |
+|------|------------|---------------|
+| Web 页面访问（GET/POST） | ✅ 生效 | 写入操作生效 |
+| Artisan 命令直接调用 Service | ❌ 不生效 | ✅ 生效 |
+| 队列任务调用 Service | ❌ 不生效 | ✅ 生效 |
+| API 调用 | ✅ 生效（如果路由定义了） | 写入操作生效 |
+| 提供的安全保障 | 防止 URL 篡改 | 确保数据一致性，防御深度 |
+
+**设计模式**：
+- 路由层 Gate 是**第一道防线**，保护 HTTP 入口
+- Service 层校验是**核心校验**，所有写入路径都必须经过
+- 两者重复但目的不同：Gate 偏向「访问控制」，Service 偏向「数据完整性」
+
+---
+
+### 8.3 归档联系人显示差异：五条路径代码逐行对比
+
+本章节逐行对比五条路径对 `listed` 字段的处理，解释为什么行为不一致。
+
+#### 8.3.1 路径A：主列表（显式过滤）
+
+**代码**：[ContactController.php:30-31](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L30-L31)
+
+```php
+$contacts = $vault->contacts()
+    ->where('listed', true)    // 🔴 显式过滤
+    ->orderBy(...)
+    ->paginate(25);
+```
+
+**逐行分析**：
+1. `$vault->contacts()`：Eloquent HasMany 关系 → `WHERE vault_id = ?`
+2. `->where('listed', true)`：**显式**追加 `AND listed = 1`
+3. 结果：只返回 listed=true 的联系人
+
+#### 8.3.2 路径B：标签筛选（显式过滤）
+
+**代码**：[ContactLabelController.php:21-26](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactLabelController.php#L21-L26)
+
+```php
+$contacts = Label::find($labelId)
+    ->contacts()
+    ->where('vault_id', $request->route()->parameter('vault'))
+    ->where('listed', true)    // 🔴 显式过滤
+    ->orderBy('created_at', 'asc')
+    ->paginate(10);
+```
+
+**逐行分析**：
+1. `Label::find($labelId)->contacts()`：多对多关系，JOIN contact_label
+2. `->where('vault_id', ...)`：二次校验 vault_id
+3. `->where('listed', true)`：**显式**追加 `AND listed = 1`
+4. 结果：只返回 listed=true 的联系人
+
+**注意**：这里用 `$request->route()->parameter('vault')` 而不是 `$vault->id`，可能是因为控制器没有注入 Vault 模型。
+
+#### 8.3.3 路径C：分组成员（❌ 无过滤）
+
+**代码**：[GroupShowViewHelper.php:26-28](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupShowViewHelper.php#L26-L28)
+
+```php
+$contactsCollection = $group->contacts()
+    ->wherePivot('group_type_role_id', $role->id)
+    ->get();
+```
+
+以及 [GroupShowViewHelper.php:48-50](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupShowViewHelper.php#L48-L50)：
+
+```php
+$contactsCollection = $group->contacts()
+    ->wherePivotNull('group_type_role_id')
+    ->get();
+```
+
+**逐行分析**：
+1. `$group->contacts()`：多对多关系，JOIN contact_group
+2. `->wherePivot('group_type_role_id', $role->id)`：只过滤 pivot 表的角色字段
+3. **没有** `->where('listed', true)`
+4. 结果：返回**所有**联系人，包括 listed=false（已归档）的
+
+**为什么遗漏？可能的原因**：
+- 分组被设计为「容器」，不管联系人状态如何都显示
+- 开发者的疏忽，因为标签筛选是有的
+- 路径C的代码路径和其他路径不同，维护时漏加
+
+#### 8.3.4 路径D：模块内搜索（收录时过滤）
+
+**代码**：[VaultContactSearchViewHelper.php:14-19](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultContactSearchViewHelper.php#L14-L19)
+
+```php
+$contacts = Contact::search($term)
+    ->where('vault_id', $vault->id)
+    ->orderBy('first_name')
+    ->orderBy('last_name')
+    ->take(5)
+    ->get();
+```
+
+**逐行分析**：
+1. `Contact::search($term)`：Scout 全文搜索
+2. `->where('vault_id', $vault->id)`：在搜索引擎侧过滤 vault
+3. **没有** `->where('listed', true)`，但结果仍然只包含 listed=true 的联系人
+4. 原因：`shouldBeSearchable()` 在索引收录时排除了 listed=false 的记录
+
+**`shouldBeSearchable()` 如何生效**：
+- 创建/更新 Contact 时，Scout observer 调用 `shouldBeSearchable()`
+- 返回 true：调用 `searchable()` → 加入/更新索引
+- 返回 false：调用 `unsearchable()` → 从索引中移除
+- 当 `listed` 字段变化时，模型 saved 事件触发，重新判断是否收录
+
+#### 8.3.5 路径E：全局搜索（收录时过滤）
+
+**代码**：[VaultSearchIndexViewHelper.php:33-35](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultSearchIndexViewHelper.php#L33-L35)
+
+和路径D原理相同，不同的是同时搜索三种模型（Contact/Note/Group）。
+
+#### 8.3.6 五条路径过滤方式对比总结
+
+| 路径 | 过滤方式 | `listed` 检查时机 | 代码可见性 | 漏写风险 |
+|------|---------|-----------------|-----------|---------|
+| A 主列表 | SQL WHERE | 查询时 | 高（查询处可见） | 低 |
+| B 标签筛选 | SQL WHERE | 查询时 | 高（查询处可见） | 低 |
+| C 分组成员 | ❌ 无 | - | - | 已遗漏 |
+| D 模块搜索 | 索引收录期 | 写入时 | 低（模型方法里） | 中（容易忽视） |
+| E 全局搜索 | 索引收录期 | 写入时 | 低（模型方法里） | 中（容易忽视） |
+
+#### 8.3.7 为什么这是个问题？
+
+**场景重现**：
+1. 用户在 Vault "家庭" 中创建分组 "家人"，添加 "张三"（listed=true）
+2. 张三正常出现在：主列表、搜索结果、分组详情
+3. 用户将张三归档（ToggleArchiveContact，listed=false）
+4. 张三的 Scout 索引被删除（因为 shouldBeSearchable 返回 false）
+5. 现在：
+   - 主列表：✅ 看不到张三
+   - 标签筛选：✅ 看不到张三
+   - 搜索：✅ 搜不到张三
+   - 分组详情：❌ **仍然能看到张三**
+
+**用户感知**：
+- "我明明归档了这个人，为什么在分组里还能看到？"
+- 行为不一致，造成困惑
+
+**Contact 模型其实有 scopeActive 但没用**：
+[Contact.php:112-115](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L112-L115)
+
+```php
+public function scopeActive(Builder $query): Builder
+{
+    return $query->where('listed', 1);
+}
+```
+
+如果路径C改成 `$group->contacts()->active()->...`，就能统一行为。但目前没有用。
+
+---
+
+### 8.4 三者的关系：代码级联调用图
+
+```
+用户操作：归档联系人
+   │
+   ├─ HTTP POST /vaults/{vault}/contacts/{contact}/archive
+   │
+   ├─ 路由层
+   │    ├─ can:vault-viewer,vault → Gate: 用户有 vault 访问权
+   │    └─ can:contact-owner,vault,contact → Gate: contact 属于该 vault
+   │
+   ├─ ContactArchiveController@store
+   │    └─ ToggleArchiveContact::execute($data)
+   │
+   ├─ Service 层（ToggleArchiveContact）
+   │    ├─ validateRules()
+   │    │   ├─ author_must_belong_to_account → 加载 $author
+   │    │   ├─ vault_must_belong_to_account  → 加载 $vault
+   │    │   ├─ contact_must_belong_to_vault  → $vault->contacts()->findOrFail()
+   │    │   └─ author_must_be_vault_editor   → pivot.permission <= 200
+   │    │
+   │    └─ $this->contact->listed = !$this->contact->listed
+   │       $this->contact->save()
+   │
+   ├─ 模型事件 → Scout Observer
+   │    └─ searchIndexShouldBeUpdated() → ScoutHelper::isActivated() = true
+   │         └─ shouldBeSearchable() → 返回新的 listed 值
+   │              ├─ true  → searchable()  → 加入/更新索引
+   │              └─ false → unsearchable() → 从索引删除
+   │
+   └─ 后续影响
+        ├─ 路径A 主列表：SQL WHERE listed=1 → 不显示 ✅
+        ├─ 路径B 标签筛选：SQL WHERE listed=1 → 不显示 ✅
+        ├─ 路径C 分组成员：无过滤 → 仍然显示 ❌
+        ├─ 路径D 模块搜索：索引中已删除 → 搜不到 ✅
+        └─ 路径E 全局搜索：索引中已删除 → 搜不到 ✅
+```
+
+---
+
+### 8.5 关键代码位置速查
+
+| 概念 | 文件 | 行号 |
+|------|------|------|
+| Searchable trait 引入（Contact）| [Contact.php:28](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L28) |
+| toSearchableArray | [Contact.php:88-97](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L88-L97) |
+| shouldBeSearchable | [Contact.php:104-107](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L104-L107) |
+| searchIndexShouldBeUpdated | [Contact.php:134-137](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L134-L137) |
+| scopeActive | [Contact.php:112-115](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L112-L115) |
+| ScoutHelper::isActivated | [ScoutHelper.php:15-30](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Helpers/ScoutHelper.php#L15-L30) |
+| ScoutHelper::id | [ScoutHelper.php:66-84](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Helpers/ScoutHelper.php#L66-L84) |
+| group-owner Gate 定义 | [AuthServiceProvider.php:67-76](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Providers/AuthServiceProvider.php#L67-L76) |
+| contact-owner Gate 定义 | [AuthServiceProvider.php:56-65](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Providers/AuthServiceProvider.php#L56-L65) |
+| 路由 group-owner 中间件 | [web.php:398](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/routes/web.php#L398) |
+| 路由 contact-owner 中间件 | [web.php:250](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/routes/web.php#L250) |
+| Service group_must_belong_to_vault | [BaseService.php:220-230](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Services/BaseService.php#L220-L230) |
+| Service contact_must_belong_to_vault | [BaseService.php:205-215](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Services/BaseService.php#L205-L215) |
+| 路径A 主列表 | [ContactController.php:30-31](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L30-L31) |
+| 路径B 标签筛选 | [ContactLabelController.php:21-26](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactLabelController.php#L21-L26) |
+| 路径C 分组成员 | [GroupShowViewHelper.php:26-28](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupShowViewHelper.php#L26-L28) |
+| 路径D 模块搜索 | [VaultContactSearchViewHelper.php:14-19](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultContactSearchViewHelper.php#L14-L19) |
+| 路径E 全局搜索 | [VaultSearchIndexViewHelper.php:33-35](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultSearchIndexViewHelper.php#L33-L35) |
+| ToggleArchiveContact | [ToggleArchiveContact.php](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Services/ToggleArchiveContact.php) |
+| Gates 单元测试 | [GatesTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/tests/Unit/Controllers/GatesTest.php) |
