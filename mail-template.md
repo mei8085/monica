@@ -374,7 +374,114 @@ Schedule::job(ProcessScheduledContactReminders::class, 'minutes', 1);
 | 3 | 重调度 | [ProcessScheduledContactReminders@triggerNotification#L120-L124](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php#L120-L124) | 一次性提醒删除调度记录，周期性更新 `scheduled_at` |
 | 4 | 标记触发时间 | [ProcessScheduledContactReminders@handle#L53](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php#L53) | 设置 `triggered_at` = 当前时间，**在 triggerNotification 返回后执行** |
 
-> **重要**：即使 `contact === null`（联系人已删除），仍会执行 `updateScheduledContactReminderTriggeredAt()` 标记为已触发，避免重复执行。
+> **注意**：即使 `contact === null`（联系人已删除），仍会执行 `updateScheduledContactReminderTriggeredAt()` 标记 `triggered_at`。但由于查询条件不排除 `triggered_at`，**该记录下次仍会被查询到**（详见 5.3.1 边缘情况分析）。
+
+### 5.3.1 边缘情况深度分析
+
+#### 情况一：一次性提醒删除后，触发时间标记是否生效？
+
+**结论：不生效。**
+
+执行顺序如下：
+
+```
+triggerNotification() 内部：
+  1. 发送通知
+  2. 递增次数
+  3. 调用 RescheduleContactReminderForChannel.execute()
+     └─ 一次性提醒 → DELETE FROM contact_reminder_scheduled WHERE id = ?
+
+handle() 中 triggerNotification() 返回后：
+  4. 调用 updateScheduledContactReminderTriggeredAt()
+     └─ UPDATE contact_reminder_scheduled SET triggered_at = ? WHERE id = ?
+     └─ ❌ 记录已被删除，UPDATE 影响 0 行
+```
+
+**代码依据**：
+- 删除操作在 [RescheduleContactReminderForChannel@execute#L56-L58](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannel.php#L56-L58)
+- 触发时间标记在 [ProcessScheduledContactReminders@handle#L53](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php#L53)
+
+**功能影响**：不影响。因为记录已被删除，下次 cron 不会再查询到，`triggered_at` 是否设置没有实际意义。
+
+---
+
+#### 情况二：重调度失败是否进入异常分支？
+
+**结论：是，会进入异常分支。**
+
+`triggerNotification()` 整体在 `handle()` 的 try 块内调用，`RescheduleContactReminderForChannel->execute()` 抛出的任何异常都会冒泡到 catch 块。
+
+**可能导致重调度失败的异常**：
+
+| 异常来源 | 触发条件 | 代码位置 |
+|----------|----------|----------|
+| `validateRules()` | 参数校验失败（如 id 不存在） | [RescheduleContactReminderForChannel@rules#L26-L33](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannel.php#L26-L33) |
+| `findOrFail()` | 找不到 ContactReminder 或 UserNotificationChannel | [RescheduleContactReminderForChannel@execute#L46-L47](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannel.php#L46-L47) |
+| `ModelNotFoundException` | 渠道已变为非活跃状态 | [RescheduleContactReminderForChannel@execute#L49-L51](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannel.php#L49-L51) |
+| `\Exception` | 无效的提醒类型（default 分支） | [RescheduleContactReminderForChannel@schedule#L80-L82](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannel.php#L80-L82) |
+
+**进入异常分支后的后果**：
+1. 记录错误日志
+2. 创建 `UserNotificationSent` 记录（含 error 字段）
+3. 渠道 `fails` 计数 +1
+4. 失败次数达到阈值时自动停用渠道并删除所有调度记录
+
+> **注意**：此时通知可能已经发送成功（发送在重调度之前），但因为重调度失败，整个流程被算作失败。
+
+---
+
+#### 情况三：联系人缺失、渠道停用时是否重复处理？
+
+**结论：会重复处理。**
+
+##### 3.1 联系人缺失（`contact === null`）
+
+```
+每次 cron 执行：
+  查询 contact_reminder_scheduled WHERE scheduled_at <= NOW()
+    → 命中该记录（因为 scheduled_at 从未更新）
+    → contact === null，跳过 triggerNotification()
+    → 执行 updateScheduledContactReminderTriggeredAt() → 更新 triggered_at
+    → 不重调度、不删除
+  下次 cron：
+    → 再次命中（查询条件不检查 triggered_at）
+    → 🔄 无限循环
+```
+
+**原因**：查询条件只有 `scheduled_at <= $currentDate`，**不排除已触发的记录**。如果联系人被删除但调度记录仍存在，每次 cron 都会重复标记 `triggered_at`，但不会发送通知。
+
+##### 3.2 渠道停用
+
+分两种场景：
+
+| 场景 | 是否重复处理 | 原因 |
+|------|-------------|------|
+| 手动停用（ToggleUserNotificationChannel） | ❌ 不会 | 停用时调用 `deleteScheduledReminders()` 删除所有调度记录 |
+| triggerNotification 中检测到非活跃 | ✅ 会 | 直接 return，不重调度、不删除记录，scheduled_at 保持不变 |
+
+**第二种场景的执行流程**：
+
+```
+每次 cron 执行：
+  查询 → 命中记录
+  triggerNotification() 入口检查：if (! $channel->active) { return; }
+    → 直接返回，不发送、不递增、不重调度
+  handle() 中继续执行：updateScheduledContactReminderTriggeredAt()
+    → 仅标记 triggered_at
+  下次 cron：
+    → 再次命中（scheduled_at 未变）
+    → 🔄 无限循环
+```
+
+**代码依据**：
+- 查询条件：[ProcessScheduledContactReminders@handle#L38-L40](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php#L38-L40)
+- 渠道活跃检查：[ProcessScheduledContactReminders@triggerNotification#L97-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php#L97-L99)
+- 手动停用删除调度：[ToggleUserNotificationChannel@deleteScheduledReminders#L81-L84](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Settings/ManageNotificationChannels/Services/ToggleUserNotificationChannel.php#L81-L84)
+
+> **实际影响评估**：
+> - 手动停用渠道时会删除调度记录，因此正常情况下不会出现重复处理
+> - 仅在数据不一致或竞态条件下（如渠道在查询后、处理前被停用）才可能发生
+> - 重复处理的代价很小：仅更新 `triggered_at` 字段，不发送通知、不产生副作用
 
 **核心发送代码**：
 
