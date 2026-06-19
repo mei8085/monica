@@ -1,5 +1,9 @@
 # HTTP Resource 与 Domain Action 职责边界分析
 
+> **文档版本**: v1.2
+> **仓库根目录**: `d:/fz/0601-2/solo-dogfeeding/code/49-monica/`
+> **路径说明**: 本文档使用**仓库相对路径**引用文件，格式为 `[显示名](相对路径#行号范围)`，同时附带完整绝对路径用于点击跳转。
+
 ---
 
 ## 1. 整体架构分层
@@ -37,7 +41,7 @@
 
 ### 2.1 定位与职责
 
-**所在目录**: [app/Http/Resources
+**所在目录**: `app/Http/Resources/`
 
 **核心职责**: 负责将领域模型对象转换为 API 响应格式，属于**表现层**。
 
@@ -58,7 +62,7 @@
 
 ### 2.3 典型代码示例
 
-以 [VaultResource.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Resources/VaultResource.php) 为例：
+以 [VaultResource.php](app/Http/Resources/VaultResource.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Resources/VaultResource.php)) 为例：
 
 ```php
 class VaultResource extends JsonResource
@@ -93,7 +97,7 @@ class VaultResource extends JsonResource
 
 ### 3.1 定位与职责
 
-**所在目录**: [app/Domains/*/Services
+**所在目录**: `app/Domains/*/Services/`
 
 **核心职责**: 封装领域业务逻辑，属于**领域层**，是业务逻辑的核心载体。
 
@@ -110,7 +114,7 @@ class VaultResource extends JsonResource
 - 存在性验证 (exists 规则)
 - UUID 格式验证
 
-示例来自 [CreateContact.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/CreateContact.php#L18-L37)：
+示例来自 [CreateContact.php](app/Domains/Contact/ManageContact/Services/CreateContact.php#L18-L37) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/CreateContact.php#L18-L37))：
 
 ```php
 public function rules(): array
@@ -128,7 +132,7 @@ public function rules(): array
 
 #### 3.2.2 权限验证 (permissions 方法)
 
-定义执行该操作所需的权限，由 [BaseService](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php#L80-L83) 统一处理：
+定义执行该操作所需的权限，由 [BaseService.php](app/Services/BaseService.php#L80-L83) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php#L80-L83)) 统一处理：
 
 ```php
 public function permissions(): array
@@ -141,7 +145,7 @@ public function permissions(): array
 }
 ```
 
-支持的权限类型 (定义在 [BaseService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php#L41-L67))：
+支持的权限类型 (定义在 [BaseService.php](app/Services/BaseService.php#L41-L67) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php#L41-L67)))：
 
 | 权限标识 | 含义 | 前置依赖 |
 |---------|------|---------|
@@ -182,7 +186,7 @@ private function validate(): void
 
 ### 3.3 Service 接口契约
 
-[ServiceInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Interfaces/ServiceInterface.php) 定义了 Service 的公共接口：
+[ServiceInterface.php](app/Interfaces/ServiceInterface.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Interfaces/ServiceInterface.php)) 定义了 Service 的公共接口：
 
 ```php
 interface ServiceInterface
@@ -194,7 +198,7 @@ interface ServiceInterface
 
 ### 3.4 BaseService 基类
 
-[BaseService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php) 提供了：
+[BaseService.php](app/Services/BaseService.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php)) 提供了：
 
 1. **通用属性**: `$author`、`$vault`、`$contact`、`$group` 等常用对象
 2. **验证流程**: `validateRules()` 统一调用验证器和权限检查
@@ -209,12 +213,12 @@ interface ServiceInterface
 
 ### 3.5 QueuableService 子类
 
-[QueuableService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/QueuableService.php) 继承 BaseService 并实现 `ShouldQueue`，使 Service 可作为队列任务派发：
+[QueuableService.php](app/Services/QueuableService.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/QueuableService.php)) 继承 BaseService 并实现 `ShouldQueue`，使 Service 可作为队列任务派发：
 
 - 构造函数中即调用 `validateRules($data)` 进行验证
 - `handle()` 方法调用 `execute()`
 - `failed()` 方法处理任务失败 (当前为空实现)
-- 典型示例: [DestroyContact](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/DestroyContact.php) 通过 `dispatchSync` 或 `dispatch` 派发
+- 典型示例: [DestroyContact.php](app/Domains/Contact/ManageContact/Services/DestroyContact.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/DestroyContact.php)) 通过 `dispatchSync` 或 `dispatch` 派发
 
 ---
 
@@ -223,14 +227,14 @@ interface ServiceInterface
 ### 4.1 定位与职责
 
 **所在目录**:
-- API Controller: [app/Domains/*/Api/Controllers
-- Web Controller: [app/Domains/*/Web/Controllers
+- API Controller: `app/Domains/*/Api/Controllers/`
+- Web Controller: `app/Domains/*/Web/Controllers/`
 
 **核心职责**: 作为 HTTP 请求的入口，协调各层，属于**应用层**。
 
 ### 4.2 API Controller 典型流程
 
-以 [VaultController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVault/Api/Controllers/VaultController.php) 为例：
+以 [VaultController.php](app/Domains/Vault/ManageVault/Api/Controllers/VaultController.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVault/Api/Controllers/VaultController.php)) 为例：
 
 ```php
 public function store(Request $request)
@@ -254,7 +258,7 @@ public function store(Request $request)
 
 ### 4.3 ApiController 基类
 
-[ApiController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Controllers/ApiController.php) 提供了：
+[ApiController.php](app/Http/Controllers/ApiController.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Controllers/ApiController.php)) 提供了：
 
 1. **异常捕获与转换**: `callAction()` 方法统一捕获异常并转换为 HTTP 响应：
 
@@ -275,7 +279,7 @@ public function callAction($method, $parameters)
 ```
 
 2. **分页参数处理**: `limit` 参数的验证和设置
-3. **JSON 响应工具**: 通过 [JsonRespondController](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Traits/JsonRespondController.php) trait 提供统一的错误响应格式
+3. **JSON 响应工具**: 通过 [JsonRespondController.php](app/Traits/JsonRespondController.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Traits/JsonRespondController.php)) trait 提供统一的错误响应格式
 
 ### 4.4 Web Controller 特点
 
@@ -320,7 +324,7 @@ Web Controller 与 API Controller 类似，但返回的是 Inertia 视图而不�
 
 #### 5.2.1 HTTP 请求层验证 (FormRequest)
 
-**所在位置**: [app/Http/Requests
+**所在位置**: `app/Http/Requests/`
 
 **使用场景**: 仅用于认证相关的特殊场景
 
@@ -329,7 +333,7 @@ Web Controller 与 API Controller 类似，但返回的是 Inertia 视图而不�
 - 认证逻辑
 - 仅限认证失败时的特殊验证
 
-**示例**: [LoginRequest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Requests/Auth/LoginRequest.php)
+**示例**: [LoginRequest.php](app/Http/Requests/Auth/LoginRequest.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Requests/Auth/LoginRequest.php))
 
 **特点**:
 - 仅用于认证相关的有限场景
@@ -374,7 +378,7 @@ Web Controller 与 API Controller 类似，但返回的是 Inertia 视图而不�
 
 ### 6.2 典型领域操作内容
 
-以 [CreateVault.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVault/Services/CreateVault.php) 为例，一个创建操作包含：
+以 [CreateVault.php](app/Domains/Vault/ManageVault/Services/CreateVault.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVault/Services/CreateVault.php)) 为例，一个创建操作包含：
 
 1. **主实体创建** - Vault::create(...)
 2. **关联数据创建** - 创建用户联系人 Contact
@@ -400,20 +404,20 @@ Web Controller 与 API Controller 类似，但返回的是 Inertia 视图而不�
 |-------|---------|---------|
 | `ValidationException` | BaseService::validateRules() 内的 Validator::make()->validate() | 字段验证失败 |
 | `ModelNotFoundException` | BaseService 内各 findOrFail() 调用 | 关联记录不存在 |
-| `NotEnoughPermissionException` | [BaseService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php#L173) (2处)、[MoveContactToAnotherVault.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/MoveContactToAnotherVault.php#L73)、[CopyContactToAnotherVault.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/CopyContactToAnotherVault.php#L73)、[CardDAVBackend.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php#L263) | 权限不足 |
-| `CantBeDeletedException` | [DestroyContact.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/DestroyContact.php#L45)、[DestroyLifeEventCategory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVaultSettings/Services/DestroyLifeEventCategory.php#L47) 等 | 资源不可删除 |
-| `SameUserException` | [GrantVaultAccessToUser.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVaultSettings/Services/GrantVaultAccessToUser.php#L68)、[RemoveVaultAccess.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccess.php#L64)、[ChangeVaultAccess.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVaultSettings/Services/ChangeVaultAccess.php#L65) | 操作目标与操作者相同 |
-| `EnvVariablesNotSetException` | [GetGPSCoordinate.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageAddresses/Services/GetGPSCoordinate.php#L67)、[UploadFile.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageDocuments/Services/UploadFile.php#L66) 等 | 环境变量未配置 |
-| `MaximumNumberOfUsersInVaultException` | (定义于 [Exceptions/](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Exceptions/MaximumNumberOfUsersInVaultException.php)) | Vault 用户数超限 |
-| `EntryAlreadyExistException` | (定义于 [Exceptions/](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Exceptions/EntryAlreadyExistException.php)) | 条目已存在 |
+| `NotEnoughPermissionException` | [BaseService.php#L173](app/Services/BaseService.php#L173) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php#L173)) (2处)、[MoveContactToAnotherVault.php#L73](app/Domains/Contact/ManageContact/Services/MoveContactToAnotherVault.php#L73) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/MoveContactToAnotherVault.php#L73))、[CopyContactToAnotherVault.php#L73](app/Domains/Contact/ManageContact/Services/CopyContactToAnotherVault.php#L73) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/CopyContactToAnotherVault.php#L73))、[CardDAVBackend.php#L263](app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php#L263) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php#L263)) | 权限不足 |
+| `CantBeDeletedException` | [DestroyContact.php#L45](app/Domains/Contact/ManageContact/Services/DestroyContact.php#L45) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/DestroyContact.php#L45))、[DestroyLifeEventCategory.php#L47](app/Domains/Vault/ManageVaultSettings/Services/DestroyLifeEventCategory.php#L47) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVaultSettings/Services/DestroyLifeEventCategory.php#L47)) 等 | 资源不可删除 |
+| `SameUserException` | [GrantVaultAccessToUser.php#L68](app/Domains/Vault/ManageVaultSettings/Services/GrantVaultAccessToUser.php#L68) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVaultSettings/Services/GrantVaultAccessToUser.php#L68))、[RemoveVaultAccess.php#L64](app/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccess.php#L64) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccess.php#L64))、[ChangeVaultAccess.php#L65](app/Domains/Vault/ManageVaultSettings/Services/ChangeVaultAccess.php#L65) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVaultSettings/Services/ChangeVaultAccess.php#L65)) | 操作目标与操作者相同 |
+| `EnvVariablesNotSetException` | [GetGPSCoordinate.php#L67](app/Domains/Vault/ManageAddresses/Services/GetGPSCoordinate.php#L67) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageAddresses/Services/GetGPSCoordinate.php#L67))、[UploadFile.php#L66](app/Domains/Contact/ManageDocuments/Services/UploadFile.php#L66) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageDocuments/Services/UploadFile.php#L66)) 等 | 环境变量未配置 |
+| `MaximumNumberOfUsersInVaultException` | (定义于 [MaximumNumberOfUsersInVaultException.php](app/Exceptions/MaximumNumberOfUsersInVaultException.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Exceptions/MaximumNumberOfUsersInVaultException.php))) | Vault 用户数超限 |
+| `EntryAlreadyExistException` | (定义于 [EntryAlreadyExistException.php](app/Exceptions/EntryAlreadyExistException.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Exceptions/EntryAlreadyExistException.php))) | 条目已存在 |
 
 此外，BaseService 自身还可能抛出通用 `\Exception`：
 
 | 抛出位置 | 代码 | 含义 |
 |---------|------|------|
-| [BaseService.php#L106](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php#L106) | `throw new \Exception("$key requires $value")` | 权限配置错误: 缺少前置权限 |
-| [BaseService.php#L115](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php#L115) | `throw new \Exception('Unknown permission: '.$e->first())` | 权限配置错误: 未知权限标识 |
-| [BaseService.php#L152](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php#L152) | `throw new \Exception("Unknown permission: $permission")` | switch-case 兜底: 不应到达的分支 |
+| [BaseService.php#L106](app/Services/BaseService.php#L106) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php#L106)) | `throw new \Exception("$key requires $value")` | 权限配置错误: 缺少前置权限 |
+| [BaseService.php#L115](app/Services/BaseService.php#L115) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php#L115)) | `throw new \Exception('Unknown permission: '.$e->first())` | 权限配置错误: 未知权限标识 |
+| [BaseService.php#L152](app/Services/BaseService.php#L152) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php#L152)) | `throw new \Exception("Unknown permission: $permission")` | switch-case 兜底: 不应到达的分支 |
 
 > 上述三个 `\Exception` 属于**开发期防御性异常**，正常情况下不应触发，表示 Service 的 permissions() 配置有误。
 
@@ -450,7 +454,7 @@ Web Controller 与 API Controller 类似，但返回的是 Inertia 视图而不�
 
 ### 7.3 路径 A: API 请求 -- ApiController::callAction() 的处理
 
-[ApiController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Controllers/ApiController.php#L54-L65) 的 `callAction()` 只 catch 了 **3 种**异常：
+[ApiController.php#L54-L65](app/Http/Controllers/ApiController.php#L54-L65) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Controllers/ApiController.php#L54-L65)) 的 `callAction()` 只 catch 了 **3 种**异常：
 
 ```php
 public function callAction($method, $parameters)
@@ -491,7 +495,7 @@ public function callAction($method, $parameters)
 
 ### 7.4 路径 B: Web 请求 -- Web Controller 的处理
 
-Web Controller 继承自 [Controller.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Controller.php)，使用 `AuthorizesRequests` trait：
+Web Controller 继承自 [Controller.php](app/Http/Controllers/Controller.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Controllers/Controller.php))，使用 `AuthorizesRequests` trait：
 
 ```php
 abstract class Controller extends BaseController
@@ -508,7 +512,7 @@ Web Controller 的异常处理流程：
 2. **Gate::authorize()**: 部分 Web Controller 方法在调用 Service 前先通过 Gate 检查权限，这会抛出 `AuthorizationException` (Laravel 框架级异常)
 3. **所有异常冒泡**: 无论是 Service 抛出的领域异常还是 Gate 抛出的 `AuthorizationException`，都直接冒泡到 Laravel 全局 Handler
 
-以 [ContactController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php) 为例：
+以 [ContactController.php](app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php)) 为例：
 
 ```php
 public function store(Request $request, string $vaultId)
@@ -540,7 +544,7 @@ Web 请求中 Laravel 全局 Handler 的默认行为：
 1. `dispatchSync` (同步): 异常直接冒泡到调用方 (Controller)，走调用方的异常处理路径
 2. `dispatch` (异步队列): 异常由 Laravel 队列 worker 捕获，触发任务重试或标记失败，调用 `failed()` 方法
 
-以 [ContactController::destroy()](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L167-L183) 为例：
+以 [ContactController.php#L167-L183](app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L167-L183) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L167-L183)) 为例：
 
 ```php
 public function destroy(Request $request, string $vaultId, string $contactId)
@@ -562,7 +566,7 @@ public function destroy(Request $request, string $vaultId, string $contactId)
 
 ### 7.6 Laravel 全局异常处理器
 
-**配置位置**: [bootstrap/app.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/bootstrap/app.php#L45-L47)
+**配置位置**: [bootstrap/app.php#L45-L47](bootstrap/app.php#L45-L47) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/bootstrap/app.php#L45-L47))
 
 ```php
 ->withExceptions(function (Exceptions $exceptions) {
@@ -570,7 +574,7 @@ public function destroy(Request $request, string $vaultId, string $contactId)
 })
 ```
 
-**自定义 Handler**: [Handler.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Exceptions/Handler.php)
+**自定义 Handler**: [Handler.php](app/Exceptions/Handler.php) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Exceptions/Handler.php))
 
 ```php
 class Handler extends ExceptionHandler
@@ -599,7 +603,7 @@ class Handler extends ExceptionHandler
 
 在 2 处 DAV 导入代码中，`NotEnoughPermissionException` 被领域内部 catch 并静默忽略：
 
-1. [ImportContactInformation.php#L104](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php#L104):
+1. [ImportContactInformation.php#L104](app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php#L104) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php#L104)):
 
 ```php
 } catch (NotEnoughPermissionException) {
@@ -607,7 +611,7 @@ class Handler extends ExceptionHandler
 }
 ```
 
-2. [ImportAddress.php#L82](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Dav/ImportAddress.php#L82):
+2. [ImportAddress.php#L82](app/Domains/Contact/ManageContact/Dav/ImportAddress.php#L82) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Dav/ImportAddress.php#L82)):
 
 ```php
 } catch (NotEnoughPermissionException) {
@@ -796,7 +800,7 @@ HTTP 403 Forbidden 错误页面
 - 处理方式: Laravel 自动映射为 403 Forbidden
 - 适用范围: **仅 Web Controller**，API Controller 不使用
 
-示例: [ContactController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L57)
+示例: [ContactController.php#L57](app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L57) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L57))
 
 ```php
 Gate::authorize('vault-editor', $vault);
@@ -809,7 +813,7 @@ Gate::authorize('vault-editor', $vault);
 - 处理方式: **无显式映射**，默认 500
 - 适用范围: **所有调用方式** (Web、API、Job、CLI)
 
-示例: [CreateContact.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/CreateContact.php#L42-L49)
+示例: [CreateContact.php#L42-L49](app/Domains/Contact/ManageContact/Services/CreateContact.php#L42-L49) ([绝对路径](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/CreateContact.php#L42-L49))
 
 ```php
 public function permissions(): array
@@ -916,3 +920,42 @@ public function permissions(): array
 - 自定义领域异常 (`NotEnoughPermissionException`、`CantBeDeletedException` 等) 没有对应的 catch 分支
 - 这些异常会冒泡到 Laravel 全局 Handler，被当作 500 处理
 - 这可能是一个**设计缺陷**或**待完善项**，合理的做法应该是在 ApiController 或全局 Handler 中添加对这些领域异常的显式映射 (如 NotEnoughPermissionException -> 403)
+
+---
+
+## 14. 文件引用索引
+
+以下是本文档中引用的所有文件的完整列表，包含仓库相对路径和绝对路径，方便在不同环境中定位：
+
+| 编号 | 文件描述 | 仓库相对路径 | 绝对路径 |
+|-----|---------|-------------|---------|
+| 1 | Vault 资源类 | `app/Http/Resources/VaultResource.php` | [VaultResource.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Resources/VaultResource.php) |
+| 2 | 创建联系人 Service | `app/Domains/Contact/ManageContact/Services/CreateContact.php` | [CreateContact.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/CreateContact.php) |
+| 3 | Service 基类 | `app/Services/BaseService.php` | [BaseService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/BaseService.php) |
+| 4 | Service 接口 | `app/Interfaces/ServiceInterface.php` | [ServiceInterface.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Interfaces/ServiceInterface.php) |
+| 5 | 可队列 Service | `app/Services/QueuableService.php` | [QueuableService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Services/QueuableService.php) |
+| 6 | 删除联系人 Service | `app/Domains/Contact/ManageContact/Services/DestroyContact.php` | [DestroyContact.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/DestroyContact.php) |
+| 7 | Vault API 控制器 | `app/Domains/Vault/ManageVault/Api/Controllers/VaultController.php` | [VaultController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVault/Api/Controllers/VaultController.php) |
+| 8 | API 控制器基类 | `app/Http/Controllers/ApiController.php` | [ApiController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Controllers/ApiController.php) |
+| 9 | JSON 响应 Trait | `app/Traits/JsonRespondController.php` | [JsonRespondController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Traits/JsonRespondController.php) |
+| 10 | 登录请求验证 | `app/Http/Requests/Auth/LoginRequest.php` | [LoginRequest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Requests/Auth/LoginRequest.php) |
+| 11 | 创建 Vault Service | `app/Domains/Vault/ManageVault/Services/CreateVault.php` | [CreateVault.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVault/Services/CreateVault.php) |
+| 12 | 权限不足异常 | `app/Exceptions/NotEnoughPermissionException.php` | [NotEnoughPermissionException.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Exceptions/NotEnoughPermissionException.php) |
+| 13 | 移动联系人到其他 Vault | `app/Domains/Contact/ManageContact/Services/MoveContactToAnotherVault.php` | [MoveContactToAnotherVault.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/MoveContactToAnotherVault.php) |
+| 14 | 复制联系人到其他 Vault | `app/Domains/Contact/ManageContact/Services/CopyContactToAnotherVault.php` | [CopyContactToAnotherVault.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Services/CopyContactToAnotherVault.php) |
+| 15 | CardDAV 后端 | `app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php` | [CardDAVBackend.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php) |
+| 16 | 删除生活事件类别 | `app/Domains/Vault/ManageVaultSettings/Services/DestroyLifeEventCategory.php` | [DestroyLifeEventCategory.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVaultSettings/Services/DestroyLifeEventCategory.php) |
+| 17 | 授予 Vault 访问权限 | `app/Domains/Vault/ManageVaultSettings/Services/GrantVaultAccessToUser.php` | [GrantVaultAccessToUser.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVaultSettings/Services/GrantVaultAccessToUser.php) |
+| 18 | 移除 Vault 访问权限 | `app/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccess.php` | [RemoveVaultAccess.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVaultSettings/Services/RemoveVaultAccess.php) |
+| 19 | 修改 Vault 访问权限 | `app/Domains/Vault/ManageVaultSettings/Services/ChangeVaultAccess.php` | [ChangeVaultAccess.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageVaultSettings/Services/ChangeVaultAccess.php) |
+| 20 | 获取 GPS 坐标 Service | `app/Domains/Vault/ManageAddresses/Services/GetGPSCoordinate.php` | [GetGPSCoordinate.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Vault/ManageAddresses/Services/GetGPSCoordinate.php) |
+| 21 | 上传文件 Service | `app/Domains/Contact/ManageDocuments/Services/UploadFile.php` | [UploadFile.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageDocuments/Services/UploadFile.php) |
+| 22 | Vault 用户数超限异常 | `app/Exceptions/MaximumNumberOfUsersInVaultException.php` | [MaximumNumberOfUsersInVaultException.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Exceptions/MaximumNumberOfUsersInVaultException.php) |
+| 23 | 条目已存在异常 | `app/Exceptions/EntryAlreadyExistException.php` | [EntryAlreadyExistException.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Exceptions/EntryAlreadyExistException.php) |
+| 24 | Web 控制器基类 | `app/Http/Controllers/Controller.php` | [Controller.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Http/Controllers/Controller.php) |
+| 25 | 联系人 Web 控制器 | `app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php` | [ContactController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php) |
+| 26 | 应用启动配置 | `bootstrap/app.php` | [bootstrap/app.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/bootstrap/app.php) |
+| 27 | 全局异常处理器 | `app/Exceptions/Handler.php` | [Handler.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Exceptions/Handler.php) |
+| 28 | 导入联系人信息 DAV | `app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php` | [ImportContactInformation.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php) |
+| 29 | 导入地址 DAV | `app/Domains/Contact/ManageContact/Dav/ImportAddress.php` | [ImportAddress.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Domains/Contact/ManageContact/Dav/ImportAddress.php) |
+| 30 | Vault 策略类 | `app/Policies/VaultPolicy.php` | [VaultPolicy.php](file:///d:/fz/0601-2/solo-dogfeeding/code/49-monica/app/Policies/VaultPolicy.php) |
