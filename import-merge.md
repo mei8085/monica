@@ -222,19 +222,39 @@ for i from 0 to max(vcard_count, local_count):
 
 ### 3.3 集合差集（无序集合）
 
-适用：标签、重要日期（BDAY）
+标签和重要日期虽然都用了 `diffKeys` / `intersectByKeys`，但**只有重要日期是真正的差集策略**，标签的实现由于 key 类型不同，实际上是全量删除再全量添加。
 
-**逻辑**：以 key（标签名 / 日期字符串）为匹配依据，做集合运算。
+#### 重要日期（真正的差集）
+
+[ImportImportantDates::import()](file:///d:/fz/0601-2/solo-dogfeeding/code/50-monica/app/Domains/Contact/ManageContactImportantDates/Dav/ImportImportantDates.php#L36-L64)
+
+两边都用 **日期字符串** 作为 key：
+- 本地：`$contactImportantDates` 通过 `mapWithKeys(fn ($d) => [$d->getVCardDate() => $d])` 构建
+- VCard：`$bdays` 通过 `mapWithKeys(fn ($b) => [$b->getValue() => ...])` 构建
+
+因此 `diffKeys` / `intersectByKeys` 能正确匹配：
 
 ```
-toAdd    = vcard_items->diffKeys(local_items)    → 新增
-toRemove = local_items->diffKeys(vcard_items)    → 删除
-intersect = local_items->intersectByKeys(vcard)  → 可能更新
+toAdd     = bdays - contactImportantDates   （按日期字符串取差集）→ 新增
+toRemove  = contactImportantDates - bdays   （按日期字符串取差集）→ 删除
+intersect = contactImportantDates ∩ bdays   （按日期字符串取交集）→ 可能更新
 ```
 
-实现位置：
-- [ImportLabels::import()](file:///d:/fz/0601-2/solo-dogfeeding/code/50-monica/app/Domains/Contact/ManageContact/Dav/ImportLabels.php#L31-L53)
-- [ImportImportantDates::import()](file:///d:/fz/0601-2/solo-dogfeeding/code/50-monica/app/Domains/Contact/ManageContactImportantDates/Dav/ImportImportantDates.php#L36-L64)
+交集部分会检查 `contactImportantDateType` 是否需要从 null 更新为 birthdate 类型。
+
+#### 标签（全量删除再添加）
+
+[ImportLabels::import()](file:///d:/fz/0601-2/solo-dogfeeding/code/50-monica/app/Domains/Contact/ManageContact/Dav/ImportLabels.php#L31-L53)
+
+两边的 key 类型不一致：
+- 本地：`$labels` 通过 `mapWithKeys(fn ($label) => [$label->name => $label])` 构建，key 是 **标签名字符串**
+- VCard：`$categories` 通过 `collect($categories->getParts())` 构建，key 是 **数字索引**（0, 1, 2...）
+
+由于数字键和字符串键永远不会匹配，`diffKeys` 的结果是：
+- `$toAdd = $categories->diffKeys($labels)` → 返回**所有** VCard 中的分类
+- `$toRemove = $labels->diffKeys($categories)` → 返回**所有**本地标签
+
+**实际效果**：每次导入都会先移除联系人身上所有现有的标签关联，再重新添加 VCard 中所有的标签。标签本身（Label 记录）不会被删除，因为 `addLabel()` 会先通过 `getLabel($name)` 查找已有的同名标签，找不到才创建。
 
 ### 3.4 成员关系合并（ImportMembers）
 
