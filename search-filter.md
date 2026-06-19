@@ -337,7 +337,378 @@ Group::search($term)->where('vault_id', $vault->id)->get();
 
 ---
 
-## 六、验证清单（排查搜索/过滤问题时）
+## 六、三大核心流程深度剖析
+
+### 6.1 流程一：联系人所有权校验（contact-owner Gate + Service 层双重校验）
+
+这是最容易产生误解的流程，因为「所有权校验」实际上发生在**两个独立的地方**，且职责不同。
+
+#### 6.1.1 路由层 Gate：`can:contact-owner,vault,contact`
+
+**代码位置**：[web.php:250](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/routes/web.php#L250-L255)
+
+```php
+Route::middleware('can:contact-owner,vault,contact')->prefix('{contact}')->group(function () {
+    Route::get('', [ContactController::class, 'show'])->name('contact.show');
+    // ... 所有单联系人操作
+});
+```
+
+**Gate 定义**：[AuthServiceProvider.php:56-65](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Providers/AuthServiceProvider.php#L56-L65)
+
+```php
+Gate::define('contact-owner', function (User $user, $vault, $contact): bool {
+    if ($contact instanceof Contact) {
+        return $contact->vault_id === static::id($vault);  // 只比较 vault_id 是否相等
+    }
+    return Contact::where([
+        'id' => static::id($contact),
+        'vault_id' => static::id($vault),
+    ])->exists();
+});
+```
+
+**⚠️ 关键理解**：
+- 这个 Gate **不检查用户的任何权限**，只检查「该 contact 是否属于该 vault」
+- 参数顺序是 `($user, $vault, $contact)`，三个参数由路由的 `{vault}` 和 `{contact}` 绑定自动传入
+- 它的作用是**防止横向越权**：即使你有 vault 访问权，也不能通过修改 URL 中的 contact_id 访问其他 vault 的联系人
+
+#### 6.1.2 Service 层校验：`contact_must_belong_to_vault`
+
+所有写入操作（创建/更新/删除联系人）都通过 Service 类执行，每个 Service 声明 `permissions()` 数组：
+
+**示例：ToggleArchiveContact** [ToggleArchiveContact.php:31-39](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Services/ToggleArchiveContact.php#L31-L39)
+
+```php
+public function permissions(): array
+{
+    return [
+        'author_must_belong_to_account',
+        'vault_must_belong_to_account',
+        'contact_must_belong_to_vault',      // ← 这里
+        'author_must_be_vault_editor',
+    ];
+}
+```
+
+**校验执行逻辑**：[BaseService.php:205-215](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Services/BaseService.php#L205-L215)
+
+```php
+public function validateContactBelongsToVault(array $data): void
+{
+    if (isset($data['contact_id'])) {
+        // 🔴 通过 vault->contacts() 关系查询，隐式包含 WHERE vault_id = ?
+        $this->contact = $this->vault->contacts()
+            ->findOrFail($data['contact_id']);
+
+        // 🔴 额外的防御性校验，确保不会拿到其他 vault 的 contact
+        if ($this->contact->vault_id !== $this->vault->id) {
+            throw new ModelNotFoundException;
+        }
+    }
+}
+```
+
+#### 6.1.3 权限依赖图
+
+[BaseService.php:41-67](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Services/BaseService.php#L41-L67) 定义了权限依赖顺序：
+
+```
+contact_must_belong_to_vault
+    ├─ 依赖 vault_must_belong_to_account  → 校验 vault 属于 account
+    └─ 依赖 author_must_belong_to_account → 校验 user 属于 account
+```
+
+执行顺序是**拓扑排序**的，先执行依赖，再执行权限本身。
+
+**完整校验链路（以 ToggleArchiveContact 为例）**：
+
+```
+请求 → 路由中间件 can:contact-owner,vault,contact
+          ↓ （检查 contact.vault_id == vault.id）
+      ToggleArchiveContact::execute($data)
+          ↓
+      $this->validateRules($data)
+          ├─ author_must_belong_to_account  → 查 user，设置 $this->author
+          ├─ vault_must_belong_to_account   → 查 vault，设置 $this->vault
+          └─ contact_must_belong_to_vault   → $vault->contacts()->findOrFail($id)
+                                              （同时隐式校验 vault_id）
+          ↓
+      author_must_be_vault_editor → 检查 pivot.permission <= 200
+          ↓
+      执行业务逻辑：$this->contact->listed = !$this->contact->listed
+```
+
+**为什么要有双重校验？**
+- 路由层的 Gate 保护所有 GET/POST/DELETE/PUT 路由，防止 URL 篡改
+- Service 层的校验是**深度防御**，即使路由层被绕过（如队列任务、Artisan 命令直接调用 Service），也能保证安全
+- Service 层还负责加载模型实例（`$this->contact`），供后续业务逻辑使用
+
+---
+
+### 6.2 流程二：分组归档可见性（路径C的 listed 过滤缺失）
+
+这是整个系统中最隐蔽的不一致性。
+
+#### 6.2.1 `listed` 字段的定义
+
+`listed` 字段在 Contact 表中，是布尔型：
+- `listed = 1`：正常显示的联系人
+- `listed = 0`：已归档（archived）的联系人
+
+**切换归档的服务**：[ToggleArchiveContact.php:44-56](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Services/ToggleArchiveContact.php#L44-L56)
+
+```php
+public function execute(array $data): Contact
+{
+    $this->data = $data;
+    $this->validate();
+
+    $this->contact->listed = ! $this->contact->listed;  // 直接取反
+    $this->contact->save();
+
+    $this->updateLastEditedDate();
+    $this->createFeedItem();
+
+    return $this->contact;
+}
+```
+
+**同时触发 Scout 索引更新**：因为 Contact 模型的 `searchIndexShouldBeUpdated()` 返回 true，`shouldBeSearchable()` 返回 `$this->listed`。当 `listed` 从 true 变为 false 时，这条记录会被**从搜索索引中移除**。
+
+#### 6.2.2 五条路径对 `listed` 的处理对比
+
+| 路径 | 查询方式 | 是否过滤 `listed=true` | 代码位置 |
+|------|---------|----------------------|---------|
+| A. 主列表 | `$vault->contacts()->where('listed', true)` | ✅ 显式过滤 | [ContactController.php:30-31](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L30-L31) |
+| B. 标签筛选 | `Label::find()->contacts()->where('listed', true)` | ✅ 显式过滤 | [ContactLabelController.php:21-24](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactLabelController.php#L21-L24) |
+| C. 分组成员 | `$group->contacts()` | ❌ **不过滤** | [GroupShowViewHelper.php:26-28](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupShowViewHelper.php#L26-L28) |
+| D. 模块内搜索 | `Contact::search($term)->where('vault_id', ...)` | ✅ 收录时过滤（`shouldBeSearchable`） | [Contact.php:104-107](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L104-L107) |
+| E. 全局搜索 | `Contact::search($term)->where('vault_id', ...)` | ✅ 收录时过滤（`shouldBeSearchable`） | 同上 |
+
+**Contact 模型其实有 scopeActive，但路径C没用到**：
+[Contact.php:112-115](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L112-L115)
+
+```php
+public function scopeActive(Builder $query): Builder
+{
+    return $query->where('listed', 1);
+}
+```
+
+#### 6.2.3 路径C代码全景
+
+[GroupShowViewHelper.php:18-90](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Contact/ManageGroups/Web/ViewHelpers/GroupShowViewHelper.php#L18-L90)
+
+```php
+public static function data(Group $group): array
+{
+    // 第一部分：按角色分组的成员
+    $rolesCollection = $group->groupType === null
+        ? collect()
+        : $group->groupType->groupTypeRoles()
+            ->orderBy('position')
+            ->get()
+            ->map(function (GroupTypeRole $role) use ($group) {
+                // 🔴 这里没有 where('listed', true)！
+                $contactsCollection = $group->contacts()
+                    ->wherePivot('group_type_role_id', $role->id)
+                    ->get()
+                    ->map(fn (Contact $contact) => [...]);
+
+                return [...];
+            });
+
+    // 第二部分：未分配角色的成员
+    $contactsCollection = $group->contacts()
+        ->wherePivotNull('group_type_role_id')  // 🔴 这里也没有 where('listed', true)！
+        ->get()
+        ->map(fn (Contact $contact) => [...]);
+
+    // 如果有未分配角色的成员，追加到 rolesCollection
+    if ($contactsCollection->isNotEmpty()) {
+        $rolesCollection->push([
+            'id' => -1,
+            'label' => trans('No role'),
+            'contacts' => $contactsCollection,
+        ]);
+    }
+
+    return [...];
+}
+```
+
+#### 6.2.4 为什么这是一个问题？
+
+**场景演示**：
+1. Vault A 中有名为「家人」的分组，包含成员「张三」（listed=true）
+2. 用户将「张三」归档（listed=false）
+3. 这时：
+   - 主列表：✅ 看不到张三
+   - 搜索：✅ 搜不到张三（已从索引移除）
+   - 分组详情页：❌ **仍然能看到张三**！因为 `$group->contacts()` 没过滤 listed
+
+**这不是 Bug 就是 Feature 争议**：系统设计时可能有意让分组显示全部成员（包括已归档），但行为不一致容易让用户困惑 — 同一个联系人在列表页消失了，在分组里却还能看到。
+
+---
+
+### 6.3 流程三：全局搜索结果回查（Scout ID 回查机制）
+
+这是整个搜索流程中最关键也最隐蔽的环节。
+
+#### 6.3.1 Scout 搜索执行的完整流程
+
+根据 [Laravel Scout 官方文档](https://laravel.com/docs/scout) 和代码设计，`Contact::search($term)->where('vault_id', $vault->id)->get()` 的执行过程如下：
+
+```
+1. Contact::search($term)
+   → 创建 Laravel\Scout\Builder 实例
+   → 保存搜索词 "John"
+   
+2. ->where('vault_id', $vault->id)
+   → 在 Builder 的 $wheres 数组中保存 ['vault_id' => 'xxx']
+   
+3. ->get()
+   ├─ 调用 Engine::search(Builder $builder)
+   │    ├─ Meilisearch/Algolia/Typesense 执行搜索
+   │    │   · 全文搜索关键词 "John"
+   │    │   · 应用过滤条件 vault_id = "xxx"
+   │    │   · 返回匹配文档的 ID 列表 [id1, id2, id3]
+   │    │
+   │    └─ Scout 用这些 ID 回查 MySQL
+   │         → SELECT * FROM contacts WHERE id IN (id1, id2, id3)
+   │         → 🔴 这里不会追加任何额外的 WHERE 条件！
+   │
+   └─ 返回 Eloquent Collection
+```
+
+#### 6.3.2 为什么回查不追加条件？
+
+**设计意图**：Scout 的设计哲学是「搜索引擎负责过滤和排序，MySQL 只负责取数据」。所有过滤逻辑应该在搜索引擎侧完成，回查只做 hydration（模型水化）。
+
+**风险点**：如果搜索引擎侧的过滤条件失效，回查阶段不会有任何补救措施。
+
+**失效场景举例**：
+1. 开发者忘记写 `->where('vault_id', $vault->id)`
+2. `scout.php` 中 `filterableAttributes` 没有包含 `vault_id`，导致过滤条件被搜索引擎忽略
+3. 搜索引擎的索引配置错误，导致跨 vault 数据泄漏
+4. `shouldBeSearchable()` 的逻辑在索引收录后被修改，但索引没有重建
+
+在这些情况下，**搜索引擎可能返回其他 vault 的 contact ID**，而回查的 `WHERE id IN (...)` 会无条件地把它们取出来，造成**跨 vault 数据泄漏**。
+
+#### 6.3.3 本系统的回查安全保障
+
+本系统通过以下机制降低风险：
+
+| 保障机制 | 作用 | 位置 |
+|---------|------|------|
+| 路由中间件 `can:vault-viewer,vault` | 保证用户至少能访问该 vault | [web.php:199](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/routes/web.php#L199) |
+| Scout 查询显式 `where('vault_id', ...)` | 在搜索引擎侧过滤 | [VaultSearchIndexViewHelper.php:33-35](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Domains/Vault/Search/Web/ViewHelpers/VaultSearchIndexViewHelper.php#L33-L35) |
+| 搜索索引收录时 `shouldBeSearchable()` | 保证只有 listed=true 的记录能被搜索到 | [Contact.php:104-107](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/app/Models/Contact.php#L104-L107) |
+| `scout.meilisearch.index-settings.filterableAttributes` | 强制声明哪些字段可过滤，防止拼写错误被静默忽略 | [scout.php:141-144](file:///d:/fz/0601-2/solo-dogfeeding/code/52-monica/config/scout.php#L141-L144) |
+
+**但注意**：这些保障是**纵深防御**，不是 100% 安全。如果搜索引擎侧的 `where('vault_id')` 因为某种原因没有生效（例如 Meilisearch 的 filterableAttributes 漏配），回查阶段没有任何补救。
+
+---
+
+### 6.4 三者之间的关系：一张完整的数据流图
+
+```
+用户请求
+   │
+   ├─ 路由层
+   │    ├─ auth:sanctum  → 登录校验
+   │    ├─ can:vault-viewer,vault  → 用户能否访问该Vault？
+   │    │    （Gate: 用户在 pivot 表中有该 vault 记录）
+   │    └─ can:contact-owner,vault,contact  → 该Contact是否属于该Vault？
+   │         （Gate: contact.vault_id == vault.id）
+   │
+   ├─ 操作类型分支
+   │    │
+   │    ├─ [写入操作] 归档/删除/修改联系人
+   │    │    │
+   │    │    └─ Service 层（如 ToggleArchiveContact）
+   │    │         ├─ validateRules()
+   │    │         │   ├─ author_must_belong_to_account → 加载 $this->author
+   │    │         │   ├─ vault_must_belong_to_account  → 加载 $this->vault
+   │    │         │   ├─ contact_must_belong_to_vault  → $vault->contacts()->findOrFail()
+   │    │         │   │                              （隐式 WHERE vault_id = ?）
+   │    │         │   └─ author_must_be_vault_editor  → pivot.permission <= 200
+   │    │         │
+   │    │         ├─ 执行业务：$contact->listed = false
+   │    │         └─ 触发 Scout 更新：
+   │    │              · shouldBeSearchable() 返回 false
+   │    │              · 从搜索索引中删除该文档
+   │    │
+   │    ├─ [读取操作] 联系人列表/标签筛选
+   │    │    │
+   │    │    └─ Eloquent 直接查 DB
+   │    │         ├─ $vault->contacts()  → 隐式 WHERE vault_id = ?
+   │    │         ├─ where('listed', true)  → 只看活跃联系人
+   │    │         └─ 分页 + 排序
+   │    │
+   │    ├─ [读取操作] 分组成员（路径C）
+   │    │    │
+   │    │    └─ Eloquent 多对多查 DB
+   │    │         ├─ $group->contacts()  → JOIN contact_group
+   │    │         ├─ ❌ 缺失 where('listed', true)
+   │    │         └─ 按角色分组
+   │    │
+   │    └─ [读取操作] 搜索（路径D/E）
+   │         │
+   │         └─ Scout 搜索
+   │              ├─ Builder 构造：search($term)
+   │              ├─ Builder where：where('vault_id', $vault->id)
+   │              ├─ Engine::search() → 发送给 Meilisearch/Algolia
+   │              │    · 全文检索 + 过滤 vault_id
+   │              │    · 返回 ID 列表 [id1, id2, ...]
+   │              │
+   │              ├─ 🔴 ID 回查 MySQL：SELECT * FROM contacts WHERE id IN (...)
+   │              │    · 不追加任何条件
+   │              │    · 完全信任搜索引擎返回的 ID
+   │              │
+   │              └─ 返回 Eloquent Collection
+   │
+   └─ 响应
+```
+
+---
+
+### 6.5 三大流程的交叉影响
+
+#### 6.5.1 归档操作对搜索的影响
+
+```
+ToggleArchiveContact::execute()
+    ↓
+$contact->listed = false
+    ↓
+Model saved → 触发 Scout observer
+    ↓
+shouldBeSearchable() 返回 false
+    ↓
+从搜索索引中删除该文档
+    ↓
+后续搜索（路径D/E）搜不到该联系人 ✅
+但分组详情页（路径C）仍然能看到 ❌
+```
+
+#### 6.5.2 所有权校验对搜索的影响
+
+搜索路径（D/E）**不经过** `contact-owner` Gate，因为搜索返回的是列表，不是单个 `{contact}` 路由参数。搜索的所有权保障是：
+1. 路由层 `can:vault-viewer,vault` 保证用户能访问 vault
+2. Scout `where('vault_id', ...)` 在搜索引擎侧过滤
+3. 收录时 `shouldBeSearchable()` 保证只有 listed=true 的记录在索引中
+
+#### 6.5.3 搜索回查对分组可见性的影响
+
+如果某人在分组中有一个已归档的联系人（路径C可见），尝试在搜索框搜他的名字：
+- 搜索返回空 ✅（因为 `shouldBeSearchable()` 已将其移除）
+- 但分组详情页仍能看到 ❌（不一致）
+
+---
+
+## 七、验证清单（排查搜索/过滤问题时）
 
 1. **确认 Scout 驱动**：`SCOUT_DRIVER` 环境变量 → `ScoutHelper::isActivated()` 是否返回 true
 2. **索引是否最新**：如果是 meilisearch/typesense，运行 `scout:setup --flush --import`
@@ -347,3 +718,6 @@ Group::search($term)->where('vault_id', $vault->id)->get();
 6. **Meilisearch/Typesense filterableAttributes**：`scout.php` 中是否声明了 `vault_id` 可过滤
 7. **路径一致性**：如果用分组/标签，注意路径C缺失了 `listed` 过滤
 8. **权限数字对比**：用户在 pivot 中的 `permission` 值是否 <= 所需阈值（300/200/100）
+9. **Service 层权限**：写入操作是否声明了 `contact_must_belong_to_vault` 权限
+10. **Gate 参数顺序**：自定义 Gate 时注意参数顺序是 `($user, $vault, $contact)`，不要搞混
+11. **搜索回查安全性**：新增搜索路径时，务必添加 `where('vault_id', ...)`，不要只依赖搜索引擎的默认行为
