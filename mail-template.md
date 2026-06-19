@@ -225,8 +225,79 @@ private function validate(): void
 
 [ToggleUserNotificationChannel](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Settings/ManageNotificationChannels/Services/ToggleUserNotificationChannel.php#L9-L94) 服务：
 
-- **停用**：删除该渠道所有已调度的提醒（`$channel->contactReminders->each->delete()`）
-- **激活**：清零失败次数 + 重新调度所有提醒
+- **停用**：调用 `$channel->contactReminders->each->delete()` 删除关联的提醒模型
+- **激活**：清零失败次数 + 调用 `ScheduleAllContactRemindersForNotificationChannel` 重新调度所有提醒
+
+> **重要**：`each->delete()` 删除的是 `ContactReminder` 模型本身（而非仅中间表记录），由于级联删除会影响所有渠道的同一提醒（详见 5.5 节）。
+
+---
+
+## 4.5 渠道停用的删除行为深度分析
+
+### 4.5.1 删除目标：提醒模型本身 vs 渠道排程
+
+两种停用场景（手动停用、失败阈值自动停用）使用相同的删除代码：
+
+```php
+$userNotificationChannel->contactReminders->each->delete();
+```
+
+**`each->delete()` 的执行机制**：
+
+| 步骤 | 操作 | 删除对象 |
+|------|------|----------|
+| 1 | `$channel->contactReminders` 返回 BelongsToMany 关系的 **ContactReminder 模型集合** | - |
+| 2 | `each` 遍历集合中的每个 ContactReminder 模型 | - |
+| 3 | 对每个 ContactReminder 调用 `delete()` 方法 | `contact_reminders` 表中的记录 |
+| 4 | 外键 `cascadeOnDelete()` 触发级联删除 | `contact_reminder_scheduled` 表中所有关联该 reminder 的记录 |
+
+**代码依据**：
+- 关系定义：[UserNotificationChannel@contactReminders#L77-L82](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Models/UserNotificationChannel.php#L77-L82)
+- 外键约束：[create_reminders_table.php#L49-L50](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/database/migrations/2022_02_18_215852_create_reminders_table.php#L49-L50)
+
+> **结论**：删除的是 **ContactReminder 提醒模型本身**，而非仅当前渠道的排程记录。
+
+### 4.5.2 对同一提醒其他通知渠道的影响
+
+假设用户配置了 3 个通知渠道（邮箱 A、邮箱 B、Telegram），且同一提醒"妈妈生日"关联了这 3 个渠道：
+
+```
+渠道停用前：
+  contact_reminders (id=1, label="妈妈生日")
+    ├─ contact_reminder_scheduled (channel_id=1, reminder_id=1) → 邮箱 A
+    ├─ contact_reminder_scheduled (channel_id=2, reminder_id=1) → 邮箱 B
+    └─ contact_reminder_scheduled (channel_id=3, reminder_id=1) → Telegram
+
+当邮箱 A 被停用（手动或失败阈值）时：
+  执行 contactReminders->each->delete()
+    → DELETE FROM contact_reminders WHERE id = 1
+    → 级联触发：DELETE FROM contact_reminder_scheduled WHERE contact_reminder_id = 1
+    → 3 条中间表记录全部被删除！
+
+最终结果：
+  ❌ contact_reminders 表：id=1 记录不存在
+  ❌ 邮箱 A：排程丢失（预期内）
+  ❌ 邮箱 B：排程丢失（非预期！）
+  ❌ Telegram：排程丢失（非预期！）
+  ❌ 该提醒从联系人中永久消失，无法通过重新激活渠道恢复
+```
+
+### 4.5.3 两种停用场景的影响对比
+
+| 停用场景 | 代码位置 | 删除行为 | 对其他渠道的影响 |
+|----------|----------|----------|-----------------|
+| 手动停用渠道 | [ToggleUserNotificationChannel@deleteScheduledReminders#L81-L84](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Settings/ManageNotificationChannels/Services/ToggleUserNotificationChannel.php#L81-L84) | 删除 ContactReminder 模型 | ⚠️ 其他渠道的同一提醒全部丢失 |
+| 失败阈值自动停用 | [ProcessScheduledContactReminders@handle#L71-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/36-monica/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php#L71-L74) | 删除 ContactReminder 模型 | ⚠️ 其他渠道的同一提醒全部丢失 |
+
+> **注意**：手动重新激活渠道时，会调用 `ScheduleAllContactRemindersForNotificationChannel` 为该渠道重新调度所有提醒。但由于 ContactReminder 模型已被删除，其他渠道的提醒已不存在，重新激活也无法恢复。
+
+### 4.5.4 与预期行为的对比
+
+| 预期行为 | 实际行为 | 问题 |
+|----------|----------|------|
+| 仅删除当前渠道的排程（中间表记录） | 删除 ContactReminder 模型本身 | 删除范围过大 |
+| 其他渠道的同一提醒不受影响 | 其他渠道的同一提醒一并丢失 | 跨渠道副作用 |
+| 重新激活渠道后恢复原有提醒 | 提醒已不存在，无法恢复 | 数据不可恢复 |
 
 ---
 
@@ -666,7 +737,7 @@ NotificationsTestController
 9. **发送记录先于统计更新**：`UserNotificationSent` 记录在 `toMail()`/`toTelegram()` 开头创建，确保发送行为可追溯，即使后续步骤失败也有记录
 10. **触发时间标记后置**：`triggered_at` 在 `triggerNotification()` 完成后才更新，确保只有被正确执行完毕后才标记为已触发
 11. **重调度与发送解耦**：重调度逻辑在发送成功后独立执行，避免发送失败时仍可标记为已触发（即使重调度失败）
-12. **容错边界处理**：即使联系人已删除（`contact === null`）仍标记为已触发，避免僵尸调度记录重复执行
+12. **容错边界处理**：即使联系人已删除（`contact === null`）仍标记 `triggered_at`，保持流程完整性
 
 ### 8.4 重调度机制细节
 
@@ -674,3 +745,33 @@ NotificationsTestController
 - **周期性提醒**：`UPDATE` 同一条调度记录的 `scheduled_at` 为下一次时间，避免创建新记录
 - **渠道状态校验**：重调度前检查 `userNotificationChannel.active`，确保渠道未被停用
 - **类型驱动计算**：基于上一次 `scheduled_at` 计算下一次时间，而非当前时间，确保周期准确
+
+### 8.5 边缘情况与潜在问题
+
+#### 8.5.1 一次性提醒的触发时间标记
+
+一次性提醒在重调度阶段删除记录后，`triggered_at` 更新不再生效。这是一个**良性的顺序问题**：
+- 记录已删除，`triggered_at` 是否设置没有业务意义
+- 不影响功能正确性，下次不会重复触发
+
+#### 8.5.2 重调度失败的异常扩散
+
+重调度在 `triggerNotification()` 内部执行，重调度失败会导致**整个流程计入失败**：
+- 通知可能已经发送成功，但因为重调度失败仍会进入 catch 块
+- 渠道 `fails` 计数 +1，可能导致渠道被误停用
+- 属于设计上的**容错粒度问题**：将发送和重调度绑定在同一个事务边界内
+
+#### 8.5.3 僵尸调度记录的重复处理
+
+查询条件仅检查 `scheduled_at <= 当前时间`，**不排除已触发记录**，以下场景会导致重复处理：
+
+| 场景 | 重复处理方式 | 实际影响 |
+|------|-------------|---------|
+| 联系人已删除 | 每次 cron 标记 `triggered_at`，不发送 | 极小，仅空转 |
+| 渠道非活跃（数据不一致时） | 每次 cron 标记 `triggered_at`，不发送 | 极小，仅空转 |
+
+**设计分析**：
+- 正常流程（发送成功 → 重调度）不会产生僵尸记录
+- 仅在异常边界（联系人删除、渠道状态不一致）下出现
+- 代价很低（仅一次 UPDATE），不会造成通知重复发送
+- 属于**容错优先**的设计选择：宁可多标记几次，也不能漏掉应发送的提醒
