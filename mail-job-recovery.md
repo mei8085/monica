@@ -1,62 +1,173 @@
 # 异步任务与邮件失败恢复代码分析
 
-## 关键纠正说明（对照初版的事实修正）
+---
 
-本版对初版分析中以下**事实错误**进行了纠正：
+## 关键纠正说明（含二次修正）
 
-| 初版错误 | 代码事实 |
-|---------|----------|
-| 提醒取数条件包含 `triggered_at IS NULL` | **取数只看 `scheduled_at <= NOW()`，完全不依赖 triggered_at** |
-| triggered_at 是重复发送的主防护 | triggered_at 仅作审计记录和前端展示用，不参与生产调度取数 |
-| 循环提醒"创建下一次调度记录" | 循环提醒**更新同一条记录**的 scheduled_at 到未来时间点，不创建新记录 |
-| 一次性提醒通过 triggered_at 标记完成 | 一次性提醒**直接 DELETE 整条记录** |
-| Reschedule 在 triggered_at 更新之后执行 | 执行顺序：发送 → Reschedule(改scheduled_at/删记录) → updateTriggeredAt |
+| 初版错误 | 首次纠正 | 二次补充澄清 |
+|---------|---------|------------|
+| 取数含 `triggered_at IS NULL` | 取数只看 `scheduled_at <= NOW()` | —— |
+| triggered_at 是主防护 | triggered_at 仅审计/前端用 | —— |
+| 循环提醒创建新记录 | 更新同一条记录的 scheduled_at | Reschedule 用 syncWithoutDetaching 只改 scheduled_at，**不重置 triggered_at** |
+| 一次性提醒标记完成 | 一次性提醒直接 DELETE | —— |
+| Reschedule 在 triggered_at 之后 | 顺序：发送 → Reschedule → updateTriggeredAt | —— |
+| 短期建议：加 `triggered_at IS NULL` | —— | ❌ **此建议错误！会导致循环提醒只触发一次**，见第4节详解 |
 
 ---
 
-## 1. 整体架构概览
+## 1. 队列三参数：retry_after、attempts、tries 的关系
 
-### 1.1 队列基础设施
+### 1.1 参数来源与定义
 
-**配置文件**：[config/queue.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/config/queue.php)
+| 参数 | 定义位置 | 含义 | 数据类型 |
+|------|---------|------|---------|
+| **tries** | Job类属性 `public int $tries` 或 Worker启动参数 `--tries=N` | **最多允许尝试次数**（含首次） | int |
+| **attempts** | `jobs.attempts` 字段（DB） | **已实际尝试次数**，Worker每次领取自增 | unsignedTinyInteger |
+| **retry_after** | `config/queue.php` 连接配置 | 任务被领取后，若 `reserved_at + retry_after < NOW()`，视为"Worker可能挂了"，可被其他Worker重新领取 | int（秒） |
+
+**代码位置**：
+- queue.php retry_after 配置：[config/queue.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/config/queue.php)
+- Worker启动参数：[scripts/docker/queue.sh](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/scripts/docker/queue.sh)
+- jobs表attempts字段：[2022_01_22_183321_create_jobs_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/database/migrations/2022_01_22_183321_create_jobs_table.php)
+
+### 1.2 tries 的优先级与本项目取值
+
+tries 有三层来源，**优先级从高到低**：
 
 ```
-默认连接: sync (生产环境应切换为 database/redis)
-重试超时: retry_after = 90秒 (任务执行超过90秒会被重新放回队列)
-失败驱动: database-uuids (使用UUID标识失败任务)
+1. Job类 $tries 属性          → 最高
+   例：QueuableService::tries=1, SynchronizeAddressBooks::tries=1
+
+2. Worker启动参数 --tries=N    → 默认兜底
+   本项目：--tries=3
+   影响：SendVerificationEmailChannel, ProcessScheduledContactReminders, PushVCard 等
+
+3. 未设置以上两者              → Laravel默认值 1（本项目不会走到）
 ```
 
-**Worker启动参数**：[scripts/docker/queue.sh](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/scripts/docker/queue.sh)
+**本项目各Job的实际 tries 值**：
 
-```bash
-php artisan queue:work --sleep=10 --timeout=0 --tries=3 --queue=high,default,low
+| Job类 | 实际 tries | 来源 |
+|-------|-----------|------|
+| ProcessScheduledContactReminders | 3 | Worker --tries=3 |
+| SendVerificationEmailChannel | 3 | Worker --tries=3 |
+| SetupAccount | 1 | 继承 QueuableService::$tries=1 |
+| UpdateVCard | 1 | 继承 QueuableService::$tries=1 |
+| SynchronizeAddressBooks | 1 | 自身属性 $tries=1 |
+| PushVCard | 3 | Worker --tries=3 |
+| UserInvited（Mailable） | 3 | Worker --tries=3 |
+
+### 1.3 三者的交互时序（正常失败路径）
+
+以 ProcessScheduledContactReminders（tries=3）为例，首次执行抛异常的完整路径：
+
+```
+T=0   调度触发 → dispatch(Job) → 写入 jobs 表
+        jobs {id:1, attempts:0, reserved_at:null, available_at: T}
+        ↓
+T+Δ   Worker1 领取：
+        UPDATE jobs SET attempts=1, reserved_at=T+Δ WHERE id=1
+        ↑ attempts 此时为 1（首次执行 = 第1次尝试）
+        ↓
+      handle() 执行 → 抛出 Exception
+        ↓
+      检查：attempts (1) < tries (3) ?
+        ├─ YES → 释放回队列
+        │        UPDATE jobs SET
+        │          reserved_at = null,
+        │          available_at = NOW() + backoff(本项目=0)
+        │        WHERE id=1
+        │        ↓
+        │      Worker2 领取：attempts=2, reserved_at=T2 ...
+        │        ... 再失败 ...
+        │        ↓
+        │      Worker3 领取：attempts=3, reserved_at=T3 ...
+        │        handle() 再抛异常
+        │        ↓
+        │      检查：attempts (3) < tries (3) ?  → NO
+        └─ NO → 调用 Job::failed() 回调
+                → INSERT INTO failed_jobs ...
+                → DELETE FROM jobs WHERE id=1
 ```
 
-| 参数 | 值 | 含义 |
-|------|----|------|
-| sleep | 10 | 无任务时休眠10秒 |
-| timeout | 0 | 任务执行无超时限制 |
-| tries | 3 | **默认重试3次**（Job类可覆盖） |
-| queue | high,default,low | 按优先级顺序处理 |
+**关键结论 1**：`attempts == tries` 时最后一次尝试仍会执行，失败后才进入 failed_jobs。
 
-### 1.2 数据表结构
+### 1.4 retry_after 静默重试（并发重复的根源）
 
-**调度表 contact_reminder_scheduled**：[2022_02_18_215852_create_reminders_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/database/migrations/2022_02_18_215852_create_reminders_table.php#L47-L54)
+这是三者中最容易被忽略、也是**重复发送风险最大**的机制。
 
-| 字段 | 类型 | 用途 |
-|------|------|------|
-| id | bigIncrements | 主键 |
-| user_notification_channel_id | FK | 通知渠道ID |
-| contact_reminder_id | FK | 提醒ID |
-| scheduled_at | datetime | **下次触发时间（也是唯一的取数条件）** |
-| triggered_at | datetime nullable | **上次触发时间（仅记录，不参与取数过滤）** |
-| created_at / updated_at | timestamps | 时间戳 |
+#### 触发条件
 
-**注意**：contact_reminder_scheduled 是 BelongsToMany 的 pivot 表，通过 `(user_notification_channel_id, contact_reminder_id)` 组合唯一标识一条调度记录。
+```
+reserved_at IS NOT NULL
+AND
+reserved_at + retry_after < NOW()
+```
 
-**任务表 jobs**：[2022_01_22_183321_create_jobs_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/database/migrations/2022_01_22_183321_create_jobs_table.php)
+即：任务被某Worker领取了，但超过 `retry_after` 秒还没完成（没删除也没释放）。
 
-**失败任务表 failed_jobs**：[2019_08_19_000000_create_failed_jobs_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/database/migrations/2019_08_19_000000_create_failed_jobs_table.php)
+#### 本项目的值：retry_after = 90 秒
+
+```php
+// config/queue.php
+'database' => [
+    'retry_after' => 90,
+],
+```
+
+#### 静默重试的完整时序（ProcessScheduledContactReminders 处理大量数据时）
+
+```
+T=0    Worker1 领取：attempts=1, reserved_at=0
+       ↓
+       handle() 开始循环处理 500 条 scheduled 提醒
+       处理到第 200 条时 ...
+       ↓
+T=90   (90秒后) retry_after 超时触发
+       ↓
+       Laravel 自动把这条 jobs 记录的 reserved_at = null
+       （相当于"Worker1可能挂了，释放给别人"）
+       ↓
+T=91   Worker2 领取：
+         UPDATE jobs SET attempts=2, reserved_at=T=91
+         注意：attempts 被自增了（和正常重试一样）
+       ↓
+       此时 Worker1 和 Worker2 **同时在跑 handle()！**
+       ├─ Worker1：继续处理第201~500条
+       └─ Worker2：重新查询DB，处理所有 scheduled_at<=NOW() 的
+           ↓
+           两边的查询结果有交集 → **并发重复发送同一条提醒**
+       ↓
+T=180  (又过了90秒) 如果两个Worker都没跑完，可能再次触发 retry_after
+       attempts=3，继续可能 Worker3 也加入
+       ↓
+T=X    当 attempts(3) == tries(3) 之后，若还没跑完并再触发 retry_after，
+       此时会直接进入 failed_jobs（因为attempts不再小于tries）
+```
+
+**关键结论 2**：
+- retry_after 触发时 `attempts 仍然会自增`（之前的分析"不增加attempts"是错误的）
+- 但 retry_after 可以在 attempts < tries 的范围内**无限重复触发并发执行**
+- 直到 attempts 增加到 attempts >= tries，之后再触发 retry_after 就直接进 failed_jobs
+
+#### 静默重试 vs 正常重试的区别
+
+| 维度 | 正常异常重试 | retry_after 静默重试 |
+|------|------------|-------------------|
+| 触发时机 | handle() 抛出异常 | 执行超时 + reserved_at 过期 |
+| attempts 自增 | ✅ 是 | ✅ 是 |
+| 最大次数 | tries | tries - 1（减去已经占用的次数） |
+| 是否并发 | 否（串行） | ✅ **是**（多个Worker同时执行同一份handle） |
+| 对邮件的影响 | 最多重复 tries 次 | tries 次以内**并发重复** |
+
+### 1.5 人工重试时的参数重置
+
+执行 `php artisan queue:retry <uuid>` 后：
+- 从 `failed_jobs.payload` 反序列化出原始Job
+- 重新 INSERT 到 `jobs` 表，**attempts 被重置为 0**
+- tries 限制重新生效（相当于又有 tries 次机会）
+
+这意味着：人工重试可以绕开 tries 限制，**理论上可以无限次重试**。
 
 ---
 
@@ -75,116 +186,44 @@ $scheduledContactReminders = DB::table('contact_reminder_scheduled')
     ->get();
 ```
 
-**取数条件只有一个：`scheduled_at <= 当前时间`**，完全没有 `triggered_at IS NULL`。
+**取数条件只有 `scheduled_at <= 当前时间`，完全没有 `triggered_at IS NULL`。**
 
-这意味着：
-- triggered_at 是 NULL 还是有值，**不影响**这条记录是否被取出
-- 只要 scheduled_at 还没到未来，每分钟调度都会再次命中这条记录
+### 2.2 triggered_at 字段的真实用途（三处使用均非生产调度）
 
-### 2.2 triggered_at 字段的真实用途
-
-triggered_at 只在以下三个场景使用，**均不参与生产调度取数**：
-
-#### 场景1：前端展示过滤（ViewHelper）
-
-**VaultShowViewHelper.php#L44-L51**：[VaultShowViewHelper.php#L44-L51](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultShowViewHelper.php#L44-L51)
-
-```php
-$channel->contactReminders()
-    ->wherePivot('scheduled_at', '<=', $currentDate->addDays(30))
-    ->wherePivot('triggered_at', null)    // 前端展示只看"未触发过"的
-    ->orderByPivot('scheduled_at', 'asc')
-    ->get()
-```
-
-这只是在 Vault 详情页展示"即将到来的提醒"时过滤已触发的记录，不影响调度任务。
-
-#### 场景2：测试命令过滤（非生产代码）
-
-**TestReminders.php#L43-L45**：[TestReminders.php#L43-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Console/Commands/TestReminders.php#L43-L45)
-
-```php
-$scheduledContactReminders = DB::table('contact_reminder_scheduled')
-    ->where('triggered_at', null)
-    ->get();
-```
-
-这是手动测试用的 Artisan 命令（只在非 production 环境可用），同样不参与生产调度。
-
-#### 场景3：审计记录
-
-triggered_at 记录这条调度最近一次被触发处理的时间，用于问题排查。
-
-### 2.3 调度频率
-
-**routes/console.php**：[console.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/routes/console.php)
-
-```php
-Schedule::job(ProcessScheduledContactReminders::class, 'minutes', 1);
-```
-
-**每分钟执行一次**。注意：代码注释写的是 "every five minutes"，但实际 `minutes(1)` 是每分钟，注释与代码不一致。
+| 场景 | 代码位置 | 用途 | 是否参与生产取数 |
+|------|---------|------|----------------|
+| 前端Vault展示 | [VaultShowViewHelper.php#L48](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultShowViewHelper.php#L48) | 只展示"待触发"的即将到来的提醒 | ❌ |
+| 前端Reminder索引 | [VaultReminderIndexViewHelper.php#L39](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultReminderIndexViewHelper.php#L39) | 同上 | ❌ |
+| 测试命令（非生产） | [TestReminders.php#L44](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Console/Commands/TestReminders.php#L44) | `where('triggered_at', null)` 手动触发用 | ❌ |
+| 审计记录 | [ProcessScheduledContactReminders.php#L83-L85](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php#L83-L85) | `updateScheduledContactReminderTriggeredAt()` 设置触发时间 | ❌（只写不读） |
 
 ---
 
-## 3. 循环提醒怎么重排？—— 更新同一条记录的 scheduled_at
+## 3. 循环提醒怎么重排？—— 更新同一条记录的 scheduled_at，且不重置 triggered_at
 
-### 3.1 处理流程完整链路
-
-**ProcessScheduledContactReminders::handle()** 核心流程：
+### 3.1 处理流程与执行顺序
 
 ```
 取数（scheduled_at <= NOW()）
     ↓
-foreach 循环处理每条记录
+foreach 每条记录
     ├─ try {
-    │   ├─ 查询 ContactReminder 和 Contact
+    │   ├─ 查询 ContactReminder, Contact
     │   ├─ triggerNotification()
-    │   │   ├─ 检查 channel->active（不活跃直接return）
-    │   │   ├─ Notification::route()->notify()  ← 实际发送邮件/Telegram
-    │   │   ├─ increment('number_times_triggered')  ← 触发次数+1
-    │   │   └─ RescheduleContactReminderForChannel::execute()  ← 重排（改scheduled_at或删记录）
-    │   │
-    │   └─ updateScheduledContactReminderTriggeredAt()  ← 设置 triggered_at = NOW()
+    │   │   ├─ if (!channel->active) return
+    │   │   ├─ Notification::route()->notify()      ← ① 发送
+    │   │   ├─ increment number_times_triggered      ← ② 计数+1
+    │   │   └─ RescheduleContactReminderForChannel   ← ③ 重排 scheduled_at
+    │   └─ updateScheduledContactReminderTriggeredAt() ← ④ 设 triggered_at = NOW()
     │
-    └─ } catch (\Exception $e) {
-        ├─ Log::error()
-        ├─ UserNotificationSent::create(..., error => ...)  ← 记录失败
-        ├─ channel->fails++
-        ├─ fails >= 10 ? 禁用channel并删除其所有调度 : 继续
-        └─ channel->save()
+    └─ } catch { ... }
 ```
 
-**关键执行顺序**：
-1. **先发送通知**
-2. **然后 Reschedule**（把 scheduled_at 推到未来 / 删除一次性记录）
-3. **最后更新 triggered_at**
+**顺序：①发送 → ②计数 → ③Reschedule（改scheduled_at/删记录） → ④triggered_at**
 
-### 3.2 RescheduleContactReminderForChannel 重排逻辑
+### 3.2 Reschedule 只改 scheduled_at，不改 triggered_at
 
-**类定义**：[RescheduleContactReminderForChannel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannel.php)
-
-```php
-public function execute(array $data): void
-{
-    if (! $this->userNotificationChannel->active) {
-        throw new ModelNotFoundException('The user notification channel is not active anymore.');
-    }
-
-    if ($this->contactReminder->type !== ContactReminder::TYPE_ONE_TIME) {
-        $this->schedule();  // 循环提醒：更新 scheduled_at
-    } else {
-        // 一次性提醒：直接 DELETE 整条记录
-        DB::table('contact_reminder_scheduled')
-            ->where('id', $this->data['contact_reminder_scheduled_id'])
-            ->delete();
-    }
-}
-```
-
-### 3.3 循环提醒的 scheduled_at 更新方式
-
-**schedule() 方法**：[RescheduleContactReminderForChannel.php#L62-L87](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannel.php#L62-L87)
+**RescheduleContactReminderForChannel::schedule()**：[RescheduleContactReminderForChannel.php#L190-L218](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannel.php#L190-L218)
 
 ```php
 private function schedule(): void
@@ -192,466 +231,481 @@ private function schedule(): void
     $record = DB::table('contact_reminder_scheduled')
         ->where('id', $this->data['contact_reminder_scheduled_id'])
         ->first();
-
-    // 基于当前 scheduled_at 计算下一次时间
     $this->upcomingDate = Carbon::createFromFormat('Y-m-d H:i:s', $record->scheduled_at);
 
-    switch ($this->contactReminder->type) {
-        case ContactReminder::TYPE_RECURRING_DAY:
-            $this->upcomingDate = $this->upcomingDate->addDay();      // +1天
-            break;
-        case ContactReminder::TYPE_RECURRING_MONTH:
-            $this->upcomingDate = $this->upcomingDate->addMonth();    // +1月
-            break;
-        case ContactReminder::TYPE_RECURRING_YEAR:
-            $this->upcomingDate = $this->upcomingDate->addYear();     // +1年
-            break;
-    }
+    // +1天 / +1月 / +1年（基于原 scheduled_at 计算，非当前时间）
+    switch ($this->contactReminder->type) { ... }
 
-    // 用 syncWithoutDetaching 更新 pivot 表（不创建新记录）
+    // 只传 scheduled_at，不传 triggered_at
     $this->contactReminder->userNotificationChannels()
         ->syncWithoutDetaching([
             $this->userNotificationChannel->id => [
                 'scheduled_at' => $this->upcomingDate,
+                // 注意：没有 triggered_at => null  ← 关键！
             ]
         ]);
 }
 ```
 
-**重点**：
-- `syncWithoutDetaching` 通过 `(contact_reminder_id, user_notification_channel_id)` 组合定位 pivot 记录
-- **更新的是同一条记录**的 scheduled_at 字段，不插入新记录
-- 只更新 scheduled_at，triggered_at 字段保持不变（由随后的 updateTriggeredAt 设置）
+**syncWithoutDetaching 的行为**：对传入的 pivot 字段做 UPDATE，**不传的字段保持原值不变**。
+所以 Reschedule 之后，triggered_at 仍保持之前的值（由后面的 updateTriggeredAt 设置为 NOW()）。
 
-### 3.4 一次性提醒的处理
+### 3.3 一次性提醒 vs 循环提醒的区别
 
-对于 `TYPE_ONE_TIME`：
+| 类型 | Reschedule 行为 | triggered_at |
+|------|----------------|-------------|
+| TYPE_ONE_TIME | DELETE 整条记录 | ——（记录已删除） |
+| TYPE_RECURRING_* | UPDATE scheduled_at → 未来，triggered_at 不变 | 随后被设为 NOW() |
+
+### 3.4 测试代码印证
+
+[RescheduleContactReminderForChannelTest.php#L81-L86](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/tests/Unit/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannelTest.php#L81-L86)：
+
 ```php
+// 初始 scheduled_at=2018-01-01，triggered_at=null
+(new RescheduleContactReminderForChannel)->execute([...]);
+
+// 断言：scheduled_at → 2018-01-02，triggered_at 仍为 null
+$this->assertDatabaseHas('contact_reminder_scheduled', [
+    'scheduled_at' => '2018-01-02 00:00:00',
+    'triggered_at' => null,   // Reschedule 不改变它
+]);
+```
+
+### 3.5 真正的防重机制
+
+防重复发送不靠 triggered_at，而是：
+> **Reschedule 把 scheduled_at 推到未来，使下一次查询 `scheduled_at <= NOW()` 不再命中。**
+
+脆弱点：如果 ①发送成功 但 ③Reschedule 没执行（进程被杀/异常），scheduled_at 仍是过去时间，下次调度（每分钟）会再次命中。
+
+---
+
+## 4. triggered_at 过滤会不会影响循环提醒？—— 会！（加过滤必须同时重置）
+
+### 4.1 初版建议的错误：只加过滤不重置 = 循环提醒只触发一次
+
+**之前的错误建议**：
+```php
+// ❌ 只加这行会出问题！
+$scheduledContactReminders = DB::table('contact_reminder_scheduled')
+    ->where('scheduled_at', '<=', $currentDate)
+    ->whereNull('triggered_at')   // ← 只加这行
+    ->get();
+```
+
+**会发生什么（以日循环提醒为例）**：
+
+```
+Day1 (2024-01-01)
+  初始状态：scheduled_at=2024-01-01 09:00, triggered_at=null
+  取数：WHERE scheduled_at <= 09:00 AND triggered_at IS NULL → 命中 ✅
+  发送 → Reschedule: scheduled_at=2024-01-02 09:00 → triggered_at=2024-01-01 09:00
+  最终状态：scheduled_at=2024-01-02 09:00, triggered_at=2024-01-01 09:00
+
+Day2 (2024-01-02)
+  状态：scheduled_at=2024-01-02 09:00, triggered_at=2024-01-01 09:00
+  取数：WHERE scheduled_at <= 09:00 AND triggered_at IS NULL
+        → triggered_at 有值 = 2024-01-01 09:00 → 不匹配 → ❌ 不命中！
+  结果：这一天不发送
+
+Day3 (2024-01-03)
+  状态同上，仍不命中 ...
+  结果：永远不再发送 = 循环提醒变成一次性提醒！
+```
+
+**根因**：Reschedule 只改 scheduled_at，**不重置 triggered_at**。第一次设了 triggered_at = NOW() 之后就再也清不掉了。
+
+### 4.2 为什么 TestReminders 有过滤却能正常工作？
+
+对比看 [TestReminders.php#L43-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Console/Commands/TestReminders.php#L43-L71)：
+
+```php
+// TestReminders 有 triggered_at 过滤
+$scheduledContactReminders = DB::table('contact_reminder_scheduled')
+    ->where('triggered_at', null)
+    ->get();
+
+foreach (...) {
+    Notification::route(...)->notify(...);   // 发送
+
+    (new RescheduleContactReminderForChannel)->execute([...]);  // Reschedule
+    // ↑ 注意：TestReminders 调用了 Reschedule
+    // ↑ 注意：TestReminders **没有调用 updateScheduledContactReminderTriggeredAt()**
+    // 所以 triggered_at 永远保持 null
+}
+```
+
+TestReminders 有过滤但**从来不设置 triggered_at**，所以不存在被卡死的问题。但它也因此**失去了 triggered_at 作为幂等边界的意义**。
+
+### 4.3 正确的 triggered_at 幂等方案：过滤 + Reschedule 时重置
+
+如果要用 triggered_at 作为幂等边界（防 retry_after 并发重复、防人工重试），必须**同时改两处**：
+
+#### 修改1：取数加过滤（ProcessScheduledContactReminders）
+
+```php
+$scheduledContactReminders = DB::table('contact_reminder_scheduled')
+    ->where('scheduled_at', '<=', $currentDate)
+    ->whereNull('triggered_at')          // ← 加这行
+    ->get();
+```
+
+#### 修改2：Reschedule 时重置 triggered_at（RescheduleContactReminderForChannel::schedule）
+
+```php
+$this->contactReminder->userNotificationChannels()
+    ->syncWithoutDetaching([
+        $this->userNotificationChannel->id => [
+            'scheduled_at' => $this->upcomingDate,
+            'triggered_at' => null,      // ← 加这行：把 triggered_at 清空
+        ]
+    ]);
+```
+
+#### 修改2的补充：一次性提醒不用改（直接 DELETE）
+
+```php
+// TYPE_ONE_TIME 的分支已经是 DELETE，无需额外处理
 DB::table('contact_reminder_scheduled')
     ->where('id', $this->data['contact_reminder_scheduled_id'])
     ->delete();
 ```
 
-直接 DELETE 整条记录，不再保留。
+#### 加了两处修改后的完整生命周期（日循环提醒）
 
-### 3.5 测试验证（RescheduleContactReminderForChannelTest）
+```
+Day1:
+  初始：scheduled=01-01 09:00, triggered=null
+  取数：scheduled<=09:00 AND triggered IS NULL → ✅ 命中
+  发送 → Reschedule: scheduled=01-02 09:00, triggered=null（被重置）
+       → updateTriggeredAt: triggered=01-01 09:00（最后设置）
+  最终：scheduled=01-02 09:00, triggered=01-01 09:00 ← 有值
 
-测试文件确认了上述行为：[RescheduleContactReminderForChannelTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/tests/Unit/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannelTest.php)
+Day2:
+  状态：scheduled=01-02 09:00, triggered=01-01 09:00
+  取数：scheduled<=09:00 AND triggered IS NULL
+        → triggered 有值 = ❌ 不命中 ← 这里还是不命中啊！？
 
-以日循环提醒为例：
-```php
-// 初始：scheduled_at = 2018-01-01
-$id = DB::table('contact_reminder_scheduled')->insertGetId([
-    'scheduled_at' => '2018-01-01 00:00:00',
-    ...
-]);
-
-// 执行 Reschedule
-(new RescheduleContactReminderForChannel)->execute([...]);
-
-// 断言：同一条记录的 scheduled_at 更新为 2018-01-02
-$this->assertDatabaseHas('contact_reminder_scheduled', [
-    'scheduled_at' => '2018-01-02 00:00:00',
-    'triggered_at' => null,   // syncWithoutDetaching 不改 triggered_at
-]);
+等一下，这里有问题。让我再梳理一遍顺序...
 ```
 
-### 3.6 真正的"去重"机制
+**⚠️ 顺序问题**：即使 Reschedule 中把 triggered_at 重置为 null，紧接着的 `updateTriggeredAt` 又把它设回 NOW() 了！
 
-既然取数不看 triggered_at，那么防止重复发送的真正机制是：
+让我重排时序：
+```
+③ Reschedule 执行：
+   UPDATE contact_reminder_scheduled
+   SET scheduled_at = '2024-01-02 09:00',
+       triggered_at = NULL            ← 先清空
+   WHERE id = ?
+   ↓
+④ updateTriggeredAt 执行：
+   UPDATE contact_reminder_scheduled
+   SET triggered_at = '2024-01-01 09:00'   ← 又设置了
+   WHERE id = ?
+```
 
-**Reschedule 把 scheduled_at 推到未来，使下一次查询 `scheduled_at <= NOW()` 不再命中这条记录。**
+**结果**：triggered_at 最终还是有值。Day2 还是不命中。
 
-这意味着防重复完全依赖 **Reschedule 是否在发送成功后被执行**。如果发送成功但 Reschedule 未执行，scheduled_at 仍是过去时间，下次调度（每分钟）会再次命中。
+所以还需要**第3处修改**：
+
+#### 修改3：把 updateTriggeredAt 移到 Reschedule 之前执行
+
+即把顺序从 `发送 → 计数 → Reschedule → updateTriggeredAt` 改为 `发送 → 计数 → updateTriggeredAt → Reschedule`
+
+```php
+// 在 triggerNotification() 内，或者在 try 块中：
+private function triggerNotification(...)
+{
+    ...
+    Notification::route(...)->notify(...);   // ① 发送
+    $this->updateNumberOfTimesTriggered(...); // ② 计数
+
+    // 把 triggered_at 设置移到这里（Reschedule 之前）
+    $this->updateScheduledContactReminderTriggeredAt($scheduledReminder); // ③ 先标记已触发
+
+    // 最后才 Reschedule（会重置 triggered_at = null，因为 scheduled_at 已经推到未来了）
+    (new RescheduleContactReminderForChannel)->execute([...]); // ④ 重排 + 重置 triggered_at=null
+}
+
+// try 块里就不再重复调用 updateTriggeredAt 了
+```
+
+**改完后的时序**：
+
+```
+Day1:
+  初始：scheduled=01-01 09:00, triggered=null
+  取数：✅ 命中
+  ① 发送
+  ② 计数
+  ③ updateTriggeredAt → triggered=01-01 09:00（有值）
+  ④ Reschedule → scheduled=01-02 09:00, triggered=null（被重置回 null）
+  最终：scheduled=01-02 09:00, triggered=null ← 关键：最终 triggered_at 是 null！
+
+Day2:
+  状态：scheduled=01-02 09:00, triggered=null
+  取数：scheduled<=09:00 AND triggered IS NULL → ✅ 命中！
+  ... 循环继续
+```
+
+**三处修改缺一不可**：
+
+| 修改 | 作用 | 不加的后果 |
+|------|------|----------|
+| 1. 取数加 `triggered_at IS NULL` | 幂等边界：同一次调度不重复处理 | retry_after 并发重复、人工重试重复 |
+| 2. Reschedule 同步重置 `triggered_at = null` | 下一周期可重新命中 | 循环提醒只触发一次（Day2起不命中） |
+| 3. 把 updateTriggeredAt 移到 Reschedule 之前 | 先标记"本周期已处理"，再重置"下周期待处理" | Reschedule 刚清空，updateTriggeredAt 又覆盖为有值 → Day2 仍不命中 |
 
 ---
 
-## 4. 人工重试会不会重复发送？—— 视 Reschedule 是否成功而定
+## 5. 人工重试会不会重复发送？—— 分情况（含并发场景）
 
-### 4.1 ProcessScheduledContactReminders 的 Job 载荷特点
+### 5.1 ProcessScheduledContactReminders 的特性
 
-这个Job的构造函数**没有任何参数**：
+这个Job无构造参数、每次 handle() 都重新查询DB。人工重试 = 重新跑一遍完整的取数+处理逻辑。
+
+### 5.2 各场景判定矩阵
+
+| 场景 | Reschedule 状态 | scheduled_at 状态 | channel 状态 | 人工重试结果 | 最多重复 |
+|------|----------------|------------------|-------------|-------------|---------|
+| A：发送前异常 | 未执行 | 过去 | active | ✅ 不重复（没发出去） | 0 |
+| B：正常完成 | 成功 | 未来/已删 | — | ✅ 不重复（取数命中不了） | 0 |
+| C：发送成、Reschedule败，catch住 | 失败 | 过去 | active | ❌ **重复**（每分钟调度+人工重试都会命中），直到熔断 | ≤10次 |
+| D：发送成、Reschedule成，进程被杀 | 成功 | 未来 | — | ✅ 不重复 | 0 |
+| E：发送成、Reschedule未执行，进程被杀 | 未执行 | 过去 | active | ❌ **重复** | ≤3(tries)×N |
+| F：retry_after 并发 + Reschedule 部分成功 | 不同Worker执行到不同阶段 | — | — | ❌ **不确定**（取决于哪条Worker先改DB） | 高并发下难预估 |
+
+### 5.3 加上 triggered_at 幂等方案后的人工重试
+
+假设已实施了第4节的三处修改：
+
+```
+第一次执行（部分成功）：
+  → 发送了提醒1、2（成功）
+  → triggered_at 分别被设为 NOW()
+  → Reschedule 重置 triggered_at=null 之前进程被杀
+  → 最终：提醒1、2的 scheduled_at=过去, triggered_at=有值（没被Reschedule重置）
+  → 提醒3、4的 scheduled_at=过去, triggered_at=null（还没处理到）
+
+人工重试时：
+  取数：WHERE scheduled_at<=NOW() AND triggered_at IS NULL
+    → 提醒1、2：triggered_at 有值 → ❌ 不命中 → ✅ 不重复
+    → 提醒3、4：triggered_at 是 null → ✅ 命中 → 正常发送
+```
+
+**结论**：三处修改都加之后，人工重试**只会补发没处理过的记录**，不会重复发送已经成功发送的。
+
+---
+
+## 6. 其他邮件任务的重试与恢复
+
+### 6.1 验证邮件（SendVerificationEmailChannel）
+
+- 无 `$tries` → 默认 tries=3
+- **无任何幂等性检查**：不检查 `verified_at`，不检查发送记录
+- retry_after 静默重试：可重复发送（1 < attempts < 3 范围内）
+- 人工重试 → 反序列化 $channel → 肯定重复发送
+- 缓解：添加 `verified_at` 检查
+
+### 6.2 邀请邮件（UserInvited）
+
+- Mailable 自带 ShouldQueue
+- 无 tries、无幂等、人工重试必重复
+
+### 6.3 测试邮件（SendTestEmail）
+
+- 同步执行，不走队列，无重试问题
+
+---
+
+## 7. 风险矩阵与关键风险点
+
+### 7.1 重复发送风险矩阵
+
+| 任务类型 | tries | 幂等防护 | retry_after 并发风险 | 人工重试是否重复 |
+|---------|-------|----------|-------------------|-----------------|
+| 提醒邮件 | 3 | Reschedule推scheduled_at（脆弱） | ⚠️ 高（无悲观锁） | 视 Reschedule 成功否 |
+| 验证邮件 | 3 | 无 | ⚠️ 中（单任务执行快） | ✅ 是 |
+| 邀请邮件 | 3 | 无 | ⚠️ 中（单任务执行快） | ✅ 是 |
+| DAV同步类 | 1 | etag/幂等接口 | ✅ 低 | ✅ 否 |
+
+### 7.2 最高风险：ProcessScheduledContactReminders 的 retry_after 并发
+
+- 每分钟调度一次，大量提醒时处理可能超过90秒
+- retry_after 触发后 attempts 自增，新 Worker 并发执行同一批数据
+- **没有悲观锁（FOR UPDATE SKIP LOCKED）、没有 triggered_at 条件、没有唯一键校验**
+- 结果：同一批提醒可能被2~3个Worker并发处理 → 群发重复邮件
+
+**缓解（低成本）**：
+1. 给 ProcessScheduledContactReminders 加 `$timeout = 60`（小于 retry_after=90，超时直接杀进程而非并发）
+2. 取数SQL改用悲观锁（database驱动支持）：
+   ```php
+   $scheduledContactReminders = DB::table('contact_reminder_scheduled')
+       ->where('scheduled_at', '<=', $currentDate)
+       ->lockForUpdate()         // ← 加悲观锁
+       ->get();
+   ```
+   （但注意：laravel database 队列的 Worker 取 jobs 时也有自己的锁机制，这个是业务表的锁）
+
+---
+
+## 8. 代码走向流程图（完整纠正版）
+
+### 8.1 循环提醒的一次完整生命周期
+
+```
+[初始状态]
+  contact_reminder_scheduled:
+    id=123, channel_id=7, reminder_id=42
+    scheduled_at = 2024-01-01 09:00:00
+    triggered_at = null
+
+Schedule 每分钟触发 ProcessScheduledContactReminders
+    ↓
+handle()
+  DB查询: WHERE scheduled_at <= NOW()  AND triggered_at IS NULL?
+          ↑ 注意：生产代码只有第一个条件，第二个条件不存在！
+    ↓
+  命中 id=123
+    ↓
+  try {
+    findOrFail(ContactReminder=42, UserNotificationChannel=7)
+      ↓
+    triggerNotification()
+      ├─ if (!channel->active) return
+      ├─ Notification::route('mail', ...)->notify(ReminderTriggered)
+      │     └─ toMail(): UserNotificationSent::create() → 写日志 → 返回 MailMessage
+      ├─ UPDATE contact_reminders SET number_times_triggered += 1
+      └─ RescheduleContactReminderForChannel::execute()
+            ├─ TYPE != ONE_TIME:
+            │   原 scheduled_at = 2024-01-01
+            │   upcomingDate = 2024-01-02 (+1 day)
+            │   syncWithoutDetaching:
+            │     UPDATE pivot SET scheduled_at = 2024-01-02
+            │           (triggered_at 不变，仍是 null)
+            └─ TYPE == ONE_TIME:
+                  DELETE FROM pivot WHERE id=123
+    ↓
+    updateScheduledContactReminderTriggeredAt():
+      UPDATE pivot SET triggered_at = NOW() WHERE id=123
+  }
+  catch (Exception $e) {
+    Log::error
+    UserNotificationSent::create(error => ...)
+    channel->fails++
+    fails >= 10 → channel->active = false + 删除其所有调度
+    channel->save()
+  }
+
+[最终状态（循环提醒）]
+  scheduled_at = 2024-01-02 09:00:00  ← 推到未来
+  triggered_at = 2024-01-01 09:00:xx  ← 标记这次触发时间
+                        ↑ 注意：下次查询 (WHERE scheduled_at<=2024-01-02 09:00)
+                                时，triggered_at 不参与过滤！
+                                只看 scheduled_at 已 ≤ NOW()，所以会命中。
+```
+
+### 8.2 retry_after / attempts / tries 交互图
+
+```
+                         ┌──────────────────────┐
+                         │  dispatch() → jobs表  │
+                         │  attempts=0           │
+                         └──────────┬───────────┘
+                                    ↓
+                         ┌──────────────────────┐
+                         │ Worker领取            │
+                         │ attempts++            │
+                         │ reserved_at = NOW()   │
+                         └──────────┬───────────┘
+                                    ↓
+               ┌─── attempts < tries ? ───┐
+               │ YES                       NO │
+               ↓                            ↓
+    ┌──────────────────────┐      ┌──────────────────────┐
+    │  handle() 执行中...  │      │  → failed_jobs       │
+    │                      │      │  → DELETE jobs       │
+    │  ┌─ 超过 retry_after? │      └──────────────────────┘
+    │  │ YES                │
+    │  │                    │
+    │  ↓                    │
+    │ reserved_at = null    │
+    │ （释放给其他Worker）   │
+    │  ──→ 新Worker领取     │
+    │      attempts++      │
+    │      → 回到判断框     │
+    └─── 正常完成/异常 ────┘
+         异常时：
+           释放回队列(reserved_at=null)
+           → Worker再次领取
+           → attempts++
+           → 回到判断框
+```
+
+---
+
+## 9. 优化建议（纠正版）
+
+### 9.1 短期优化（低风险）
+
+#### ① 给 ProcessScheduledContactReminders 加 `$timeout = 60`
 
 ```php
 class ProcessScheduledContactReminders implements ShouldQueue
 {
-    use Dispatchable, InteractsWithQueue, Queueable;
-    // 无 SerializesModels
-    // 构造函数无参数
-    // handle() 内部每次都重新查询 DB
+    public int $timeout = 60;  // 小于 retry_after=90，避免并发
+    ...
+}
+```
+60秒超时直接杀进程，不是并发多个Worker。代价是：大量提醒时部分提醒可能在被杀时没处理完（但有tries=3兜底，下次重试）。
+
+#### ② 验证邮件添加 `verified_at` 检查
+
+```php
+// SendVerificationEmailChannel::handle()
+if ($this->channel->verified_at !== null) {
+    return;
 }
 ```
 
-**载荷极其轻量**，不携带任何提醒数据。每次执行（包括人工重试）都会在 `handle()` 内重新执行：
+#### ③ 取数加悲观锁（避免并发Worker重复处理）
 
 ```php
 $scheduledContactReminders = DB::table('contact_reminder_scheduled')
     ->where('scheduled_at', '<=', $currentDate)
+    ->lockForUpdate()    // 事务内加悲观锁
     ->get();
 ```
+需要包在 DB::transaction() 中。并发Worker会排队而不是重复取数。
 
-### 4.2 人工重试的重复发送场景判定
+### 9.2 中期优化（需同时修改多处）
 
-人工执行 `php artisan queue:retry <uuid>` 后，Job 会重新跑一遍完整的 handle()。是否重复发送，取决于**上一次执行时 Reschedule 有没有成功**：
+#### ④ 三处联动修改，引入 triggered_at 作为幂等边界
 
-#### 场景A：发送前失败（取数/查询阶段异常）
+**修改1**：取数加 `triggered_at IS NULL`
 
+**修改2**：RescheduleContactReminderForChannel::schedule() 在 syncWithoutDetaching 时同步设置 `triggered_at => null`
+
+**修改3**：在 ProcessScheduledContactReminders 中，把 `updateScheduledContactReminderTriggeredAt()` 的调用从 try 块末尾移到 `Reschedule` 调用之前（即 triggerNotification 方法内）
+
+三处必须联动，缺一不可（详见第4.3节）。
+
+#### ⑤ contact_reminder_scheduled 表加唯一索引
+
+```sql
+ALTER TABLE contact_reminder_scheduled
+ADD UNIQUE KEY uk_channel_reminder
+  (user_notification_channel_id, contact_reminder_id);
 ```
-DB::table(...) 或 findOrFail 抛出异常
-    ↓
-Reschedule 未执行，scheduled_at 仍是过去时间
-    ↓
-人工重试 → 重新查询 → 命中 → 正常发送（不算重复）
-```
-**结果**：✅ 不重复（之前根本没发出去）
+防止 syncWithoutDetaching 在并发下产生重复 pivot 记录（目前代码逻辑上不会重复，但表结构无约束）。
 
-#### 场景B：发送成功，Reschedule 成功，进程在 updateTriggeredAt 之后正常结束
+### 9.3 长期优化（高风险，架构调整）
 
-```
-发送成功
-    ↓
-Reschedule 成功 → scheduled_at 被推到未来（或记录被删除）
-    ↓
-updateTriggeredAt 成功
-    ↓
-Job 正常完成
-```
-人工重试时：
-- 循环提醒：scheduled_at 在未来 → 不命中 → ✅ 不重复
-- 一次性提醒：记录已被 DELETE → 不命中 → ✅ 不重复
-
-**结果**：✅ 不重复
-
-#### 场景C：发送成功，但 Reschedule 失败/未执行，Job 整体异常
-
-```
-Notification::route()->notify() → 邮件已成功发出
-    ↓
-RescheduleContactReminderForChannel::execute() 抛出异常（如 channel 突然被禁用）
-    ↓
-Reschedule 未完成 → scheduled_at 仍是过去时间
-    ↓
-异常未被catch（Reschedule 在 try 块内但抛异常了？——实际上有catch）
-```
-
-**⚠️ 注意**：ProcessScheduledContactReminders 的 try-catch 包裹了整个单条记录的处理逻辑，包括 Reschedule。Reschedule 失败会被 catch 住，不会冒泡到队列层。因此：
-
-```
-Reschedule 异常 → catch 捕获 → 记录错误 → channel->fails++
-    ↓
-Job 继续处理下一条记录，不会整体失败
-    ↓
-但这条记录的 scheduled_at 仍是过去时间，triggered_at 未被设置
-    ↓
-下一分钟调度再次命中 → 又尝试发送 → 可能重复！
-```
-
-熔断器（fails >= 10 自动禁用 channel）最多能兜住 10 次重复。
-
-#### 场景D：发送成功，Reschedule 成功，但进程在 Job 完成前被杀 / 超过 retry_after=90秒
-
-```
-发送成功（邮件已发出）
-    ↓
-Reschedule 成功 → scheduled_at 已推到未来
-    ↓
-进程被杀或超过90秒
-    ↓
-队列检测到 retry_after 超时 → 把 Job 重新放回队列
-    ↓
-人工重试或队列自动重试 → handle() 重新执行
-    ↓
-查询 scheduled_at <= NOW() → 这条记录 scheduled_at 已在未来 → 不命中
-```
-
-**结果**：✅ 不重复（因为 Reschedule 已成功把 scheduled_at 推到未来）
-
-#### 场景E：发送成功，Reschedule 未执行，进程被杀
-
-```
-发送成功（邮件已发出）
-    ↓
-还没执行 Reschedule → 进程被杀
-    ↓
-scheduled_at 仍是过去时间
-    ↓
-重试 → 重新查询 → 命中 → 再次发送！
-```
-
-**结果**：❌ **重复发送**
-
-### 4.3 重复发送场景总结
-
-| 场景 | Reschedule是否成功 | 人工重试是否重复 | 最多重复次数 |
-|------|-------------------|-----------------|-------------|
-| A：发送前失败 | 未执行 | 否（没发出去） | 0 |
-| B：正常完成 | 成功 | 否 | 0 |
-| C：发送成功、Reschedule失败、catch住 | 失败 | **是（每分钟调度都会命中）** | ≤10（熔断器） |
-| D：发送成功、Reschedule成功、进程被杀 | 成功 | 否 | 0 |
-| E：发送成功、Reschedule未执行、进程被杀 | 未执行 | **是** | ≤3（队列tries） |
-
-### 4.4 ProcessScheduledContactReminders 的队列重试
-
-这个Job没有设置 `$tries`，使用 Worker 默认值 `--tries=3`。队列层面最多自动重试 2 次（加上首次执行共 3 次）。
-
-但更危险的是 `retry_after=90` 秒的静默重试：
-- 如果 handle() 处理大量提醒，执行超过 90 秒
-- 队列认为 Worker 挂了，把 Job 重新放回队列
-- 此时原来的 Worker 可能还在运行，同时新的 Worker 也开始执行
-- 两个 Worker 同时取数，可能命中同一条记录 → **并发重复发送**
-
----
-
-## 5. 其他邮件任务的重试与恢复
-
-### 5.1 验证邮件（SendVerificationEmailChannel）
-
-**类定义**：[SendVerificationEmailChannel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Settings/ManageNotificationChannels/Jobs/SendVerificationEmailChannel.php)
-
-```php
-class SendVerificationEmailChannel implements ShouldQueue
-{
-    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
-
-    protected UserNotificationChannel $channel;  // 序列化只存ID
-
-    public function handle()
-    {
-        if ($this->channel->type !== UserNotificationChannel::TYPE_EMAIL) {
-            return;
-        }
-        Mail::to($this->channel->content)
-            ->send(new UserNotificationChannelEmailCreated($this->channel));
-    }
-}
-```
-
-**重试与重复分析**：
-- 无 `$tries` → 默认 3 次队列重试
-- 无 `$backoff` → 重试无间隔
-- **无任何幂等性检查**（没有检查 `verified_at`，没有检查是否已发送过）
-- 人工重试 → 反序列化 `$channel` → 重新发送 → **肯定重复**
-- 所有邮件中的验证链接相同（同一个 `verification_token`），用户点击任意一封即可验证
-
-### 5.2 邀请邮件（UserInvited）
-
-**类定义**：[UserInvited.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Mail/UserInvited.php)
-
-```php
-class UserInvited extends Mailable implements ShouldQueue
-{
-    use Queueable, SerializesModels;
-    // 无 $tries → 默认3次
-    // 无幂等性检查
-}
-```
-
-Mailable 本身实现 `ShouldQueue`，邮件自动进入队列。人工重试会重复发送。
-
-### 5.3 测试邮件（SendTestEmail）
-
-**类定义**：[SendTestEmail.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Settings/ManageNotificationChannels/Services/SendTestEmail.php)
-
-- **同步执行**（不实现 ShouldQueue），不走队列
-- 失败直接抛异常，无重试
-- 不存在人工重试问题
-
----
-
-## 6. 其他重试机制
-
-### 6.1 QueuableService 基类（tries=1，不重试）
-
-**QueuableService.php**：[QueuableService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Services/QueuableService.php)
-
-```php
-abstract class QueuableService extends BaseService implements ShouldQueue
-{
-    public int $tries = 1;  // 只跑1次，不重试
-}
-```
-
-子类：SetupAccount、UpdateVCard 等。人工重试不受此限制（从 failed_jobs 恢复后 attempts 重置）。
-
-### 6.2 DAV任务的业务内重试
-
-**PushVCard**：[PushVCard.php#L80-L105](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Contact/DavClient/Jobs/PushVCard.php#L80-L105)
-
-```php
-private function pushDistant(int $depth = 1): string
-{
-    try {
-        $response = $this->subscription->getClient()
-            ->request('PUT', $this->uri, $this->card, $this->headers());
-        return $response->header('Etag');
-    } catch (RequestException $e) {
-        if ($depth > 0 && $e->response->status() === 412) {
-            $this->mode = self::MODE_MATCH_NONE;
-            return $this->pushDistant(--$depth);  // 412时内部重试1次
-        } else {
-            $this->fail($e);
-            throw $e;
-        }
-    }
-}
-```
-
-业务逻辑内对 412 状态码重试1次，与队列层面的重试是**叠加关系**。
-
-### 6.3 失败清理机制
-
-```php
-Schedule::command('queue:prune-failed --hours=48', 'daily');
-```
-失败任务最多保留 48 小时，之后自动清除，无法再人工重试。
-
----
-
-## 7. 关键风险点总结
-
-### 7.1 提醒邮件的防重机制实际很脆弱
-
-**错误认知**：triggered_at 过滤 + 异常捕获 = 可靠防重
-
-**代码事实**：
-- 取数不依赖 triggered_at（这是最大的误解）
-- 真正防重靠 Reschedule 把 scheduled_at 推到未来
-- 如果发送成功但 Reschedule 未执行，每分钟调度都会再次命中
-
-**重复发送的时间窗口**：
-
-```
-发送成功 → Reschedule 执行之间的时间窗
-          |<-------->|
-          这段时间内进程被杀/异常，就会重复
-
-另外：C调度每分钟执行，如果 Reschedule 失败（被catch），
-      下次调度会重新命中，直到熔断器触发（最多10次）
-```
-
-### 7.2 重复发送风险矩阵
-
-| 任务类型 | 队列tries | 幂等防护 | 人工重试是否重复 | 风险等级 |
-|---------|-----------|----------|-----------------|----------|
-| 提醒邮件 | 3 | Reschedule推scheduled_at到未来 | **视Reschedule是否成功而定** | ⚠️⚠️ 中高 |
-| 验证邮件 | 3 | 无 | **是** | ⚠️⚠️⚠️ 高 |
-| 邀请邮件 | 3 | 无 | **是** | ⚠️⚠️⚠️ 高 |
-| 测试邮件 | 0（同步） | 无 | 不适用 | ✅ 低 |
-| DAV同步 | 1+业务重试1次 | etag机制 | 否（幂等） | ✅ 低 |
-| SetupAccount | 1 | 数据初始化幂等 | 低风险 | ✅ 低 |
-
-### 7.3 retry_after 静默重试风险
-
-```php
-'retry_after' => 90,  // config/queue.php
-```
-
-- 超过 90 秒自动释放回队列，**不增加 attempts**，不受 tries 限制
-- 如果 ProcessScheduledContactReminders 处理大量提醒超过 90 秒，可能并发执行多个实例
-- 原 Worker 和新 Worker 可能同时处理同一条 scheduled 记录（并发重复）
-
----
-
-## 8. 代码走向流程图
-
-### 8.1 提醒邮件完整链路（纠正后）
-
-```
-Schedule 每分钟触发
-    ↓
-ProcessScheduledContactReminders::handle()
-    ├─ DB查询 contact_reminder_scheduled WHERE scheduled_at <= NOW()
-    │                                      ↑ 注意：没有 triggered_at 条件
-    ├─ foreach 循环
-    │   ├─ try {
-    │   │   ├─ findOrFail(ContactReminder, UserNotificationChannel)
-    │   │   ├─ triggerNotification()
-    │   │   │   ├─ if (!channel->active) return
-    │   │   │   ├─ Notification::route()->notify(ReminderTriggered)
-    │   │   │   │   └─ ReminderTriggered::toMail()
-    │   │   │   │       ├─ UserNotificationSent::create() ← 记录日志（发送前）
-    │   │   │   │       └─ 返回 MailMessage ← 实际发送
-    │   │   │   ├─ increment number_times_triggered
-    │   │   │   └─ RescheduleContactReminderForChannel.execute()
-    │   │   │       ├─ 循环提醒: syncWithoutDetaching 更新 scheduled_at → 未来
-    │   │   │       └─ 一次性提醒: DELETE 整条记录
-    │   │   │
-    │   │   └─ updateScheduledContactReminderTriggeredAt() ← triggered_at = NOW()
-    │   │         ↑ 注意：Reschedule 在这之前就执行完了
-    │   │
-    │   └─ } catch (\Exception $e) {
-    │       ├─ Log::error()
-    │       ├─ UserNotificationSent::create(..., error => ...)
-    │       ├─ channel->fails++
-    │       ├─ fails >= 10 ? channel->active = false, 删除所有调度 : 继续
-    │       └─ channel->save()
-    └─ 结束
-```
-
-### 8.2 人工重试对提醒邮件的影响判定
-
-```
-人工 queue:retry <uuid>
-    ↓
-handle() 重新执行，重新查询 DB
-    ↓
-这条提醒的 scheduled_at 是否已被 Reschedule 推到未来？
-    ├─ 是（Reschedule 成功过） → 不命中 → ✅ 不重复
-    ├─ 否（Reschedule 失败/未执行） → 命中 → ❌ 重复发送
-    │       └─ 如果 channel->active = false → triggerNotification 直接 return → 不发送但也不 Reschedule → 僵尸记录
-```
-
----
-
-## 9. 优化建议
-
-### 9.1 短期优化（低风险）
-
-1. **取数增加 triggered_at 条件**（真正把 triggered_at 作为幂等边界）
-
-   ```php
-   // ProcessScheduledContactReminders::handle()
-   $scheduledContactReminders = DB::table('contact_reminder_scheduled')
-       ->where('scheduled_at', '<=', $currentDate)
-       ->whereNull('triggered_at')          // ← 增加这行
-       ->get();
-   ```
-
-   这是最直接、最低风险的修复，把之前"假设存在"的机制补回来。
-
-2. **为邮件Job添加超时限制**（小于 retry_after）
-
-   ```php
-   // ProcessScheduledContactReminders, SendVerificationEmailChannel 等添加
-   public int $timeout = 60;  // 小于 queue.retry_after = 90
-   ```
-
-3. **验证邮件添加幂等性检查**
-
-   ```php
-   public function handle()
-   {
-       if ($this->channel->verified_at !== null) {
-           return;
-       }
-       // ... 发送
-   }
-   ```
-
-### 9.2 中期优化（中风险）
-
-1. **Reschedule 与发送使用数据库事务包裹**，保证"发送成功+Reschedule成功"的原子性
-   - 注意：邮件发送是外部IO，无法与DB事务真正原子化，需要用"事务消息"或"发件箱模式"
-
-2. **为 contact_reminder_scheduled 的 (user_notification_channel_id, contact_reminder_id) 增加唯一索引**，防止 syncWithoutDetaching 产生重复记录（目前虽然逻辑上不会重复，但表结构没有唯一约束）
-
-3. **提醒调度使用悲观锁** `WHERE ... FOR UPDATE SKIP LOCKED`，防止并发 Worker 处理同一条记录
-
-### 9.3 长期优化（高风险）
-
-1. **发件箱模式（Transactional Outbox）**：先写"待发送邮件"到DB（在业务事务内），异步任务扫描发送，保证"业务操作+邮件发送"原子性
-2. **接入邮件服务商 Webhook**：准确追踪真实投递状态，而非仅记录"尝试发送"
-3. **分布式锁**（Redis）防止 ProcessScheduledContactReminders 并发执行
+- 发件箱模式（Transactional Outbox）
+- 邮件服务商 Webhook 追踪投递状态
+- Redis 分布式锁防同一份提醒并发处理
 
 ---
 
@@ -659,14 +713,15 @@ handle() 重新执行，重新查询 DB
 
 | 类型 | 文件路径 | 关键内容 |
 |------|---------|----------|
+| 队列配置 | [config/queue.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/config/queue.php) | retry_after=90 |
+| Worker脚本 | [scripts/docker/queue.sh](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/scripts/docker/queue.sh) | --tries=3 |
+| jobs表迁移 | [2022_01_22_183321_create_jobs_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/database/migrations/2022_01_22_183321_create_jobs_table.php) | attempts, reserved_at 字段 |
 | 提醒调度Job | [ProcessScheduledContactReminders.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php) | 取数无triggered_at条件、执行顺序 |
-| 重排服务 | [RescheduleContactReminderForChannel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannel.php) | 循环更新scheduled_at / 一次性DELETE |
-| 调度表迁移 | [2022_02_18_215852_create_reminders_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/database/migrations/2022_02_18_215852_create_reminders_table.php) | contact_reminder_scheduled 字段定义 |
-| 调度配置 | [routes/console.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/routes/console.php) | 每分钟调度一次 |
-| 队列配置 | [config/queue.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/config/queue.php) | retry_after=90秒 |
-| Worker脚本 | [scripts/docker/queue.sh](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/scripts/docker/queue.sh) | --tries=3 默认值 |
+| 重排服务 | [RescheduleContactReminderForChannel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannel.php) | syncWithoutDetaching 只改scheduled_at |
+| 调度表迁移 | [2022_02_18_215852_create_reminders_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/database/migrations/2022_02_18_215852_create_reminders_table.php) | contact_reminder_scheduled 字段 |
+| 测试命令 | [TestReminders.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Console/Commands/TestReminders.php) | 有triggered_at过滤，但不调用updateTriggeredAt |
+| 前端展示过滤 | [VaultShowViewHelper.php#L48](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultShowViewHelper.php#L48) | wherePivot('triggered_at', null) |
+| QueuableService基类 | [QueuableService.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Services/QueuableService.php) | tries=1 |
 | 验证邮件Job | [SendVerificationEmailChannel.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Settings/ManageNotificationChannels/Jobs/SendVerificationEmailChannel.php) | 无幂等检查 |
-| 邀请邮件 | [app/Mail/UserInvited.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Mail/UserInvited.php) | ShouldQueue无幂等 |
 | 熔断器配置 | [config/monica.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/config/monica.php) | max_notification_failures=10 |
-| 测试命令（非生产） | [TestReminders.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Console/Commands/TestReminders.php) | 有triggered_at条件（非生产） |
-| 前端ViewHelper | [VaultShowViewHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultShowViewHelper.php) | 前端展示过滤triggered_at |
+| 重排测试 | [RescheduleContactReminderForChannelTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/53-monica/tests/Unit/Domains/Contact/ManageReminders/Services/RescheduleContactReminderForChannelTest.php) | 断言triggered_at在Reschedule后保持null |
