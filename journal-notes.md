@@ -209,25 +209,83 @@ Feed 是联系人详情页的一个模块，展示该联系人的所有操作历
 
 4. 根据 `action` 值渲染不同的子组件
 
-**Note 在 Feed 中的展示**：
+#### 4.1.1 Note 相关 action 在 Feed 中的展示
 
 - `note_created` / `note_updated` → ✅ 使用 [FeedItems/Note.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/resources/js/Shared/Modules/FeedItems/Note.vue)
 - `note_destroyed` → ❌ **前端 Bug：不渲染专用组件**（Feed.vue 中写的是 `'note_deleted'`，与后端 `'note_destroyed'` 不匹配），只显示 "deleted a note" sentence，无内容预览
-- 数据由 [ActionFeedNote::data()](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedNote.php) 生成：
-  ```php
-  'note' => [
-      'object' => $note ? ['id' => ..., 'title' => ..., 'body' => Str::limit($note->body, 30)] : null,
-      'description' => $item->description,
-  ]
-  ```
-- **如果笔记仍存在且 feedable 关联未断开**：显示 title 和 body（截断到 30 字符）
-- **如果笔记已删除或 feedable 关联已断开**（`feedable` 为 null）：显示 description（创建/更新时保存的 10 词摘要），灰色标签样式
 
-**Post 在 Feed 中的展示**：
+**`note_destroyed` 完整代码链路分析**：
+
+1. **DB 层**：[DestroyNote.php:60-68](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageNotes/Services/DestroyNote.php#L60-L68) 存了 `description = Str::words(body, 10)`，但故意不走 `feedItem()->save()`，所以 `feedable_id=NULL, feedable_type=NULL`
+
+2. **ViewHelper 层**：[ModuleFeedViewHelper::getData()](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/ModuleFeedViewHelper.php#L129-L132) 中 `note_destroyed` 走 `ActionFeedNote::data($item)`，返回结构正确：
+   ```php
+   'note' => [
+       'object' => $item->feedable,  // null（因为 feedable_id=NULL）
+       'description' => $item->description,  // 10词摘要
+   ]
+   ```
+
+3. **前端渲染 Bug**：[Feed.vue:135-142](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/resources/js/Shared/Modules/Feed.vue#L135-L142) 匹配条件写错：
+   ```html
+   <note v-if="feedItem.action === 'note_created' ||
+                feedItem.action === 'note_updated' ||
+                feedItem.action === 'note_deleted'"  />
+   <!-- 应该是 'note_destroyed'，不是 'note_deleted'！ -->
+   ```
+
+4. **顶层 fallback 也失效**：ModuleFeedViewHelper 不返回顶层 `description` 字段，所以 `<div v-if="feedItem.description">` 兜底分支也不生效
+
+**最终结果**：只显示 sentence "deleted a note"，虽然 DB 和 ViewHelper 的 data.note.description 中都有 10 词摘要，但完全不会被渲染出来
+
+#### 4.1.2 Post 相关 action 在 Feed 中的展示
 
 - `added_to_post` / `removed_from_post` → 无专用子组件，Feed.vue 中走 default 分支
-- [ModuleFeedViewHelper::data()](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/ModuleFeedViewHelper.php#L21-L35) 返回结构中**没有顶层 description 字段**，因此 Feed.vue 第 145-152 行的 `<div v-if="feedItem.description">` fallback 对这些 action 也不生效
-- 实际效果：仅显示 sentence（如 "added the contact to a post"），不显示 post title 等内容预览
+
+**完整代码链路分析（以 `added_to_post` 为例）**：
+
+1. **DB 层**：[AddContactToPost.php:80-86](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Vault/ManageJournals/Services/AddContactToPost.php#L80-L86) 存了 `description = post title`，并通过 `$post->feedItem()->save($feedItem)` 设置了 `feedable_id=post.id, feedable_type='App\Models\Post'`
+
+2. **ViewHelper 层**：[ModuleFeedViewHelper::getData()](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/ModuleFeedViewHelper.php#L107-L147) 中 `added_to_post` **不在任何 case 中**，走 default 分支：
+   ```php
+   default:
+       return ActionFeedGenericContactInformation::data($item);
+   ```
+
+3. **ActionFeedGenericContactInformation::data()**：[ActionFeedGenericContactInformation.php:9-23](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedGenericContactInformation.php#L9-L23) 返回的是 **contact 信息**（id、name、age、avatar、url），**完全没有用到 `$item->description` 或 `$item->feedable`**：
+   ```php
+   return [
+       'id' => $contact->id,
+       'name' => $contact->name,
+       'age' => $contact->age,
+       'avatar' => $contact->avatar,
+       'url' => route('contact.show', ...),
+   ];
+   ```
+
+4. **顶层字段缺失**：[ModuleFeedViewHelper::data()](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/ModuleFeedViewHelper.php#L21-L35) 返回结构中**没有顶层 `description` 字段**，只返回 `id/action/author/sentence/data/created_at`
+
+5. **前端渲染**：[Feed.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/resources/js/Shared/Modules/Feed.vue) 中：
+   - 没有任何子组件（note/pet/goal 等）匹配 `added_to_post`
+   - `<div v-if="feedItem.description">` fallback 也不生效（顶层 description 不存在）
+
+**最终结果**：仅显示 sentence（如 "added the contact to a post"），**连 post title 都看不到**，即使 DB 中存了 title 也完全传不到前端
+
+> `removed_from_post` 的代码链路与 `added_to_post` 完全相同，也同样看不到 post title
+
+---
+
+### 4.1.3 `note_created` / `note_updated` 的展示逻辑
+
+数据由 [ActionFeedNote::data()](file:///d:/fz/0601-2/solo-dogfeeding/code/51-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedNote.php) 生成：
+```php
+'note' => [
+    'object' => $note ? ['id' => ..., 'title' => ..., 'body' => Str::limit($note->body, 30)] : null,
+    'description' => $item->description,
+]
+```
+- **如果笔记仍存在且 feedable 关联有效**：`object` 非空，Note.vue 走 `v-if` 分支显示 title 和 body（截断到 30 字符）
+- **如果笔记已删除或 feedable 关联无效**（`feedable` 为 null）：`object` 为空，Note.vue 走 `v-else` 分支显示 description（创建/更新时保存的 10 词摘要），灰色标签样式
 
 ### 4.2 Journal 页面的时间线展示
 
@@ -652,7 +710,7 @@ MorphOne 的 "One" 体现在**查询端**，不是**保存端**：
 | 与 Contact 关系 | 直接外键（1:N） | 多对多（contact_post 中间表） |
 | 内容结构 | 单个 body 字段 | 多个 PostSection（label + content） |
 | Markdown 渲染 | ❌ 纯文本展示 | ✅ 服务端转 HTML，前端 v-html 渲染 |
-| 在 Contact Feed 中 | note_created/updated/destroyed（有专用组件） | added_to_post/removed_from_post（仅显示 title） |
+| 在 Contact Feed 中 | `note_created` / `note_updated` 有专用组件，展示完整；<br>`note_destroyed` 前端 Bug，**只显示 sentence 无内容** | `added_to_post` / `removed_from_post` **无专用组件，无内容预览**，只显示 sentence（连 post title 都看不到） |
 | 编辑对 Feed 影响 | ✅ 创建新 feedItem | ❌ 无影响 |
 | 删除对 Feed 影响 | ✅ 创建 feedItem，Note 硬删除 | ❌ 无 feedItem，Post 级联删除 |
 | 在 Journal 页面展示 | ❌ 不展示 | ✅ 按年月组织展示 |
