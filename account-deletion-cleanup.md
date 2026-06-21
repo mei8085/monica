@@ -322,16 +322,18 @@ DeleteUser (Jetstream)
 
 ## 九、外键级联策略全景表
 
-本章节逐张表分析所有迁移文件中的外键级联策略，共统计到 **100 处 cascadeOnDelete**、**28 处 nullOnDelete**、**0 处 restrictOnDelete**。
+本章节逐张表分析所有迁移文件中的外键级联策略，共统计到 **108 处 cascadeOnDelete**（新语法）、**4 处 onDelete('cascade')**（旧语法）、**28 处 nullOnDelete**、**0 处 restrictOnDelete**。
 
 ### 9.1 三种外键策略使用统计
 
 | 策略 | 数量 | 占比 | 说明 |
 |------|------|------|------|
-| `cascadeOnDelete()` | 100 | 78.1% | 关联记录随父记录一同删除 |
-| `nullOnDelete()` | 28 | 21.9% | 外键字段置为 NULL，关联记录保留 |
+| `cascadeOnDelete()` | 108 | 77.7% | 关联记录随父记录一同删除（Laravel 新语法） |
+| `onDelete('cascade')` | 4 | 2.9% | 关联记录随父记录一同删除（Laravel 旧语法） |
+| **级联合计** | **112** | **80.6%** | **所有级联删除总计** |
+| `nullOnDelete()` | 27 | 19.4% | 外键字段置为 NULL，关联记录保留 |
 | `restrictOnDelete()` | 0 | 0% | 全系统未使用，不会阻止删除 |
-| **合计** | **128** | **100%** | |
+| **合计** | **139** | **100%** | |
 
 ### 9.2 按删除场景梳理策略
 
