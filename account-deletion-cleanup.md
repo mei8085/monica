@@ -59,8 +59,12 @@ Monica 系统中有两种删除场景：
 | `sync_tokens` | 同步令牌 | 一对多 |
 
 另外，用户作为作者的记录（通过 `author_id` 关联）：
-- `notes` — 笔记（**注意**：`author_id` 外键需要确认是否级联）
-- `contact_tasks` — 联系人任务（**注意**：`author_id` 外键需要确认是否级联）
+- `notes` — 笔记（`author_id` 置空，记录保留）
+- `contact_tasks` — 联系人任务（`author_id` 置空，记录保留）
+- `calls` — 通话记录（`author_id` 置空，记录保留）
+- `contact_feed_items` — 联系人动态（`author_id` 置空，记录保留）
+
+**注意**：所有 `author_id` 字段均使用 `nullOnDelete` 策略，删除用户不会导致这些记录被删除，仅作者关联被清空。详见下文「附录：author_id 字段级联规则分析」。
 
 ---
 
