@@ -1,4 +1,4 @@
-# 账号删除数据清理流程梳理
+﻿# 账号删除数据清理流程梳理
 
 ## 概述
 
@@ -331,9 +331,9 @@ DeleteUser (Jetstream)
 | `cascadeOnDelete()` | 108 | 77.7% | 关联记录随父记录一同删除（Laravel 新语法） |
 | `onDelete('cascade')` | 4 | 2.9% | 关联记录随父记录一同删除（Laravel 旧语法） |
 | **级联合计** | **112** | **80.6%** | **所有级联删除总计** |
-| `nullOnDelete()` | 27 | 19.4% | 外键字段置为 NULL，关联记录保留 |
+| `nullOnDelete()` | 28 | 20.0% | 外键字段置为 NULL，关联记录保留 |
 | `restrictOnDelete()` | 0 | 0% | 全系统未使用，不会阻止删除 |
-| **合计** | **139** | **100%** | |
+| **合计** | **140** | **100%** | |
 
 ### 9.2 按删除场景梳理策略
 
@@ -567,11 +567,14 @@ DeleteUser (Jetstream)
 
 ##### 第三层：无外键约束的 User 关联（潜在悬空引用）
 
+经全面排查所有 migration 文件中 `foreignIdFor` 后未调用 `constrained()` 的情况，仅有 **2 处**（详见 11.3 节）：
+
 | 表名 | 外键字段 | 字段定义 | 实际行为 | 迁移文件 |
 |------|---------|---------|---------|---------|
-| `sessions` | `user_id` | `nullable()->index()`（无 constrained） | 记录残留，无数据库处理 | [create_sessions_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/67-monica/database/migrations/2022_07_31_200647_create_sessions_table.php#L19) |
-| `user_notification_channels` | `user_id` | `nullable()`（无 constrained） | 记录残留，无数据库处理 | [create_reminders_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/67-monica/database/migrations/2022_02_18_215852_create_reminders_table.php#L36) |
-| `contact_reminders` | `user_id` | `nullable()`（无 constrained） | 记录残留，无数据库处理 | [create_reminders_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/67-monica/database/migrations/2022_02_18_215852_create_reminders_table.php#L36) |
+| `sessions` | `user_id` | `foreignIdFor(User::class)->nullable()->index()`（无 constrained） | 记录残留，无数据库级联处理 | [create_sessions_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/67-monica/database/migrations/2022_07_31_200647_create_sessions_table.php#L19) |
+| `user_notification_channels` | `user_id` | `foreignIdFor(User::class)->nullable()`（无 constrained） | 记录残留，无数据库级联处理 | [create_reminders_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/67-monica/database/migrations/2022_02_18_215852_create_reminders_table.php#L36) |
+
+> **注意**：`contact_reminders` 表**没有** `user_id` 字段，其唯一外键是 `contact_id`（已 `constrained()->cascadeOnDelete()`）。之前版本误将同一迁移文件 L36 的 `foreignIdFor(User::class)->nullable()` 归属为 `contact_reminders`，实际上该行属于 `user_notification_channels` 表定义块（L34-45）。
 
 ### 9.3 关键策略差异对比
 
@@ -763,9 +766,8 @@ $user->delete()
 │
 ├─ 无约束残留（无外键，数据库层面不处理）：
 │   ├─ sessions.user_id → 悬空引用（依赖会话过期机制清理）
-│   ├─ user_notification_channels.user_id → 悬空引用（遗留问题）
-│   │   └─ 但 channel 被删时：contact_reminder_scheduled（级联）+ user_notification_sent（级联）
-│   └─ contact_reminders.user_id → 悬空引用（遗留问题）
+│   └─ user_notification_channels.user_id → 悬空引用（遗留问题）
+│       └─ 但 channel 被删时：contact_reminder_scheduled（级联）+ user_notification_sent（级联）
 │
 └─ 特殊业务处理（DestroyUser::destroyAllVaults）：
     对每个用户有 MANAGE 权限的 Vault：
@@ -852,17 +854,79 @@ $table->foreignIdFor(Contact::class, 'paid_by_contact_id')
 
 ### 11.3 无外键约束定义示例（潜在问题）
 
-```php
-// sessions：仅有索引，无 constrained()，删除用户时不处理
-// create_sessions_table.php L19
-$table->foreignIdFor(User::class)->nullable()->index();
-// 注意：少了 ->constrained()，无外键！
+经全面排查所有 migration 文件中 `foreignIdFor` 后未调用 `constrained()` 的情况，仅有 **2 处**，分布在 2 个迁移文件中：
 
-// user_notification_channels：仅有 nullable()，无 constrained()
-// create_reminders_table.php L36
-$table->foreignIdFor(User::class)->nullable();
-// 注意：少了 ->constrained()，无外键！
+#### 11.3.1 sessions 表 — `user_id` 无外键约束
+
+```php
+// create_sessions_table.php L17-24
+Schema::create('sessions', function (Blueprint $table) {
+    $table->string('id')->primary();
+    $table->foreignIdFor(User::class)->nullable()->index();  // ← 无 constrained()
+    $table->string('ip_address', 45)->nullable();
+    $table->text('user_agent')->nullable();
+    $table->longText('payload');
+    $table->integer('last_activity')->index();
+});
 ```
+
+**分析**：
+- `foreignIdFor(User::class)` 会创建 `user_id` 列（BIGINT UNSIGNED, nullable），但未调用 `constrained()` 意味着**没有建立外键约束**
+- 这是 Laravel 标准 sessions 表的默认写法，session 记录本身是临时的，不需要与用户建立强关联
+- **删除用户时的影响**：sessions 表中的 `user_id` 记录会残留为悬空引用（指向已删除的用户 ID），但这些 session 记录会在自然过期后由 Laravel 的 `session:gc` 命令清理
+- Laravel 框架内部在用户登出时会主动清除该用户的 session 记录（`Auth::logout()` → `Session::invalidate()`），但**直接删除用户模型时不会触发 session 清理**
+
+#### 11.3.2 user_notification_channels 表 — `user_id` 无外键约束
+
+```php
+// create_reminders_table.php L34-45
+Schema::create('user_notification_channels', function (Blueprint $table) {
+    $table->id();
+    $table->foreignIdFor(User::class)->nullable();  // ← 无 constrained()
+    $table->string('type');
+    $table->string('label')->nullable();
+    $table->text('content');
+    $table->time('preferred_time')->nullable();
+    $table->boolean('active')->default(false);
+    $table->datetime('verified_at')->nullable();
+    $table->string('verification_token')->nullable();
+    $table->timestamps();
+});
+```
+
+**分析**：
+- `foreignIdFor(User::class)->nullable()` 创建了 `user_id` 列但未建立外键约束
+- 这意味着删除用户时，数据库**不会级联删除或置空** `user_notification_channels` 中的记录
+- **删除用户时的影响**：`user_notification_channels` 中的 `user_id` 残留为悬空引用
+- **级联影响范围**：由于 `contact_reminder_scheduled` 和 `user_notification_sent` 都通过 `constrained()->cascadeOnDelete()` 依赖 `user_notification_channels`，这些子表记录会继续存在，直到对应的 `user_notification_channel` 被手动清理
+
+**同一迁移文件中的其他表（有完整约束）**：
+
+```php
+// contact_reminders 表 — 有完整外键约束（L20-32）
+Schema::create('contact_reminders', function (Blueprint $table) {
+    $table->id();
+    $table->foreignIdFor(Contact::class)->constrained()->cascadeOnDelete();  // ✓ 有约束
+    // ... 其他字段，无 user_id
+});
+
+// contact_reminder_scheduled 中间表 — 双边级联（L47-54）
+Schema::create('contact_reminder_scheduled', function (Blueprint $table) {
+    $table->id();
+    $table->foreignIdFor(UserNotificationChannel::class)->constrained()->cascadeOnDelete();  // ✓
+    $table->foreignIdFor(ContactReminder::class)->constrained()->cascadeOnDelete();  // ✓
+    // ...
+});
+
+// user_notification_sent 表 — 级联删除（L56-63）
+Schema::create('user_notification_sent', function (Blueprint $table) {
+    $table->id();
+    $table->foreignIdFor(UserNotificationChannel::class)->constrained()->cascadeOnDelete();  // ✓
+    // ...
+});
+```
+
+> **重要澄清**：`contact_reminders` 表**没有** `user_id` 字段，其唯一外键是 `contact_id`（指向 `contacts` 表，有 `constrained()->cascadeOnDelete()`）。之前版本误将同一迁移文件 L36 的 `foreignIdFor(User::class)->nullable()` 归属为 `contact_reminders` 表的字段，实际上该行属于 `user_notification_channels` 表定义块（L34-45）。
 
 ---
 
