@@ -839,3 +839,335 @@ public static function canUploadFile(Account $account): bool
 | 无 type 枚举校验 | 传 `type: malicious` | files 表出现非预期类型值，查询过滤可能遗漏 |
 | UUID 无格式校验 | 传 `uuid: ../../../etc/passwd` | 低风险——此 uuid 只用于拼接 CDN URL，不用于本地文件路径 |
 | 前端不强制 imagesOnly | 用户在 Uploadcare 弹窗选了非图片文件 | 文件能成功上传到 CDN，但 CDN 的 scale_crop 操作会失败，头像展示异常 |
+
+---
+
+## 15. Uploadcare 签名鉴权算法的完整实现
+
+### 15.1 算法本质：HMAC-SHA256
+
+Uploadcare 的签名上传（Signed Uploads）鉴权核心是 **HMAC-SHA256**。算法的输入只有两个：
+
+- **密钥**：Uploadcare 项目的 Private Key（存储在 `config/services.php` 的 `uploadcare.private_key`）
+- **消息**：过期时间的 Unix 时间戳字符串
+
+签名公式为：
+
+```
+signature = HMAC-SHA256(key=PRIVATE_KEY, message=str(expire_timestamp))
+```
+
+### 15.2 PHP SDK 中的 Signature 类源码
+
+Monica 依赖的是 `uploadcare/uploadcare-php` v4.2.0（见 [composer.lock](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/composer.lock#L11619)）。其 `Signature` 类位于 `Uploadcare\Security\Signature`：
+
+```php
+class Signature implements SignatureInterface
+{
+    private string $secretKey;
+    private \DateTimeInterface $expired;
+
+    public function __construct(string $secretKey, int $ttl = null)
+    {
+        $this->secretKey = $secretKey;
+        if ($ttl === null || $ttl > self::MAX_TTL) {
+            $ttl = self::MAX_TTL;        // MAX_TTL = 3600 秒（1 小时）
+        }
+        $ts = \date_create()->getTimestamp() + $ttl;
+        $this->expired = \date_create()->setTimestamp($ts);
+    }
+
+    public function getSignature(): string
+    {
+        $signString = $this->getExpire()->getTimestamp();
+        return \hash_hmac(
+            SignatureInterface::SIGN_ALGORITHM,   // 'sha256'
+            (string) $signString,                  // 过期时间戳字符串
+            $this->secretKey                       // 私钥
+        );
+    }
+
+    public function getExpire(): \DateTimeInterface
+    {
+        return $this->expired;
+    }
+}
+```
+
+**关键细节**：
+
+1. **签名消息就是 `expire` 时间戳本身**，不是 `expire + UUID + 其他参数` 的组合。这意味着同一个签名可以用于同一个项目内的**任何文件上传**——签名不绑定具体文件
+2. **MAX_TTL = 3600 秒**：构造函数未传 TTL 时默认 1 小时有效期，传入超过 3600 的值也会被截断到 3600
+3. **签名是 hex 编码的**：`hash_hmac()` 默认返回 64 字符的十六进制小写字符串
+
+### 15.3 StorageHelper 如何调用
+
+[StorageHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Helpers/StorageHelper.php#L36-L45)
+
+```php
+public static function uploadcare(): array
+{
+    $signature = config('services.uploadcare.private_key') != ''
+        ? new Signature(config('services.uploadcare.private_key'))
+        : null;
+
+    return [
+        'publicKey' => config('services.uploadcare.public_key'),
+        'signature' => optional($signature)->getSignature(),
+        'expire'    => optional(optional($signature)->getExpire())->getTimestamp(),
+    ];
+}
+```
+
+**调用链**：
+
+1. 从 `config/services.php` 读取私钥，构造 `Signature` 对象（未传 TTL → 默认 3600 秒）
+2. 调用 `getSignature()` 得到 HMAC-SHA256 签名字符串
+3. 调用 `getExpire()->getTimestamp()` 得到过期时间戳（当前时间 + 3600）
+4. 将公钥、签名、过期时间三值返回给前端
+
+**重要：每次调用 `StorageHelper::uploadcare()` 都会生成新的签名和过期时间**。因为 `Signature` 构造函数在实例化时就计算了 `now + ttl`，所以不同请求拿到的 `expire` 不同，`signature` 也不同。
+
+### 15.4 前端如何消费签名
+
+[Uploadcare.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/resources/js/Components/Uploadcare.vue#L109-L134) 把 `secureSignature` 和 `secureExpire` 直接传入 `uploadcare.openDialog()` 的 options：
+
+```javascript
+const options = {
+    publicKey,
+    secureSignature,    // HMAC-SHA256 签名
+    secureExpire,       // Unix 时间戳（秒）
+    // ...
+};
+this.fileGroup = uploadcare.openDialog([], options);
+```
+
+uploadcare-widget SDK 在向 Uploadcare CDN 上传文件时，会自动把 `secureSignature` 和 `secureExpire` 附加到上传请求中。Uploadcare 服务器收到请求后：
+
+1. 用自己保存的私钥 + 请求中的 `expire` 值，重新计算 `HMAC-SHA256`
+2. 对比计算结果与请求中的 `signature`
+3. 检查 `expire` 是否大于当前时间（防过期）
+4. 两项均通过才允许上传
+
+### 15.5 签名的安全特性与局限
+
+| 特性 | 说明 |
+| ---- | ---- |
+| **防未授权上传** | 没有私钥就无法伪造合法签名，攻击者无法直接向 Uploadcare 项目上传文件 |
+| **有时效性** | 签名最多 1 小时有效，过期后无法使用 |
+| **不绑定文件** | 签名只含时间戳，不含文件 UUID 或类型——合法签名可用于上传任意文件到该项目 |
+| **不绑定用户** | 签名不包含用户 ID——拿到签名的任何人都可以使用（包括被截获后重放，但在 1 小时内） |
+| **私钥在 Monica 后端** | 私钥只存在于服务端 `config/services.php`，不会传给前端，不会被暴露 |
+
+---
+
+## 16. 照片上传组件对图片类型的限制——全场景对比
+
+### 16.1 Uploadcare.vue 组件支持的图片相关 props
+
+[Uploadcare.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/resources/js/Components/Uploadcare.vue#L26-L55) 提供了以下与文件类型限制相关的 props：
+
+| Prop | 类型 | 默认值 | 作用 |
+| ---- | ---- | ------ | ---- |
+| `imagesOnly` | Boolean | `false` | Uploadcare 弹窗只允许选择图片文件 |
+| `crop` | String | `''` | 设置裁剪比例，如 `"1:1"`、`"3:2"` 等 |
+| `imageShrink` | Boolean | `false` | 上传大图时自动缩小（减少 CDN 存储） |
+| `inputAcceptTypes` | String | — | HTML `<input accept>` 属性值，如 `"image/*"` |
+| `preferredTypes` | String | — | 优先选择的文件类型列表 |
+
+### 16.2 全部调用场景的 props 对照
+
+| 调用场景 | 组件文件 | `imagesOnly` | `crop` | `imageShrink` | `tabs` | `inputAcceptTypes` |
+| -------- | -------- | ------------ | ------ | ------------- | ------ | ------------------ |
+| 头像上传 | [Show.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/resources/js/Pages/Vault/Contact/Show.vue#L236-L246) | ❌ 未传 (false) | ❌ 未传 ('') | ❌ 未传 (false) | `'file'` | ❌ 未传 |
+| 照片上传（模块） | [Photos.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/resources/js/Shared/Modules/Photos.vue#L12-L22) | ❌ 未传 (false) | ❌ 未传 ('') | ❌ 未传 (false) | `'file'` | ❌ 未传 |
+| 照片上传（列表页） | [Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/resources/js/Pages/Vault/Contact/Photos/Index.vue#L84-L94) | ❌ 未传 (false) | ❌ 未传 ('') | ❌ 未传 (false) | `'file'` | ❌ 未传 |
+| 文档上传 | [Documents.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/resources/js/Shared/Modules/Documents.vue#L12-L22) | ❌ 未传 (false) | ❌ 未传 ('') | ❌ 未传 (false) | `'file'` | ❌ 未传 |
+| Journal 封面图 | [Show.vue (Slices)](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/resources/js/Pages/Vault/Journal/Slices/Show.vue#L123-L149) | ❌ 未传 (false) | ❌ 未传 ('') | ❌ 未传 (false) | `'file'` | ❌ 未传 |
+
+**结论：全场景无差异**——Monica 中所有 Uploadcare 调用点都没有设置 `imagesOnly`、`crop`、`imageShrink`、`inputAcceptTypes` 中的任何一个。头像、照片、文档、Journal 封面图的上传弹窗行为完全相同，用户可以上传任意类型的文件。
+
+### 16.3 这意味着什么
+
+1. **头像上传**：用户可以选 PDF 文件上传 → CDN 存了 PDF → `Contact::avatar` Attribute 拼接的 `scale_crop/300x300/smart/` URL 对 PDF 无效 → 头像位置显示破损图片
+2. **照片上传**：用户可以选 ZIP 文件上传 → 同样 CDN URL 裁剪失败 → 照片展示异常
+3. **文档上传**：这个场景**不需要** `imagesOnly`，因为文档本身就可以是任意类型——但前端和后端都没有阻止用户把 ZIP 当照片上传
+4. **Journal 封面图**：与头像同理，上传非图片文件后封面展示异常
+
+---
+
+## 17. 文档上传与照片上传的保护机制差异
+
+### 17.1 Controller 层差异
+
+**照片上传**：[ContactModulePhotoController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManagePhotos/Web/Controllers/ContactModulePhotoController.php#L16-L40)
+
+```php
+public function store(Request $request, string $vaultId, string $contactId)
+{
+    $data = [
+        // ...
+        'type' => File::TYPE_PHOTO,   // 硬编码类型
+    ];
+    $file = (new UploadFile)->execute($data);
+    $contact = Contact::where('vault_id', $vaultId)->findOrFail($contactId);
+    $contact->files()->save($file);   // 只建 morphMany 关联，不设 file_id
+    return response()->json([...], 201);
+}
+```
+
+**文档上传**：[ContactModuleDocumentController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Web/Controllers/ContactModuleDocumentController.php#L16-L40)
+
+```php
+public function store(Request $request, string $vaultId, string $contactId)
+{
+    $data = [
+        // ...
+        'type' => File::TYPE_DOCUMENT,   // 硬编码类型
+    ];
+    $file = (new UploadFile)->execute($data);
+    $contact = Contact::where('vault_id', $vaultId)->findOrFail($contactId);
+    $contact->files()->save($file);   // 同样只建 morphMany 关联
+    return response()->json([...], 201);
+}
+```
+
+两者的 Controller 代码结构**完全一致**，唯一区别是 `File::TYPE_PHOTO` vs `File::TYPE_DOCUMENT`。
+
+### 17.2 保护机制对比
+
+| 保护层 | 照片上传 | 文档上传 | 差异 |
+| ------ | -------- | -------- | ---- |
+| **UploadFile Service 校验** | `mime_type: required\|string`，无类型限制 | 同左 | 无差异 |
+| **UploadFile Service 校验** | `size: required\|integer`，无大小限制 | 同左 | 无差异 |
+| **Controller 硬编码 type** | `File::TYPE_PHOTO` | `File::TYPE_DOCUMENT` | 仅类型标记不同 |
+| **前端 imagesOnly** | ❌ 未设 | ❌ 未设 | 无差异 |
+| **前端 crop** | ❌ 未设 | ❌ 不需要 | 合理差异 |
+| **前端 imageShrink** | ❌ 未设 | ❌ 不需要 | 合理差异 |
+| **展示时 CDN 裁剪** | ✅ 使用 `scale_crop` 等 URL 参数 | ❌ 直接展示/下载原文件 | **关键差异** |
+| **存储配额检查** | `canUploadFile` 前端挡位 | `canUploadFile` 前端挡位 | 无差异 |
+| **删除链路** | 同步调 CDN API 删除 | 同步调 CDN API 删除 | 无差异 |
+
+### 17.3 关键差异分析：展示层才是真正的保护分水岭
+
+照片和文档上传在后端和前端的保护机制**完全相同**——都没有对文件类型和大小做校验。但两者在**展示层**有本质区别：
+
+- **照片**的展示 URL 包含 CDN 图像处理操作（`scale_crop`、`format/auto` 等）。如果用户上传了非图片文件（如 PDF），Uploadcare CDN 在执行 `scale_crop` 时会返回错误响应，前端 `<img>` 标签显示破损图标
+- **文档**的展示是直接下载或预览原始文件，不做任何 CDN 图像处理。非图片文件在文档场景下**完全正常**——PDF、Word、ZIP 都可以正常下载
+
+换句话说，**照片展示层的 CDN 处理反而是唯一一层对文件类型的隐式校验**——虽然它不是主动拒绝上传，而是让错误类型的文件在展示时「自然失败」。
+
+### 17.4 差异化保护应该是怎样的
+
+合理的保护策略应该是：
+
+| 保护 | 照片/头像 | 文档 |
+| ---- | --------- | ---- |
+| 前端 `imagesOnly` | ✅ 应设为 `true` | ❌ 不设 |
+| 后端 `mime_type` 校验 | ✅ 应校验 `image/*` | ❌ 不限 |
+| 前端 `crop` (头像) | ✅ 应设为 `"1:1"` | ❌ 不设 |
+| 前端 `imageShrink` | ✅ 应设为 `true` | ❌ 不设 |
+| 后端 `size` 上限 | ✅ 应设上限（如 10MB） | ✅ 应设上限（如 50MB） |
+
+---
+
+## 18. Faker 确定性种子头像的修复方案及现行 API 写法不正确之处
+
+### 18.1 现行 API 写法的问题
+
+[AvatarHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Helpers/AvatarHelper.php#L19-L30) 的当前实现：
+
+```php
+public static function generateRandomAvatar(Contact $contact): string
+{
+    $multiavatar = new MultiAvatar;
+
+    if (is_null($contact->first_name)) {
+        $name = Faker::create()->name();
+    } else {
+        $name = $contact->first_name.' '.$contact->last_name;
+    }
+
+    return $multiavatar($name, null, null);
+}
+```
+
+**问题 1：Faker 无种子，导致不可复现**
+
+`Faker::create()` 等价于 `Faker\Factory::create()`，内部调用 `new Generator()` 时**不传入种子**。PHP 的 `mt_rand()` 每次进程启动时自动播种，所以同一个 PHP-FPM worker 进程内的连续请求可能恰好一致，但不同 worker 之间、不同请求之间结果都是随机的。
+
+**问题 2：方法签名不正确——`generateRandomAvatar` 不是「随机」的应有语义**
+
+方法名说的是「生成随机头像」，但实际需求是「生成确定性默认头像」——同一联系人每次应看到同一张。真正随机是当前实现的 bug，而非 feature。方法名和实现恰好颠倒了意图。
+
+**问题 3：Faker 产生的是人类姓名，而不是最佳种子**
+
+MultiAvatar 的算法（[MultiAvatar.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Models/MultiAvatar.php#L562-L570)）是：
+
+```php
+$sha256Hash = hash('sha256', $avatarId);
+$sha256Numbers = preg_replace('/[^0-9]/', '', $sha256Hash);
+$hash = substr($sha256Numbers, 0, 12);
+```
+
+它先对输入字符串做 SHA-256，再提取数字位。这意味着**任何输入字符串都能产生有效的头像**——不需要是人类姓名。Faker 的姓名（如 "Prof. Janick Collins"）和联系人的 UUID（如 `"550e8400-e29b-41d4-a716-446655440000"`）在经过 SHA-256 后效果完全等价——都是高质量的伪随机散列输入。
+
+### 18.2 正确的修复方案
+
+**方案 A：直接用 `$contact->id` 作为种子（推荐）**
+
+```php
+public static function generateRandomAvatar(Contact $contact): string
+{
+    $multiavatar = new MultiAvatar;
+
+    $name = $contact->first_name
+        ? $contact->first_name . ' ' . $contact->last_name
+        : $contact->id;
+
+    return $multiavatar($name, null, null);
+}
+```
+
+优势：
+- `Contact` 使用 UUID 主键（`HasUuids` trait），`$contact->id` 是确定性值，同一联系人永远相同
+- 无需引入 Faker 依赖
+- MultiAvatar 的 SHA-256 算法对 UUID 字符串同样能产生高质量散列
+- 改动最小——只删了 Faker 分支，改为一个三元表达式
+
+**方案 B：用 Faker 但固定种子**
+
+```php
+if (is_null($contact->first_name)) {
+    $name = Faker::create(crc32($contact->id))->name();
+} else {
+    $name = $contact->first_name.' '.$contact->last_name;
+}
+```
+
+这种方式也能保证确定性——`crc32($contact->id)` 对同一 UUID 总是产出相同整数，Faker 对相同种子总是产出相同姓名。但这是**不必要的间接层**：Faker 姓名只是 MultiAvatar SHA-256 的输入，为什么不直接把 UUID 传给 SHA-256？
+
+**方案 C：首次生成后持久化**
+
+在 `contacts` 表加 `default_avatar` 列，创建联系人时生成一次 SVG 存入。这最稳定但成本最高，对于默认头像这种纯装饰性内容来说过度设计。
+
+### 18.3 方案 A 的可行性验证
+
+[MultiAvatar.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Models/MultiAvatar.php#L562-L631) 的 `generate()` 方法对 `avatarId` 做了：
+
+1. `hash('sha256', $avatarId)` — 无论输入是姓名还是 UUID，SHA-256 都是 64 位十六进制
+2. 提取数字位 — UUID 格式 `"550e8400-e29b-41d4-a716-446655440000"` 的 SHA-256 数字位足够多
+3. 取前 12 位数字 → 分成 6 组（env/clo/head/mouth/eyes/top），每组 2 位 → 映射到 0-47 的范围
+
+也就是说，**UUID 输入与姓名输入在 MultiAvatar 算法中的效果完全对等**，不会出现「纯数字字符串视觉效果不佳」的情况——因为输入根本不是直接映射，而是经过 SHA-256 散列。
+
+### 18.4 还需考虑的边界情况
+
+| 边界 | 当前行为 | 修复后行为 |
+| ---- | -------- | ---------- |
+| `first_name` 为空字符串 `""` | `is_null("")` = false → 拼出 `"  Smith"`（前导空格） | 同上（三元表达式 `""` 不走 null 分支） |
+| `first_name` 为 null，`last_name` 有值 | Faker 随机 → MultiAvatar 不稳定 | 用 `$contact->id` → 稳定 |
+| `first_name` 和 `last_name` 都为 null | 同上 | 同上 |
+| 联系人 `id` 为空（未持久化） | Faker 随机 | `$contact->id` 为 null → MultiAvatar 收到空字符串 → 返回空 SVG |
+
+最后一个边界情况需要注意：**未持久化的 Contact 没有 id**。如果 `generateRandomAvatar()` 在 `Contact::create()` 之前被调用（虽然当前代码不存在此场景），UUID 主键尚未生成，会传入 null。但当前所有调用点都在联系人已存在之后，所以这不是实际问题。
