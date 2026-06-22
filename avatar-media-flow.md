@@ -480,3 +480,362 @@ https://ucarecdn.com/{uuid}/-/operation/params/-/operation/params/...
 | 模型       | [MultiAvatar.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Models/MultiAvatar.php) | 第三方 SVG 头像生成库封装                    |
 | **事件**   | [DeleteFileInStorage.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Listeners/DeleteFileInStorage.php) | FileDeleted 监听 → 调 Uploadcare API 删远程文件 |
 | **视图帮助** | [ContactShowViewHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageContact/Web/ViewHelpers/ContactShowViewHelper.php) | 准备上传参数 + 上传/删除路由 URL             |
+
+---
+
+## 11. 缺名联系人每次刷新都换一张默认头像的成因
+
+### 11.1 问题现象
+
+当联系人没有设置 `first_name`（即匿名联系人）时，页面每刷新一次，SVG 默认头像就变一张——颜色、发型、表情全都不同。而有名字的联系人则始终显示同一种头像。
+
+### 11.2 根因追踪
+
+调用链：`Contact::avatar` Attribute → `AvatarHelper::generateRandomAvatar()` → `MultiAvatar`
+
+[AvatarHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Helpers/AvatarHelper.php#L19-L30)
+
+```php
+public static function generateRandomAvatar(Contact $contact): string
+{
+    $multiavatar = new MultiAvatar;
+
+    if (is_null($contact->first_name)) {
+        $name = Faker::create()->name();   // ← 问题根源
+    } else {
+        $name = $contact->first_name.' '.$contact->last_name;
+    }
+
+    return $multiavatar($name, null, null);
+}
+```
+
+**三层原因叠加**：
+
+1. **Faker 不可复现**：`Faker::create()->name()` 每次调用都生成不同的随机姓名（如 "Prof. Janick Collins"、"Miss Alaina Lehner"）。Faker 没有固定种子（seed），也没有使用联系人的 `id` 做伪随机种子。
+
+2. **MultiAvatar 是纯确定性函数，但种子每次不同**：[MultiAvatar.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Models/MultiAvatar.php#L26-L29) 的 `__invoke` 接受 `avatarId` 参数，同一个 `avatarId` 永远产出同一张 SVG。对于有名字的联系人，`"John Doe"` 每次传入都一样，所以头像稳定。但对于缺名联系人，每次传入不同的 Faker 姓名作为种子，输出自然不同。
+
+3. **avatar Attribute 是实时计算的访问器，无缓存**：[Contact::avatar](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Models/Contact.php#L482-L500) 是一个 Eloquent Attribute `get` 访问器，每次被访问都会重新执行。Inertia 在每次页面渲染时序列化联系人数据，都会调用此访问器，触发 `AvatarHelper::generateRandomAvatar()`，触发新的 Faker 调用。
+
+### 11.3 有名字联系人不换头像的原因
+
+有 `first_name` 的联系人，种子字符串是 `first_name + ' ' + last_name`（如 `"Alice Smith"`），这是一个**确定性的字符串**——不会因刷新而变化，MultiAvatar 对相同输入始终产出相同输出。
+
+### 11.4 影响范围
+
+- 同一个缺名联系人在不同请求、不同用户、不同时间看到的默认头像都不同
+- 列表页中同一联系人在翻页后头像也会变
+- 即使同一页面，如果 `avatar` 属性被访问多次，理论上也可能得到不同结果（Faker 实例非全局单例）
+
+### 11.5 可选修复方向
+
+| 方案 | 做法 | 优劣 |
+| ---- | ---- | ---- |
+| A. 用 contact id 做种子 | `Faker::create( crc32($contact->id) )->name()` | 简单；同一联系人总是同一 Faker 姓名→同一 SVG |
+| B. 省掉 Faker，直接用 id | `$name = $contact->id` 传给 MultiAvatar | 最简；但 MultiAvatar 对纯数字字符串的视觉效果可能不佳 |
+| C. 首次生成后持久化 | 创建联系人时生成 SVG 存到 `default_avatar` 列 | 最稳定，但增加存储和迁移成本 |
+
+---
+
+## 12. files 表两套关联列并存现状：fileable 与 ufileable
+
+### 12.1 迁移中的表结构
+
+[2022_02_24_002342_create_files_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/database/migrations/2022_02_24_002342_create_files_table.php#L18-L34)
+
+```php
+Schema::create('files', function (Blueprint $table) {
+    $table->id();
+    $table->foreignIdFor(Vault::class)->constrained()->cascadeOnDelete();
+
+    // 第一套：nullableNumericMorphs → fileable_id (BIGINT UNSIGNED NULL) + fileable_type (STRING NULL)
+    $table->nullableNumericMorphs('fileable');
+
+    // 第二套：ufileable_id (UUID NULL) + 复用 fileable_type 作为类型列
+    $table->uuid('ufileable_id')->nullable();
+    $table->index(['fileable_type', 'ufileable_id']);
+
+    $table->string('uuid');
+    // ...
+});
+```
+
+### 12.2 两套关联的语义对比
+
+| 列 | 类型 | 用途 | 来源 |
+| -- | ---- | ---- | ---- |
+| `fileable_id` | `BIGINT UNSIGNED NULL` | Laravel 标准 `nullableNumericMorphs`，存**数字型**外键 | 迁移自动生成 |
+| `fileable_type` | `STRING NULL` | 多态类型名，如 `App\Models\Contact`、`App\Models\Post` | 两套共用 |
+| `ufileable_id` | `UUID NULL` | 存 **UUID 型**外键，专给使用 UUID 主键的模型用 | 手动添加 |
+
+**核心矛盾**：Monica 的 `Contact` 模型使用 UUID 主键（`HasUuids` trait），而 Laravel 的 `nullableNumericMorphs` 只能存 `BIGINT`。因此原有的 `fileable_id` 列无法存储 UUID 值，必须另加 `ufileable_id` 列来承载 UUID。
+
+### 12.3 两套 MorphTo 关系在 File 模型中的定义
+
+[File.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Models/File.php#L68-L82)
+
+```php
+// 第一套：标准 MorphTo，查找 fileable_id + fileable_type
+public function fileable(): MorphTo
+{
+    return $this->morphTo();
+}
+
+// 第二套：自定义 MorphTo，查找 ufileable_id + fileable_type
+public function ufileable(): MorphTo
+{
+    return $this->morphTo(type: 'fileable_type');
+}
+```
+
+第二套 `ufileable()` 的写法 `morphTo(type: 'fileable_type')` 利用了 Laravel MorphTo 的参数重载：
+- 第一个参数 `name` 默认是方法名（即 `ufileable`），Laravel 会查找 `ufileable_type` 和 `ufileable_id` 列
+- 传入 `type: 'fileable_type'` 后，类型列被改为 `fileable_type`（与第一套共用），而 ID 列仍由方法名推得为 `ufileable_id`
+
+### 12.4 Contact 模型使用的是第二套
+
+[Contact.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Models/Contact.php#L318-L321)
+
+```php
+public function files(): MorphMany
+{
+    return $this->morphMany(File::class, 'ufileable', 'fileable_type');
+}
+```
+
+第三个参数 `'fileable_type'` 告诉 Laravel 用 `fileable_type` 列而不是 `ufileable_type` 列来存储多态类型名。这样当调用 `$contact->files()->save($file)` 时，写入的是：
+- `ufileable_id` = 联系人的 UUID
+- `fileable_type` = `App\Models\Contact`
+- `fileable_id` = NULL（不写入）
+
+### 12.5 两套并存的现状总结
+
+| 模型 | 主键类型 | 使用哪套关联 | fileable_id | ufileable_id | fileable_type |
+| ---- | -------- | ------------ | ----------- | ------------ | ------------- |
+| Contact | UUID | 第二套 (ufileable) | NULL | UUID 值 | `App\Models\Contact` |
+| Post | UUID | 第二套 (ufileable) | NULL | UUID 值 | `App\Models\Post` |
+| 其他可能的数字 ID 模型 | BIGINT | 第一套 (fileable) | BIGINT 值 | NULL | 类名 |
+
+**实际影响**：
+- `fileable_id` 列在当前 Contact/Photo/Document 流程中**始终为 NULL**，因为所有用到多态关联的模型都使用 UUID
+- 查询时 `File::where('ufileable_id', $contactId)->where('type', File::TYPE_PHOTO)` 直接走 UUID 列
+- `fileable()` 关系方法在当前业务中**未被调用**，属于迁移遗留
+
+**潜在问题**：
+- 查询照片列表时（[ContactPhotoController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManagePhotos/Web/Controllers/ContactPhotoController.php#L23-L26)），直接用 `where('ufileable_id', $contactId)` 而非通过 Eloquent 关系，绕过了多态类型过滤——如果未来有其他模型也使用 `ufileable` 关联，可能查出非 Contact 的文件
+- 两套关联列共存增加理解成本，`fileable_id` 在 UUID 场景下是死列
+
+---
+
+## 13. 删除文件时同步请求第三方 CDN 的链路与风险
+
+### 13.1 完整同步链路
+
+```
+用户操作（更换头像/删除头像/删除照片/删除文档）
+  │
+  ▼
+Service 层调用 $file->delete()
+  │
+  ▼  Eloquent deleted 事件
+FileDeleted 事件被派发
+  │
+  ▼  同步 Listener（注册在 AppServiceProvider）
+DeleteFileInStorage::handle()
+  │
+  ├─► checkAPIKeyPresence()     ← 纯本地检查
+  ├─► getFileFromUploadcare()   ← HTTP 请求 1: GET /files/{uuid}/
+  └─► deleteFile()              ← HTTP 请求 2: DELETE /files/{uuid}/
+  │
+  ▼  返回给 Service 层
+响应返回给前端
+```
+
+### 13.2 事件注册方式
+
+[AppServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Providers/AppServiceProvider.php#L158)
+
+```php
+Event::listen(FileDeleted::class, DeleteFileInStorage::class);
+```
+
+这行注册的是**同步监听器**，不是 Queued Listener。`FileDeleted` 事件本身也**没有实现 `ShouldQueue` 接口**：
+
+[FileDeleted.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Events/FileDeleted.php)
+
+```php
+class FileDeleted
+{
+    use Dispatchable;
+    use InteractsWithSockets;
+    use SerializesModels;
+    // 没有 ShouldQueue
+}
+```
+
+这意味着 `DeleteFileInStorage::handle()` 在**同一个 HTTP 请求生命周期内同步执行**。
+
+### 13.3 同步链路的风险分析
+
+| 风险 | 分析 | 严重度 |
+| ---- | ---- | ------ |
+| **请求延迟叠加** | 删除一个文件 = 2 次同步 HTTP 往返（先查 fileInfo 再 delete）。如果用户更换头像，要先删旧头像（2 次 HTTP）再建新关联——前端等待时间 = 本地 DB 操作 + 2 次 Uploadcare API 调用 | 中 |
+| **Uploadcare 宕机 = 删除操作失败** | `getFileFromUploadcare()` 中 HTTP 请求失败时抛出 `BadRequestHttpException`，这会导致整个删除流程中断——本地 DB 记录已标记删除，但 CDN 文件可能未被真正删除 | 高 |
+| **无重试机制** | 同步 Listener 不走队列，失败后没有自动重试。如果 API 调用超时或 5xx，CDN 上的文件成为孤儿——本地记录已删，CDN 文件残留，持续计费 | 高 |
+| **DB 事务与事件时序** | Eloquent 的 `deleted` 事件在 `DELETE` SQL 执行**之后**触发。如果 Listener 抛异常，DB 记录已物理删除（不在事务中回滚），但 CDN 文件未删 | 高 |
+| **并发删除同一文件** | 两个请求同时删同一 File 记录，第二个 `fileInfo` 调用可能返回 404（Uploadcare 上已被第一个请求删除），异常被抛出 | 低 |
+
+### 13.4 一个值得注意的细节：两步 HTTP 调用的必要性存疑
+
+[DeleteFileInStorage.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Listeners/DeleteFileInStorage.php#L53-L68)
+
+```php
+private function getFileFromUploadcare(): void
+{
+    $configuration = Configuration::create(...);
+    $this->api = new Api($configuration);
+    $this->fileInUploadcare = $this->api->file()->fileInfo($this->file->uuid);
+}
+
+private function deleteFile(): void
+{
+    $this->api->file()->deleteFile($this->fileInUploadcare);
+}
+```
+
+`deleteFile()` 接受的是一个 `FileInfoInterface` 对象，而不是 UUID 字符串。所以必须先调 `fileInfo()` 拿到完整对象再传给 `deleteFile()`。这是 Uploadcare PHP SDK 的 API 设计限制——如果能直接按 UUID 删除，可以省掉一次 HTTP 往返。
+
+### 13.5 改进方向
+
+| 方向 | 做法 | 效果 |
+| ---- | ---- | ---- |
+| 异步化 | 让 `DeleteFileInStorage` 实现 `ShouldQueue`，用 Redis/数据库队列异步处理 | 请求立即返回，CDN 删除后台进行 |
+| 幂等重试 | 队列 + 指数退避重试，404 视为成功（文件已删） | 解决孤儿文件问题 |
+| 简化调用 | 如果 SDK 支持直接按 UUID 删除，去掉 `fileInfo()` 预查询 | 少一次 HTTP 往返 |
+
+---
+
+## 14. 上传校验对类型与大小的限制
+
+### 14.1 后端校验层：UploadFile Service
+
+[UploadFile.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Services/UploadFile.php#L20-L31)
+
+```php
+public function rules(): array
+{
+    return [
+        'account_id'  => 'required|uuid|exists:accounts,id',
+        'vault_id'    => 'required|uuid|exists:vaults,id',
+        'author_id'   => 'required|uuid|exists:users,id',
+        'uuid'        => 'required|string',
+        'name'        => 'required|string',
+        'original_url'=> 'required|string',
+        'cdn_url'     => 'required|string',
+        'mime_type'   => 'required|string',
+        'size'        => 'required|integer',
+        'type'        => 'required|string',
+    ];
+}
+```
+
+**关键发现**：
+
+| 字段 | 校验规则 | 缺失的限制 |
+| ---- | -------- | ---------- |
+| `mime_type` | `required\|string` | **没有 `mimetypes` 或 `mimes` 规则**，不检查是否为 image/* 等合法类型 |
+| `size` | `required\|integer` | **没有 `min`/`max` 规则**，0 字节或数十 GB 的 size 值都能通过 |
+| `type` | `required\|string` | **没有 `in:document,avatar,photo` 规则**，任意字符串都能写入 |
+| `uuid` | `required\|string` | **没有 `uuid` 格式校验**（对比 `account_id` 有 `uuid` 规则），任意字符串都能作为 Uploadcare UUID 传入 |
+| `name` | `required\|string` | 没有长度限制、没有文件扩展名白名单 |
+
+也就是说，**后端 UploadFile Service 不校验文件类型、不限制文件大小、不验证 UUID 格式**。它只确保这些字段「存在且为字符串/整数」。
+
+### 14.2 后端校验层：UpdatePhotoAsAvatar Service
+
+[UpdatePhotoAsAvatar.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageAvatar/Services/UpdatePhotoAsAvatar.php#L21-L29)
+
+```php
+public function rules(): array
+{
+    return [
+        'account_id' => 'required|uuid|exists:accounts,id',
+        'vault_id'   => 'required|uuid|exists:vaults,id',
+        'author_id'  => 'required|uuid|exists:users,id',
+        'contact_id' => 'required|uuid|exists:contacts,id',
+        'file_id'    => 'nullable|integer|exists:files,id',
+    ];
+}
+```
+
+这里额外校验了 `file_id` 必须存在于 `files` 表，且在 `validate()` 方法中进一步限定 `where('type', File::TYPE_AVATAR)`——只有 type 为 avatar 的文件才能被设为头像。这是唯一一层对文件类型的间接约束。
+
+### 14.3 存储配额校验：StorageHelper::canUploadFile
+
+[StorageHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Helpers/StorageHelper.php#L15-L31)
+
+```php
+public static function canUploadFile(Account $account): bool
+{
+    if ($account->storage_limit_in_mb == 0) {
+        return true;   // 0 = 不限量
+    }
+
+    $vaultIds = $account->vaults()->select('id')->get()->toArray();
+    $totalSizeInBytes = File::whereIn('vault_id', $vaultIds)->sum('size');
+    $accountLimit = $account->storage_limit_in_mb * 1024 * 1024;
+
+    return $totalSizeInBytes < $accountLimit;
+}
+```
+
+**这是 Monica 唯一的大小限制机制**：
+- 在前端渲染时计算 `canUploadFile`，决定是否显示上传按钮
+- 如果账户已用空间 >= 配额，上传按钮不渲染
+- **但后端没有二次校验**：即使前端隐藏了按钮，直接 `PUT /avatar` 仍可绕过此限制，因为 `UploadFile` Service 不检查配额
+
+### 14.4 前端 Uploadcare Widget 的限制
+
+[Show.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/resources/js/Pages/Vault/Contact/Show.vue#L236-L244) 中头像上传组件的配置：
+
+```vue
+<Uploadcare
+  :public-key="data.avatar.uploadcare.publicKey"
+  :secure-signature="data.avatar.uploadcare.signature"
+  :secure-expire="data.avatar.uploadcare.expire"
+  :tabs="'file'"
+  :preview-step="false"
+  @success="onSuccess"
+  @error="onError">
+```
+
+而 [Uploadcare.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/resources/js/Components/Uploadcare.vue) 支持的 props：
+
+| Prop | 默认值 | 头像上传时传的值 | 作用 |
+| ---- | ------ | ---------------- | ---- |
+| `imagesOnly` | `false` | **未传（默认 false）** | 如果为 true，Uploadcare 弹窗只允许选图片 |
+| `crop` | `''` | **未传（空字符串）** | 如果设置如 `"1:1"`，Uploadcare 会强制裁剪 |
+| `imageShrink` | `false` | **未传** | 如果为 true，大图会被自动缩小 |
+| `multipartMinSize` | `26214400`（25MB） | **未传（默认 25MB）** | 超过此大小启用分片上传 |
+
+**关键发现**：
+- 头像上传时 `imagesOnly` 没有设为 `true`——理论上用户可以上传 PDF、ZIP 等非图片文件作为头像
+- `crop` 没有设置——上传头像时不强制 1:1 裁剪，最终展示时的方形裁剪完全由 CDN URL 参数 `scale_crop/300x300` 完成，这意味着原始文件可能是任意比例的图
+- `imageShrink` 没有启用——大图（如 8000×6000 的相机原片）会原封不动地传到 CDN，虽然 CDN 取图时会缩放，但原始文件占用 Uploadcare 存储空间
+
+### 14.5 对比：照片上传和文档上传
+
+[ContactModulePhotoController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManagePhotos/Web/Controllers/ContactModulePhotoController.php#L16-L40) 的上传逻辑与头像完全一致——同样调用 `UploadFile`，同样无类型/大小校验，仅 `type` 字段改为 `TYPE_PHOTO`。
+
+照片页面的 Uploadcare 配置（在照片列表页 Vue 中）可能不同（可能启用了 `imagesOnly` 和 `crop`），但后端校验层同样没有约束。
+
+### 14.6 校验缺失的风险汇总
+
+| 风险 | 场景 | 后果 |
+| ---- | ---- | ---- |
+| 无 MIME 类型校验 | 恶意请求传 `mime_type: application/pdf` | 非图片文件被当作头像/照片存入，avatar Attribute 的 CDN 裁剪 URL 返回错误 |
+| 无文件大小上限 | 传 `size: 9999999999` | 绕过前端配额检查，Uploadcare 存储被滥用（实际 Uploadcare 账户可能有自己的大小限制） |
+| 无 type 枚举校验 | 传 `type: malicious` | files 表出现非预期类型值，查询过滤可能遗漏 |
+| UUID 无格式校验 | 传 `uuid: ../../../etc/passwd` | 低风险——此 uuid 只用于拼接 CDN URL，不用于本地文件路径 |
+| 前端不强制 imagesOnly | 用户在 Uploadcare 弹窗选了非图片文件 | 文件能成功上传到 CDN，但 CDN 的 scale_crop 操作会失败，头像展示异常 |
