@@ -1506,3 +1506,292 @@ Monica 的 Uploadcare 签名和 Laravel 的 CSRF Token 在暴露形式上类似�
 | **服务端校验** | Laravel 每个非 GET 请求强制校验 | Uploadcare 上传端点校验 |
 
 值得注意的是 Uploadcare 签名**每次页面刷新都重新生成**，所以同一用户多次打开页面会得到多个不同且都有效的签名。签名过期的时间点是各自独立计算的（`now + ttl`），这会让有效签名数量随页面访问次数线性增长。
+
+---
+
+## 23. Slice 封面上传：写入老 fileable_id 列但端模型未定义对应关系
+
+### 23.1 SetSliceOfLifeCoverImage 如何写入关联
+
+[SetSliceOfLifeCoverImage::execute()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Services/SetSliceOfLifeCoverImage.php#L48-L61)
+
+```php
+$this->slice->file_cover_image_id = $this->file->id;  // ← 1. 写入 SliceOfLife 自身的外键
+$this->slice->save();
+
+$this->file->fileable_id = $this->slice->id;          // ← 2. 写入 fileable 多态关联（INT 主键那套）
+$this->file->fileable_type = SliceOfLife::class;
+$this->file->save();
+```
+
+同时维护了两套关联：
+- **正向 BelongsTo**：`slice_of_lives.file_cover_image_id` → `files.id`（由 [SliceOfLife::file()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Models/SliceOfLife.php#L52-L55) 定义，指定键名 `file_cover_image_id`）
+- **反向 MorphMany**：`files.fileable_id = slice.id` + `files.fileable_type = SliceOfLife::class`（使用 INT 主键那套老关联）
+
+### 23.2 但 SliceOfLife 模型**未定义反向 morphMany 关系**
+
+对比 [Post::files()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Models/Post.php#L112-L115)：
+
+```php
+// Post 模型有定义
+public function files(): MorphMany
+{
+    return $this->morphMany(File::class, 'fileable');
+}
+```
+
+而 [SliceOfLife 模型](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Models/SliceOfLife.php#L10-L56) 的全部关系只有 `journal()`、`posts()`、`file()` ——**没有 `files()` 方法**。
+
+这意味着：
+
+| 操作 | Post（有定义） | SliceOfLife（无定义） |
+| ---- | ------------- | -------------------- |
+| `$model->files` 动态属性读取 | ✅ 返回该 Post 的全部照片 | ❌ 报错：`Undefined property` |
+| `$model->files()->save($file)` | ✅ 自动写入 fileable_id/type | ❌ 报错：`Call to undefined method` |
+| `$model->files()->where(...)` 查询 | ✅ 可以按 Post 过滤照片 | ❌ 无法使用 |
+| 通过 `File::where('fileable_type', SliceOfLife::class)->where('fileable_id', $sliceId)` 查询 | — | ✅ 手写 SQL 可以查到 |
+
+### 23.3 为何业务没有因此报错
+
+SetSliceOfLifeCoverImage 和 AddPhotoToPost 都**绕过了 Eloquent 关系**，直接手动写入 `$file->fileable_id` 和 `$file->fileable_type`，而不是调用 `$slice->files()->save($file)`。所以缺失关系定义在写入时不会暴露问题。
+
+但查询时，以下代码都**没有使用** `$slice->files`：
+- 展示封面用 `$slice->file`（BelongsTo，存在）
+- 删除封面用 `$slice->file->delete()`（同上）
+- Vault 文件管理页用 `File::where('vault_id', ...)` 全局查询
+
+因此这个缺失只影响「列出某个 Slice 的全部封面历史」这类需求，但由于 Slice 只有一张当前封面（`file_cover_image_id` 一对一），历史封面在业务上其实不被查询，所以 bug 被掩盖。
+
+### 23.4 修复建议
+
+在 SliceOfLife 模型中补加：
+
+```php
+public function files(): MorphMany
+{
+    return $this->morphMany(File::class, 'fileable');
+}
+```
+
+虽然当前业务不直接使用，但这是与 Post 保持一致的正确模型定义，可避免后续开发踩坑。
+
+---
+
+## 24. files.original_url：强校验写入但读取方为零
+
+### 24.1 写入路径
+
+所有 5 个上传入口（Avatar / Contact Photo / Contact Document / Post Photo / Slice Cover）都要求前端传入 `original_url`：
+
+| 上传场景 | Controller |
+| -------- | ---------- |
+| 头像 | [ModuleAvatarController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageAvatar/Web/Controllers/ModuleAvatarController.php#L24) |
+| 联系人照片 | [ContactModulePhotoController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManagePhotos/Web/Controllers/ContactModulePhotoController.php#L24) |
+| 联系人文档 | [ContactModuleDocumentController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Web/Controllers/ContactModuleDocumentController.php#L24) |
+| Post 照片 | [PostPhotoController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Web/Controllers/PostPhotoController.php#L24) |
+| Slice 封面 | [SliceOfLifeCoverImageController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Web/Controllers/SliceOfLifeCoverImageController.php#L25) |
+
+[UploadFile::rules()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Services/UploadFile.php#L26) 强制校验：
+
+```php
+'original_url' => 'required|string',   // ← required，不可省略
+'cdn_url'      => 'required|string',
+```
+
+前端 [Uploadcare.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/resources/js/Components/Uploadcare.vue) 的 `onSuccess` 回调中，把 `file.originalUrl` 和 `file.cdnUrl` 都传给后端。
+
+### 24.2 全局搜索：original_url 的读取方
+
+对 `app/` 目录和 `resources/js/` 目录做全局搜索：
+
+- PHP 端：**8 处** —— 全部是写入（`$request->input('original_url')` 或 `fillable` 声明或 `rules()`），**零处读取**
+- JS 端：**6 处** —— 全部是写入 form（`this.form.original_url = file.originalUrl`），**零处消费**
+
+读取到 `$file->original_url` 的 ViewHelper / Controller / Service 数量 = **0**。
+
+对比之下，`cdn_url` 有 **5 处读取**（全部是 `'download' => $file->cdn_url`）。
+
+### 24.3 original_url 和 cdn_url 的区别（Uploadcare 语义）
+
+根据 Uploadcare SDK 语义：
+- `file.originalUrl`：用户上传前本地文件的原始路径（浏览器中通常是 `blob:` URL 或临时对象 URL），**不保证可公网访问**
+- `file.cdnUrl`：文件上传到 Uploadcare CDN 后的正式 URL，形如 `https://ucarecdn.com/{uuid}/`，**可永久公网访问**
+
+也就是说，`original_url` 是**前端浏览器本地的临时 URL**，传到后端存进数据库完全没有意义——后端和其他用户根本无法访问这个本地 blob URL。
+
+### 24.4 问题总结
+
+| 问题 | 说明 |
+| ---- | ---- |
+| **存储浪费** | 每条 File 记录多存一个无用字符串字段（通常是几十到几百字节的 blob URL） |
+| **校验冗余** | `required\|string` 校验强制前端必须传一个无用字段 |
+| **可能的误解** | 后续开发者看到此字段可能误以为可以用它访问原始文件，实际却不行 |
+| **与 cdn_url 功能重叠** | Uploadcare 真正可用的下载 URL 是 cdn_url，original_url 在后端无任何用途 |
+
+### 24.5 修复建议
+
+- 短期：从 UploadFile `rules()` 中去掉 `required`，改为 `nullable|string`，避免未来重构时前端不传就报错
+- 长期：新建迁移移除 `files.original_url` 列，同时移除 Controller 中的 `$request->input('original_url')` 和前端 form 中的 `original_url` 字段
+
+---
+
+## 25. Slice 封面与联系人照片的隔离：共用 TYPE_PHOTO 标签，仅靠 fileable_type 区分
+
+### 25.1 Slice 封面的 type 标签
+
+[SliceOfLifeCoverImageController::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Web/Controllers/SliceOfLifeCoverImageController.php#L29)：
+
+```php
+$data = [
+    // ...
+    'type' => File::TYPE_PHOTO,   // ← 与联系人照片完全相同的常量值 'photo'
+];
+$file = (new UploadFile)->execute($data);
+```
+
+没有 `TYPE_COVER` 或 `TYPE_SLICE_COVER` 之类的独立常量，Slice 封面直接复用 `TYPE_PHOTO`。
+
+### 25.2 仅靠两层隔离区分
+
+| 隔离层 | 联系人照片 | Slice 封面 | Post 内嵌照片 |
+| ------ | ---------- | ---------- | ------------- |
+| 第一层：`files.type` | `'photo'` | `'photo'` | `'photo'` |
+| 第二层：`files.fileable_type` | `Contact::class` (UUID 走 ufileable_id) | `SliceOfLife::class` (INT 走 fileable_id) | `Post::class` (INT 走 fileable_id) |
+| 第三层：外键 | `contacts.file_id` (仅头像) + `ufileable_id` | `slice_of_lives.file_cover_image_id` + `fileable_id` | `fileable_id` |
+
+### 25.3 隔离不充分带来的问题
+
+**问题 1：Vault 文件管理页混在一起，无法分辨**
+
+[VaultFileController::photos()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageFiles/Web/Controllers/VaultFileController.php#L34-L49) 和 `avatars()` / `documents()` 的查询方式：
+
+```php
+// 仅按 type 过滤
+$files = File::where('vault_id', $vaultId)
+    ->where('type', File::TYPE_PHOTO)   // ← 只看 type=photo
+    ->orderBy('created_at', 'desc')
+    ->paginate(25);
+```
+
+这意味着**联系人照片、Post 内嵌照片、Slice 封面全部出现在同一个「照片」Tab 下**，用户在 Vault 文件管理页中完全看不出这张照片是属于某个 Contact 还是某个 Slice。
+
+[VaultFileIndexViewHelper::getObjectDetails()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageFiles/Web/ViewHelpers/VaultFileIndexViewHelper.php#L79-L96) 用 match 处理归属：
+
+```php
+return match ($file->fileable_type) {
+    Contact::class => [ 'type' => 'contact', ... ], // 仅 Contact 有处理
+    default => [],   // ← Post 和 SliceOfLife 的文件都返回空数组，显示成「未知归属」
+};
+```
+
+**问题 2：DestroyFile 的 updateLastEditedDate 只处理 Contact**
+
+[DestroyFile::updateLastEditedDate()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Services/DestroyFile.php#L63-L69)
+
+```php
+if ($this->file->fileable_type == Contact::class) {
+    $this->file->ufileable->last_updated_at = Carbon::now();
+    $this->file->ufileable->save();
+}
+```
+
+删除 Slice 封面或 Post 照片时，**归属对象的时间戳完全不更新**——既不检查 SliceOfLife 也不检查 Post，即使它们可能有 `updated_at` 字段。
+
+**问题 3：DestroyFile 不区分 type，任何路由可以删除任意 type**
+
+第 19 章已分析：4 个控制器共用 DestroyFile，Service 内部不校验 type。因此用联系人照片的删除路由可以删掉一张 Slice 封面，只要它在同 Vault 下。
+
+### 25.4 建议的隔离方案
+
+| 方案 | 做法 | 优劣 |
+| ---- | ---- | ---- |
+| A. 细化 File::type 常量 | 新增 `TYPE_COVER = 'cover'` 或 `TYPE_SLICE_COVER`，Slice 封面写入时用新 type | 清晰；但需同步修改所有过滤查询和 Vault 文件管理页的 Tab |
+| B. 保留 type=photo，查询时同时按 fileable_type 过滤 | 联系人照片查询加 `where('fileable_type', Contact::class)` | 无需迁移；但每个查询点都要补 where 条件 |
+| C. DestroyFile 中 expected_type 校验同时校验 fileable_type | Service 层新增 `expected_fileable_type` 参数 | 解决跨归属删除越权；但不解决展示层混合 |
+
+---
+
+## 26. Slice 封面误删后 SliceOfLife.file_cover_image_id 外键的级联效果
+
+### 26.1 迁移中的外键约束
+
+[2022_12_15_004442_create_slices_of_life_table.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/database/migrations/2022_12_15_004442_create_slices_of_life_table.php#L22)：
+
+```php
+$table->foreignIdFor(File::class, 'file_cover_image_id')
+    ->nullable()
+    ->constrained('files')
+    ->nullOnDelete();   // ← 关键：文件被删时，自动把此外键设为 NULL
+```
+
+`nullOnDelete()` 是 Laravel 对外键 `ON DELETE SET NULL` 的封装。
+
+### 26.2 两条删除路径的对比
+
+**路径 A：正常移除（通过 RemoveSliceOfLifeCoverImage Service）**
+
+[RemoveSliceOfLifeCoverImage::execute()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Services/RemoveSliceOfLifeCoverImage.php#L44-L57)：
+
+```php
+if ($this->slice->file) {
+    $this->slice->file->delete();      // ① 先删 File 记录
+                                       // → DB 级外键 nullOnDelete 自动把
+                                       //   slice_of_lives.file_cover_image_id 置为 NULL
+                                       // → 同时触发 FileDeleted 事件 → DeleteFileInStorage
+                                       //   → 调 Uploadcare API 删 CDN 文件
+}
+
+$this->slice->file_cover_image_id = null;  // ② 再显式写一次 NULL（重复但无害）
+$this->slice->save();
+```
+
+注意这里有一个**重复操作**：第 ① 步删 File 后，外键 `nullOnDelete` 已经把 DB 中的 `file_cover_image_id` 置为 NULL；第 ② 步再写一次是冗余的，但不会出错。
+
+**路径 B：误删（通过 DestroyFile / Vault 文件管理删了封面文件）**
+
+假设用户在 Vault 文件管理页（[VaultFileController::destroy()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageFiles/Web/Controllers/VaultFileController.php#L85-L99)）看到了某张封面照片，直接点删除：
+
+```
+DELETE FROM files WHERE id = {coverFileId}
+        │
+        ▼  外键 ON DELETE SET NULL
+slice_of_lives.file_cover_image_id = NULL
+        │
+        ▼  Eloquent deleted 事件
+FileDeleted 事件 → DeleteFileInStorage → Uploadcare API → CDN 文件删除
+        │
+        ▼  DestroyFile 的 updateLastEditedDate
+fileable_type == SliceOfLife::class != Contact::class → 不更新任何时间戳
+```
+
+结果：
+- ✅ 数据库完整性：外键自动 `NULL`，不会出现悬垂指针
+- ✅ CDN 文件同步删除：DeleteFileInStorage Listener 正常工作
+- ✅ Slice 再次读取时 `$slice->file` 返回 null，ViewHelper 已做 `optional()` 处理（[SliceOfLifeShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeShowViewHelper.php#L79) 写的是 `$slice->file ? ... : null`）
+- ❌ SliceOfLife 的 `updated_at` 不更新（DestroyFile 只处理 Contact）
+- ❌ 没有写动态流或日志，用户可能不知道封面为什么不见了
+
+### 26.3 与联系人头像删除的对比
+
+| | 头像删除（DestroyAvatar Service） | Slice 封面误删（DestroyFile → DB 级联） |
+| - | -------------------------------- | --------------------------------------- |
+| 外键处理 | Service 显式 `$contact->file_id = null` + `save()` | DB 级 `nullOnDelete` 自动处理 |
+| 是否触发 FileDeleted 事件 | ✅ 是（`$this->contact->file->delete()`） | ✅ 是（`$this->file->delete()`） |
+| CDN 文件是否同步删除 | ✅ 是 | ✅ 是 |
+| Contact/Slice 时间戳 | ✅ `updateLastEditedDate()` 写 `last_updated_at` | ❌ 不更新 |
+| 动态流（Feed Item） | ✅ 写 `ACTION_CHANGE_AVATAR` | ❌ 没有 |
+| 是否可以从任意路由触发 | ❌ 只有 `contact.avatar.destroy` 调 DestroyAvatar | ✅ 4 个 DestroyFile 入口都可以删 |
+
+### 26.4 隐藏问题：RemoveSliceOfLifeCoverImage 的显式 NULL 可能在事务回滚时不一致
+
+RemoveSliceOfLifeCoverImage 中：
+1. `$this->slice->file->delete()` 触发 `deleted` 事件 → Uploadcare REST API（HTTP，不在事务内）
+2. `$this->slice->file_cover_image_id = null` → `save()`（DB 写入）
+
+如果第 ② 步 DB 写入失败（如死锁、连接断开），会出现：
+- CDN 文件已被删（HTTP 请求已完成，无法回滚）
+- 但 `slice_of_lives.file_cover_image_id` 仍指向已删除文件的 id —— **除非外键 nullOnDelete 在同一 DB 事务内自动生效**
+
+实际上第 ① 步 Eloquent `delete()` 执行的 SQL `DELETE FROM files` 和第 ② 步 `UPDATE slice_of_lives` 在同一个请求中通常共享同一个 DB 连接，`nullOnDelete` 的 `ON DELETE SET NULL` 是 MySQL 内部机制，与 DELETE 在同一事务中自动完成——所以 `file_cover_image_id` 在 DELETE 后立即就是 NULL，第 ② 步只是覆盖写 NULL，失败不会导致不一致。
+
+但这不是一个稳健的模式：**Service 应该只维护一套语义，不要同时依赖 DB 级联和显式赋值。**
