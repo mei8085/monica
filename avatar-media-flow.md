@@ -1171,3 +1171,338 @@ if (is_null($contact->first_name)) {
 | 联系人 `id` 为空（未持久化） | Faker 随机 | `$contact->id` 为 null → MultiAvatar 收到空字符串 → 返回空 SVG |
 
 最后一个边界情况需要注意：**未持久化的 Contact 没有 id**。如果 `generateRandomAvatar()` 在 `Contact::create()` 之前被调用（虽然当前代码不存在此场景），UUID 主键尚未生成，会传入 null。但当前所有调用点都在联系人已存在之后，所以这不是实际问题。
+
+---
+
+## 19. DestroyFile Service 被多控制器共用但未按类型守门的权限问题
+
+### 19.1 四个控制器共用同一个 DestroyFile
+
+通过代码搜索发现，[DestroyFile](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Services/DestroyFile.php) Service 被以下 4 个控制器的 destroy 方法调用：
+
+| 控制器 | 路由 | 删除场景 | 预期删除的 type |
+| ------ | ---- | -------- | ---------------- |
+| [ContactModulePhotoController](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManagePhotos/Web/Controllers/ContactModulePhotoController.php#L42-L59) | `contact.photo.destroy` | 联系人照片模块中删除某张照片 | `TYPE_PHOTO` |
+| [ContactModuleDocumentController](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Web/Controllers/ContactModuleDocumentController.php#L42-L56) | `contact.document.destroy` | 联系人文档模块中删除某个文档 | `TYPE_DOCUMENT` |
+| [PostPhotoController](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Web/Controllers/PostPhotoController.php#L47-L61) | `post.photos.destroy` | Journal 的 Post 中删除某张内嵌照片 | `TYPE_PHOTO` |
+| [VaultFileController](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageFiles/Web/Controllers/VaultFileController.php#L85-L99) | `vault.files.destroy` | Vault 级文件管理页（所有类型汇总） | 任意 type（合理） |
+
+### 19.2 DestroyFile 的权限与校验缺口
+
+[DestroyFile.php](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Services/DestroyFile.php#L20-L61) 中的校验逻辑：
+
+```php
+public function rules(): array
+{
+    return [
+        'account_id' => 'required|uuid|exists:accounts,id',
+        'vault_id'   => 'required|uuid|exists:vaults,id',
+        'author_id'  => 'required|uuid|exists:users,id',
+        'file_id'    => 'required|integer|exists:files,id',  // ← 只校验 file_id 存在
+    ];
+}
+
+public function permissions(): array
+{
+    return [
+        'author_must_belong_to_account',
+        'vault_must_belong_to_account',
+        'author_must_be_vault_editor',  // ← 只校验 Vault Editor 权限
+    ];
+}
+
+private function validate(): void
+{
+    $this->validateRules($this->data);
+    // 只校验文件属于该 vault，不校验 type
+    $this->file = $this->vault->files()->findOrFail($this->data['file_id']);
+}
+```
+
+**关键发现：DestroyFile Service 内部完全不知道自己被哪种场景调用**——它不接收、也不校验 `type` 字段。
+
+### 19.3 具体越权场景
+
+由于缺失 `type` 守门，可以构造以下越权请求：
+
+| 场景 | 攻击方式 | 后果 |
+| ---- | -------- | ---- |
+| 跨类型删除（照片路由删头像） | 知道某头像文件 id=123，调用 `DELETE /vault/xxx/contact/yyy/photo/123` | 该联系人头像被删，而当前用户可能**没有编辑该联系人详情的权限**，只有查看照片模块的权限 |
+| 跨类型删除（文档路由删照片） | 调用 `DELETE /vault/xxx/contact/yyy/document/456` 传的是照片文件 id=456 | 照片被删，同样不校验文件是否属于该文档模块 |
+| Post 照片删 Contact 照片 | 调 `DELETE /vault/xxx/journal/1/post/2/photo/123`，传一个属于 Contact 的 TYPE_PHOTO 的 file_id=123 | Contact 的照片被删，请求来自 Journal Post 路由，但文件实际归属 Contact |
+
+**根本原因**：四个路由从 RESTful 设计上看应该各自限定只能删除自己「归属」的文件，但控制器只是把 `file_id` 原样传给 DestroyFile，没有在 Service 层或 Controller 层做「文件归属 + 文件类型」的双重校验。
+
+### 19.4 唯一的隐式限制
+
+DestroyFile 的唯一过滤是：
+
+```php
+$this->file = $this->vault->files()->findOrFail($this->data['file_id']);
+```
+
+这确保文件属于该 Vault——但 Vault 是一个很宽的边界。同一个 Vault 下的所有联系人、所有 Journal 共享同一个文件池，V 编辑器可以看到全部，因此**跨联系人、跨 Journal 的删除是可能的**。
+
+### 19.5 建议的修复方案
+
+在 DestroyFile 中增加可选的 `type` 参数校验：
+
+```php
+public function rules(): array
+{
+    return [
+        ...
+        'file_id' => 'required|integer|exists:files,id',
+        'expected_type' => 'nullable|string|in:avatar,photo,document', // 新增
+    ];
+}
+
+private function validate(): void
+{
+    $this->validateRules($this->data);
+    $query = $this->vault->files();
+    if (isset($this->data['expected_type'])) {
+        $query = $query->where('type', $this->data['expected_type']);
+    }
+    $this->file = $query->findOrFail($this->data['file_id']);
+}
+```
+
+同时控制器调用时传入类型：
+
+```php
+// ContactModulePhotoController::destroy
+(new DestroyFile)->execute([... , 'expected_type' => File::TYPE_PHOTO]);
+```
+
+---
+
+## 20. 删除路径中 fileable_type 列的真相：仍在被使用（修正第 12 章结论）
+
+第 12 章中曾得出「`fileable_id` 列在 Contact/Photo/Document 流程中始终为 NULL」的结论是**部分正确但不完整的**。结合 AddPhotoToPost 和 SetSliceOfLifeCoverImage 两个 Service，重新梳理：
+
+### 20.1 fileable_type 在删除路径的实际使用
+
+[DestroyFile::updateLastEditedDate()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Services/DestroyFile.php#L63-L69)
+
+```php
+private function updateLastEditedDate(): void
+{
+    // ← 这里的 fileable_type 绝对不可为 NULL
+    if ($this->file->fileable_type == Contact::class) {
+        // ← 这里用的是 ufileable 关系，但判断条件是 fileable_type！
+        $this->file->ufileable->last_updated_at = Carbon::now();
+        $this->file->ufileable->save();
+    }
+}
+```
+
+**关键点**：`$this->file->fileable_type == Contact::class` 这个判断必须依赖 `fileable_type` 列有正确的值。如果它为 NULL 或存了错误的值，`updateLastEditedDate` 会静默跳过（删 Contact 照片后不更新 last_updated_at），但不会报错。
+
+### 20.2 两种主键类型的模型实际使用的列
+
+| 模型 | 主键类型 | 写入的 ID 列 | fileable_type 值 | 写入位置 |
+| ---- | -------- | ------------ | ---------------- | -------- |
+| **Contact** | UUID (HasUuids) | `ufileable_id`（UUID） | `Contact::class` | 由 `Contact::files()->save($file)` 自动写入（Laravel MorphMany） |
+| **Post** | INT (BIGINT auto_increment) | `fileable_id`（BIGINT） | `Post::class` | [AddPhotoToPost::execute()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Services/AddPhotoToPost.php#L53-L56) 手动赋值 |
+| **SliceOfLife** | INT (BIGINT auto_increment) | `fileable_id`（BIGINT） | `SliceOfLife::class` | [SetSliceOfLifeCoverImage::execute()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Services/SetSliceOfLifeCoverImage.php#L56-L58) 手动赋值 |
+
+**修正后的对照表**（替换第 12 章的表）：
+
+| 模型 | 主键类型 | 使用哪套关联 | fileable_id | ufileable_id | fileable_type |
+| ---- | -------- | ------------ | ----------- | ------------ | ------------- |
+| Contact | UUID | 第二套 (ufileable) | NULL | UUID 值 | `App\Models\Contact` ✅ 有值 |
+| Post | INT | 第一套 (fileable) | BIGINT 值 | NULL | `App\Models\Post` ✅ 有值 |
+| SliceOfLife | INT | 第一套 (fileable) | BIGINT 值 | NULL | `App\Models\SliceOfLife` ✅ 有值 |
+
+### 20.3 fileable_type 还有哪些读取方
+
+| 读取方 | 用途 |
+| ------ | ---- |
+| DestroyFile::updateLastEditedDate() | 判断归属是否为 Contact，决定是否更新联系人的 `last_updated_at` |
+| [VaultFileIndexViewHelper::getObjectDetails()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageFiles/Web/ViewHelpers/VaultFileIndexViewHelper.php#L79-L96) | Vault 文件管理页中，用 `match ($file->fileable_type)` 判断文件归属类型，展示跳转链接（Contact 展示对应联系人链接，其他类型返回空数组） |
+| File::ufileable() 关系 | `morphTo(type: 'fileable_type')`——共享的类型列 |
+| File::fileable() 关系 | `morphTo()`——默认使用类型列，对应 Post/SliceOfLife |
+
+### 20.4 第 12 章潜在问题的修正
+
+原第 12.5 节提到：
+> `fileable()` 关系方法在当前业务中未被调用，属于迁移遗留
+
+**此结论错误**。实际上，`fileable()` 关系虽然没有在 Contact 场景下被使用，但在 Post 和 SliceOfLife 场景下：
+- 由 Service 层手动写入 `fileable_id` + `fileable_type`
+- 对应的关联查询（如 `$post->files()`）在 `Post` 模型中必然定义为 `morphMany(File::class, 'fileable')`，即使用第一套关联
+
+### 20.5 删除路径中的一个隐藏 bug
+
+在 DestroyFile::updateLastEditedDate 中：
+
+```php
+if ($this->file->fileable_type == Contact::class) {
+    $this->file->ufileable->last_updated_at = Carbon::now();
+}
+```
+
+如果文件归属是 `Post::class` 或 `SliceOfLife::class`，**不会更新归属对象的 last_updated_at**——这是合理的，因为 Post 和 SliceOfLife 可能没有 `last_updated_at` 字段。但如果未来新增一个 Contact 以外的模型也使用 `ufileable_id`（UUID 主键 + 第二套关联），这里的判断条件 `== Contact::class` 就会漏掉，导致删除后不更新归属对象的时间戳。
+
+更通用的写法应该是：判断是否存在 `ufileable` 关联对象，且该对象有 `last_updated_at` 字段，而不是硬编码比较 `Contact::class`。
+
+---
+
+## 21. 照片下载/展示 URL 的构造：直接 CDN URL vs 裁剪参数
+
+### 21.1 两种 URL 模式的清晰划分
+
+Monica 所有涉及图片的 ViewHelper 中，URL 严格分为两类：
+
+- **`url.display`**：供前端 `<img>` 标签展示用，**拼接 CDN 裁剪/缩放参数**
+- **`url.download`**：供用户下载原文件用，**直接用 `$file->cdn_url`，不做任何处理**
+
+### 21.2 全场景 display URL 的裁剪参数一览
+
+| 场景 | ViewHelper | 尺寸 | CDN 处理链 |
+| ---- | ---------- | ---- | ---------- |
+| 联系人头像（Attribute） | [Contact::avatar](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Models/Contact.php#L492-L497) | 300×300 | `scale_crop/300x300/smart` → `format/auto` → `quality/smart_retina` |
+| 照片模块缩略图（Contact 模块） | [ModulePhotosViewHelper::dto](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManagePhotos/Web/ViewHelpers/ModulePhotosViewHelper.php#L44-L46) | 300×300 | `scale_crop/300x300/smart` → `format/auto` → `quality/smart_retina` |
+| 照片列表页网格图（Index） | [ContactPhotosIndexViewHelper::dto](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManagePhotos/Web/ViewHelpers/ContactPhotosIndexViewHelper.php#L45-L47) | 400×400 | `scale_crop/400x400/smart` → `format/auto` → `quality/smart_retina` |
+| 照片详情页大图（Show） | [ContactPhotosShowViewHelper::data](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManagePhotos/Web/ViewHelpers/ContactPhotosShowViewHelper.php#L21-L23) | 1700px 宽 | `resize/1700x` → `format/auto` → `quality/smart_retina` |
+| Post 编辑页缩略图 | [PostEditViewHelper::dtoPhoto](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostEditViewHelper.php#L186-L188) | 75×75 | `scale_crop/75x75/smart` → `format/auto` → `quality/smart_retina` |
+| Post 展示页缩略图 | [PostShowViewHelper::getPhotos()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostShowViewHelper.php#L154-L156) | 100×100 | `scale_crop/100x100/smart` → `format/auto` → `quality/smart_retina` |
+| Journal 列表页 Post 封面 | [JournalShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/JournalShowViewHelper.php#L87-L89) | 75×75 | `scale_crop/75x75/smart` → `format/auto` → `quality/smart_retina` |
+| Journal 相册页索引 | [JournalPhotoIndexViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/JournalPhotoIndexViewHelper.php#L53-L55) | 200×200 | `scale_crop/200x200/smart` → `format/auto` → `quality/smart_retina` |
+| Journal 列表页 Slice 封面 | [JournalShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/JournalShowViewHelper.php#L206-L208) | 200×100 | `scale_crop/200x100/smart` → `format/auto` → `quality/smart_retina` |
+| Slice 详情页封面大图 | [SliceOfLifeShowViewHelper::dtoSlice](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeShowViewHelper.php#L79) | 800×100 | `scale_crop/800x100/smart` → `format/auto` → `quality/smart_retina` |
+
+### 21.3 download URL 的统一模式
+
+所有 ViewHelper 中 download URL 的构造完全一致：
+
+| ViewHelper | 代码 |
+| ---------- | ---- |
+| [ModulePhotosViewHelper::dto](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManagePhotos/Web/ViewHelpers/ModulePhotosViewHelper.php#L46) | `'download' => $file->cdn_url` |
+| [ModuleDocumentsViewHelper::dto](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Web/ViewHelpers/ModuleDocumentsViewHelper.php#L43) | `'download' => $file->cdn_url` |
+| [ContactPhotosIndexViewHelper::dto](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManagePhotos/Web/ViewHelpers/ContactPhotosIndexViewHelper.php#L47) | `'download' => $file->cdn_url` |
+| [ContactPhotosShowViewHelper::data](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManagePhotos/Web/ViewHelpers/ContactPhotosShowViewHelper.php#L22) | `'download' => $file->cdn_url` |
+| [VaultFileIndexViewHelper::data](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Vault/ManageFiles/Web/ViewHelpers/VaultFileIndexViewHelper.php#L26) | `'download' => $file->cdn_url` |
+
+### 21.4 `$file->cdn_url` 从何而来
+
+`cdn_url` 字段是**前端上传时传过来的**，不是后端自己拼的：
+
+- 前端 Uploadcare Widget 上传成功后，`file.cdnUrl` 属性（通常形如 `https://ucarecdn.com/{uuid}/`）被 axios PUT/POST 到后端
+- [UploadFile::save()](file:///d:/fz/0601-2/solo-dogfeeding/code/71-monica/app/Domains/Contact/ManageDocuments/Services/UploadFile.php#L77-L88) 原样存入 `files.cdn_url` 列
+
+所以 download URL 实际上就是**用户上传的原始文件在 CDN 上的根 URL**，不含任何图像转换参数。
+
+### 21.5 两种 URL 模式的设计意图
+
+| | display URL | download URL |
+| - | ----------- | ------------ |
+| **目的** | 给 `<img>` 标签快速加载缩略图 | 给用户下载原始文件 |
+| **体积** | 小（300-1700px 且格式压缩，通常几十 KB） | 大（原始分辨率，可能几 MB 到几十 MB） |
+| **格式** | 自动选择 WebP/AVIF | 保留用户上传的原始格式 |
+| **质量损耗** | 有（smart_retina 级别压缩） | 无（完全无损） |
+| **生成位置** | ViewHelper 实时拼接字符串 | 前端上传时写入数据库，后端原样返回 |
+| **代码重复度** | 10 处硬编码，每次拼接 3 段相同参数（`scale_crop/...` + `format/auto` + `quality/smart_retina`） | 完全一致，无重复 |
+
+### 21.6 设计改进建议
+
+`format/auto` + `quality/smart_retina` 这两段在 10 处 display URL 中重复出现，建议抽到 `FileHelper` 静态方法中：
+
+```php
+public static function displayUrl(string $uuid, string $size = '300x300'): string
+{
+    return 'https://ucarecdn.com/'.$uuid.'/-/scale_crop/'.$size.'/smart/-/format/auto/-/quality/smart_retina/';
+}
+```
+
+---
+
+## 22. Uploadcare 签名直接嵌入 HTML 的暴露风险
+
+### 22.1 签名如何到达用户浏览器
+
+完整链路：
+
+```
+StorageHelper::uploadcare()
+  ├─► new Signature($privateKey)         ← PHP 内计算签名
+  ├─► getSignature() → HMAC-SHA256 字符串
+  └─► getExpire() → Unix 时间戳
+       │
+       ▼
+ContactShowViewHelper / ModulePhotosViewHelper / ...
+  └─► 'uploadcare' => StorageHelper::uploadcare()   ← 放入返回数组
+       │
+       ▼
+Inertia::render() → 序列化为 JSON
+  └─► 注入到 HTML 页面的 <div id="app" data-page="{...}"> 属性
+       │
+       ▼
+浏览器接收 HTML → Vue/Inertia 解析 data-page JSON
+  └─► props.data.avatar.uploadcare.signature 可用
+       │
+       ▼
+Uploadcare.vue 中
+  └─► secureSignature, secureExpire 传入 uploadcare.openDialog()
+```
+
+**签名以明文形式出现在 HTML 源码中**。任何打开 DevTools、查看页面源码、抓 HTTP 包（或使用中间人攻击读取明文 HTTP）的人都能直接看到这 64 个十六进制字符的 HMAC 签名。
+
+### 22.2 签名泄露后能做什么
+
+结合第 15 章对签名算法的分析，当前签名设计的特点是：
+- ✅ 不绑定私钥（不暴露私钥本身）
+- ✅ 有时效性（最多 1 小时）
+- ❌ **不绑定文件**：同一签名可用于任意文件的上传
+- ❌ **不绑定用户**：拿到签名的任何人都能用
+- ❌ **不绑定 IP**：跨网络重放有效
+
+具体攻击场景：
+
+| 场景 | 可行性 | 效果 |
+| ---- | ------ | ---- |
+| **跨用户上传** | 完全可行 | 同一 Vault 的另一个合法用户 B 查看页面得到签名后，可以用自己的程序直接上传文件到 Monica 的 Uploadcare 项目，再通过构造合法请求写入 Contact A 的照片列表——只要 B 有 Vault Editor 权限，整个流程完全合法 |
+| **签名截获重放** | 在 HTTP 明文传输下可行（通常 Monica 是 HTTPS，降低风险） | 攻击者在有效期内用截获的签名上传任意内容 |
+| **上传非法内容** | 完全可行 | 签名不约束文件类型/内容，攻击者可以上传超大文件、恶意软件、色情内容到 Monica 的 Uploadcare 项目空间，产生账单风险和法律风险 |
+| **签名滥用上传后不入库** | 完全可行 | 攻击者直接用签名向 Uploadcare 上传文件，不回调 Monica 后端——CDN 文件存在但 Monica 无记录，产生无主的存储消耗 |
+
+### 22.3 风险的前提条件与边界
+
+| 前提 | 是否通常满足 |
+| ---- | ------------ |
+| Monica 站点有多个信任边界不同的用户（如家庭共享、团队使用） | 取决于部署方式 |
+| 站点通过 HTTPS 服务 | 是（任何现代部署都是 HTTPS） |
+| 用户使用公共电脑 / 共享浏览器 Session | 低概率 |
+| Uploadcare 账户有存储上限或按用量计费 | 是（商业 SaaS） |
+| 站点对外公开注册 | 通常不是（Monica 是自部署私密 CRM） |
+
+**综合评价**：在典型自部署场景（单用户/家庭使用 + HTTPS）下，此风险等级为**低**。但在多租户 SaaS 部署或团队共享部署场景下，风险等级提升为**中**。
+
+### 22.4 为什么不能把签名放在上传请求时动态获取
+
+直觉上，用户点击上传按钮时再 AJAX 请求一个签名会更安全——但这实际上和嵌入 HTML 在风险上等价，因为用户点击上传按钮的时刻同样是在浏览器中，同样能被 DevTools 截获。签名生成必须在服务端完成，而任何传送到浏览器的数据本质上都是用户可读取的。
+
+**真正有效的加固手段**（而非隐藏签名）：
+
+| 方案 | 效果 |
+| ---- | ---- |
+| **缩短 TTL** | 把默认 3600 秒改为 300-600 秒。上传操作通常在几十秒内完成，1 小时过于宽松 |
+| **Uploadcare 后端 Webhook 校验** | 在 Uploadcare Dashboard 配置文件上传 Webhook，Monica 收到后校验上传来源，删除未通过 Monica 后端注册的「无主文件」 |
+| **上传完成后后端再校验 type/mime/size** | UploadFile Service 中增加规则（如第 14 章建议的），即使签名被滥用上传非法文件，也写不进 Monica 数据库 |
+| **上传速率限制** | 对 `/contact/*/store` 和 `/avatar/update` 等上传入库路由加 Throttle 中间件 |
+| **Uploadcare 项目层面加限制** | 在 Uploadcare Dashboard 配置文件大小上限、允许的 MIME 类型白名单——在 CDN 侧第一层拦截 |
+
+### 22.5 与典型 CSRF Token 的安全性对比
+
+Monica 的 Uploadcare 签名和 Laravel 的 CSRF Token 在暴露形式上类似（都嵌入 HTML），但本质不同：
+
+| | Laravel CSRF Token | Uploadcare 签名 |
+| - | ------------------ | --------------- |
+| **生命周期** | 整个 Session（2 小时或更长） | 最多 1 小时（SDK MAX_TTL） |
+| **每次刷新是否更新** | 同一 Session 内不更新 | ✅ 每次页面刷新重新生成 |
+| **泄露后能做什么** | 在当前 Session 内伪造表单提交 | 有效期内上传任意文件到 Uploadcare 项目 |
+| **是否绑定用户/会话** | ✅ 绑定当前 Session | ❌ 不绑定 |
+| **服务端校验** | Laravel 每个非 GET 请求强制校验 | Uploadcare 上传端点校验 |
+
+值得注意的是 Uploadcare 签名**每次页面刷新都重新生成**，所以同一用户多次打开页面会得到多个不同且都有效的签名。签名过期的时间点是各自独立计算的（`now + ttl`），这会让有效签名数量随页面访问次数线性增长。
