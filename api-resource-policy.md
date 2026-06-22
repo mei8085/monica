@@ -24,7 +24,7 @@ Monica CRM 的权限体系设计了 **两条平行但不同的执行路径**，�
 ┌─────────────────────┐            ┌─────────────────────────┐
 │      Gate 层         │            │   BaseService 层         │
 │  (AuthServiceProvider│            │  (自定义权限依赖图)       │
-│   定义 8 个 Gate)    │            │  - 权限依赖校验          │
+│   定义 9 个 Gate)    │            │  - 权限依赖校验          │
 └─────────────────────┘            │  - 作用域存在性校验       │
                                    └────────────┬────────────┘
                                                 │
@@ -43,7 +43,7 @@ Monica CRM 的权限体系设计了 **两条平行但不同的执行路径**，�
 
 ### 2.1 Gate 定义层 - [AuthServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Providers/AuthServiceProvider.php#L28-L115)
 
-Gate 在 `boot()` 方法中集中定义，共 8 个权限门，分为三类：
+Gate 在 `boot()` 方法中集中定义，共 9 个权限门，分为三类：
 
 | Gate 名称 | 用途 | 判断逻辑 |
 |-----------|------|----------|
@@ -999,19 +999,23 @@ CalDAV 后端（日历/任务）使用完全相同的 ACL 机制：
 
 ### 15.1 Gate 定义清单 - [AuthServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Providers/AuthServiceProvider.php#L32-L109)
 
-Monica 共定义了 **8 个 Gate**（不含 Telescope/Pulse 等调试工具 Gate）：
+Monica 共定义了 **9 个 Gate**（不含 Telescope/Pulse 等调试工具 Gate），分为三类：
 
-| # | Gate 名称 | 参数 | 判定方式 |
-|---|----------|------|---------|
-| 1 | `administrator` | `User $user` | `$user->is_account_administrator` |
-| 2 | `vault-viewer` | `$user, $vault` | pivot 存在即可 |
-| 3 | `vault-editor` | `$user, $vault` | pivot `permission <= 200` |
-| 4 | `vault-manager` | `$user, $vault` | pivot `permission <= 100` |
-| 5 | `contact-owner` | `$user, $vault, $contact` | `contact.vault_id == vault_id` |
-| 6 | `group-owner` | `$user, $vault, $group` | `group.vault_id == vault_id` |
-| 7 | `journal-owner` | `$user, $vault, $journal` | `journal.vault_id == vault_id` |
-| 8 | `post-owner` | `$user, $journal, $post` | `post.journal_id == journal_id` |
-| 9 | `sliceOfLife-owner` | `$user, $journal, $sliceOfLife` | `sliceOfLife.journal_id == journal_id` |
+- **账户级**：1 个（administrator）
+- **Vault 级**：3 个（viewer/editor/manager）
+- **资源归属级**：5 个（contact/group/journal/post/sliceOfLife）
+
+| # | Gate 名称 | 参数 | 判定方式 | 类别 |
+|---|----------|------|---------|------|
+| 1 | `administrator` | `User $user` | `$user->is_account_administrator` | 账户级 |
+| 2 | `vault-viewer` | `$user, $vault` | pivot 存在即可 | Vault 级 |
+| 3 | `vault-editor` | `$user, $vault` | pivot `permission <= 200` | Vault 级 |
+| 4 | `vault-manager` | `$user, $vault` | pivot `permission <= 100` | Vault 级 |
+| 5 | `contact-owner` | `$user, $vault, $contact` | `contact.vault_id == vault_id` | 资源归属级 |
+| 6 | `group-owner` | `$user, $vault, $group` | `group.vault_id == vault_id` | 资源归属级 |
+| 7 | `journal-owner` | `$user, $vault, $journal` | `journal.vault_id == vault_id` | 资源归属级 |
+| 8 | `post-owner` | `$user, $journal, $post` | `post.journal_id == journal_id` | 资源归属级 |
+| 9 | `sliceOfLife-owner` | `$user, $journal, $sliceOfLife` | `sliceOfLife.journal_id == journal_id` | 资源归属级 |
 
 ### 15.2 Web 路由 can 中间件挂载清单 - [web.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/web.php)
 
@@ -1161,44 +1165,79 @@ Monica 项目中存在 **三种完全独立的 Token 体系**，各自有不同�
 
 #### 创建
 
-走 Jetstream 标准路由 `POST /user/api-tokens`，在 [JetstreamServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Providers/JetstreamServiceProvider.php#L50-L55) 中配置：
-- 默认能力：`['read']`（`Jetstream::defaultApiTokenPermissions`）
-- 可选能力：`['read', 'write']`（`Jetstream::permissions`）
-- 明文 Token 仅在创建时返回一次，后续无法恢复
+走 Jetstream 标准路由 `POST /user/api-tokens`，在 [JetstreamServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Providers/JetstreamServiceProvider.php#L50-L55) 中配置能力选项。
 
-数据库存储：
+底层调用 Laravel Sanctum 的 `HasApiTokens::createToken()` 方法，其签名（框架内置）为：
+```php
+// Laravel\Sanctum\HasApiTokens trait
+public function createToken(string $name, array $abilities = ['*'], DateTimeInterface $expiresAt = null)
+```
+
+Jetstream 创建 Token 时**只传 `name` 和 `abilities`，不传 `$expiresAt`**，因此 `expires_at` 默认为 `null`。
+
+数据库存储 - [2019_12_14_000001_create_personal_access_tokens_table.php](file:///d:/fz/0601-2\solo-dogfeeding\code\70-monica\database\migrations\2019_12_14_000001_create_personal_access_tokens_table.php#L16-L25)：
 ```
 personal_access_tokens
-  ├─ tokenable_type / tokenable_id → 关联 User
+  ├─ id
+  ├─ tokenable_type / tokenable_id → 多态关联 User
   ├─ name: Token 名称（用户备注）
-  ├─ token: SHA-256 哈希值
-  ├─ abilities: JSON 数组 ["read","write"]
-  ├─ last_used_at: 最后使用时间（每次请求自动更新）
-  └─ expires_at: NULL（Monica 不使用过期机制）
+  ├─ token: SHA-256 哈希值（64位），唯一索引
+  ├─ abilities: text, nullable → JSON 数组 ["read","write"]
+  ├─ last_used_at: timestamp, nullable → 每次请求自动更新
+  ├─ expires_at: timestamp, nullable → 过期时间（Monica 始终为 NULL）
+  └─ created_at / updated_at
 ```
 
 #### 能力更新
 
 `PUT /user/api-tokens/{tokenId}` - [ApiTokenPermissionsTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/tests/Feature/Auth/ApiTokenPermissionsTest.php#L31-L41)
-- 覆盖 `abilities` 字段
-- 无效能力名被静默过滤（白名单校验）
+- Jetstream 内部逻辑：覆盖 `abilities` 字段
+- 白名单校验：只保留在 `Jetstream::permissions()` 中声明过的有效能力
+- 无效能力名（如 `'missing-permission'`）被静默过滤
 
 #### 撤销（删除）
 
 `DELETE /user/api-tokens/{tokenId}` - [DeleteApiTokenTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/tests/Feature/Auth/DeleteApiTokenTest.php#L31-L33)
-- Jetstream 内置逻辑，直接删除对应行
-- 删除后该 Token 立即失效（下次请求哈希匹配不到）
+- Jetstream 内置逻辑，执行 `$user->tokens()->where('id', $tokenId)->delete()`
+- 删除后该 Token 立即失效（下次请求哈希匹配不到 → 401）
 
 #### 到期判定
 
-Monica **从不设置 `expires_at`**，Token 永不过期。Sanctum 的过期检查逻辑（Laravel 内置）：
+Monica 的 Sanctum Token **永不过期**，结论来自以下三层证据：
+
+**证据 1：迁移文件字段默认可空**
+[2019_12_14_000001_create_personal_access_tokens_table.php](file:///d:/fz/0601-2\solo-dogfeeding\code\70-monica\database\migrations\2019_12_14_000001_create_personal_access_tokens_table.php#L23)
 ```php
-// Sanctum 伪代码
-if ($token->expires_at && $token->expires_at->isPast()) {
-    throw new AuthenticationException;  // 401
-}
+$table->timestamp('expires_at')->nullable();
 ```
-由于 `expires_at` 始终为 null，该检查直接跳过。
+字段可空且无默认值，不设置即为 NULL。
+
+**证据 2：项目代码从不设置 expires_at**
+全项目搜索 `createToken(` 无任何匹配结果（Token 创建完全由 Jetstream 内部完成），也没有任何地方手动写入 `expires_at` 字段。
+
+**证据 3：无全局配置项**
+- 无 `config/sanctum.php` 配置文件（使用 Sanctum 默认配置）
+- `.env` 中无 `SANCTUM_EXPIRATION` 之类的过期配置
+- `config/auth.php` 中 guards.api.driver = sanctum，但无过期时间配置
+
+**Sanctum 过期检查的代码路径（框架内置）**：
+
+```
+请求 → auth:sanctum 中间件
+  ↓
+Sanctum Guard::validateRequest()
+  ↓
+根据 Token 哈希查 personal_access_tokens 表
+  ↓
+检查 Token 有效性（框架伪代码）:
+  if ($token->expires_at !== null && $token->expires_at->isPast()) {
+      throw new AuthenticationException;  // 401 Unauthenticated
+  }
+  ↓
+expires_at 为 null → 检查跳过 → Token 有效
+```
+
+> **设计选择**：Monica 采用"手动撤销"模式而非"自动过期"模式。Token 创建后长期有效，由用户在个人设置页面手动删除来撤销。这是常见的 SaaS API Token 设计（类似 GitHub Personal Access Token）。
 
 ### 17.3 OAuth 社交登录 Token 生命周期 - [UserToken.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Models/UserToken.php)
 
@@ -1234,28 +1273,105 @@ public function destroy(Request $request, string $driver)
 
 ### 17.4 DAV Sync Token 生命周期 - [CleanSyncToken.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Jobs/CleanSyncToken.php)
 
-这是 CardDAV/CalDAV 同步协议的增量同步令牌，与认证无关，用于客户端追踪服务端变更。
+这是 CardDAV/CalDAV 同步协议的增量同步令牌（类似游标），与认证无关，用于客户端追踪服务端变更。
+
+#### Sync Token 数据结构 - [2018_12_29_135516_create_synctokens.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/database/migrations/2018_12_29_135516_create_synctokens.php#L18-L27)
+
+```
+sync_tokens
+  ├─ id
+  ├─ account_id → 外键关联 accounts
+  ├─ user_id → 外键关联 users
+  ├─ name → 资源类型，如 "contacts-{vaultId}"、"calendars-{vaultId}"
+  ├─ timestamp → 同步时间戳（datetime）
+  ├─ created_at / updated_at
+  └─ 复合索引：(account_id, user_id, name)
+```
+
+模型：[SyncToken.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Models/SyncToken.php)
 
 #### 创建
 
 每次客户端请求 `sync-token` 时，若数据有变化则自动创建新 Token：
-- [SyncDAVBackend.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Web/Backend/SyncDAVBackend.php#L61-L69) `createSyncTokenNow()`
-- 每个 Token 关联 `user_id` + `name`（如 `contacts-{vaultId}`）+ `timestamp`
+- 创建入口：[SyncDAVBackend.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Web/Backend/SyncDAVBackend.php#L61-L69) `createSyncTokenNow()`
+- 每个 Token 关联 `user_id` + `name` + `timestamp`
+- 同用户同资源类型会累积多个历史 Token（用于增量同步回溯）
 
-#### 到期判定与清理
+#### 到期判定与清理（详细实现）
 
-保留天数配置：[dav.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/config/dav.php#L24)
+**配置项**：[dav.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/config/dav.php#L24)
 ```php
 'sync_token_keep_days' => 30,
 ```
 
-清理逻辑（CleanSyncToken Job）：
+**Job 入口 - `execute()` 方法 [L19-L32]**
+
+```php
+public function execute(array $data): void
+{
+    $this->timefix = now()->addDays(-1 * intval(config('dav.sync_token_keep_days')));
+    // 即: 30天前的时间点，作为"最早保留时间"
+
+    DB::table('sync_tokens')
+        ->orderBy('user_id')
+        ->groupBy('user_id', 'name')
+        ->select(DB::raw('user_id, name, max(timestamp) as timestamp'))
+        ->chunk(200, function ($tokens) {
+            foreach ($tokens as $token) {
+                $this->handleUserToken($token->user_id, $token->name, $token->timestamp);
+            }
+        });
+}
 ```
-1. 按 user_id + name 分组，找出每组最新的 token（max timestamp）
-2. 删除所有"老于最新 token 且老于 30 天"的 token
-3. 触发 TokenDeleteEvent 事件
-4. 保留每个用户+资源类型至少一个 token（即使超 30 天）
+
+第一步用纯 SQL 聚合查询，**按 `user_id + name` 分组**，找出每组 `max(timestamp)`（最新 Token 的时间戳）。每 200 条分批处理，防止内存溢出。
+
+**核心清理逻辑 - `handleUserToken()` 方法 [L37-L53]**
+
+```php
+private function handleUserToken(string $userId, string $tokenName, string $timestamp): void
+{
+    $tokens = SyncToken::where([
+        ['user_id', $userId],
+        ['name', $tokenName],
+        ['timestamp', '<', Carbon::parse($timestamp)],  // 条件A：不是最新的那个
+        ['timestamp', '<', $this->timefix],             // 条件B：超过30天
+    ])
+        ->orderByDesc('timestamp')
+        ->get();
+
+    foreach ($tokens as $token) {
+        TokenDeleteEvent::dispatch($token);  // 触发事件（供订阅者清理关联数据）
+        $token->delete();                     // 物理删除
+    }
+}
 ```
+
+**删除条件：必须同时满足两个 AND 条件**
+
+| 条件 | SQL 表达式 | 含义 |
+|------|-----------|------|
+| A | `timestamp < max(timestamp)` | 不是本组最新的 Token |
+| B | `timestamp < now() - 30天` | 超过保留天数 |
+
+两个条件**缺一不可**，这导致了一个重要特性：
+- 即使 Token 已经 45 天（超 30 天），但如果它是唯一的/最新的，仍然保留
+- 即使 Token 只有 1 天（不超 30 天），但如果它不是最新的，仍然保留（因为条件 B 不满足）
+
+#### 测试验证 - [CleanSyncTokenTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/tests/Unit/Domains/Contact/DAV/Jobs/CleanSyncTokenTest.php)
+
+测试用例 `tokenclean_left_all_token` 验证了 4 个 Token 的清理结果：
+
+| Token | 年龄 | 是否最新 | 条件A (非最新) | 条件B (超30天) | 删除? |
+|-------|------|---------|--------------|--------------|------|
+| s1 | 0 天（now） | ✅ 最新 | ❌ 不满足 | ❌ 不满足 | **保留** |
+| s4 | -1 天 | 第二新 | ✅ 满足 | ❌ 不满足 | **保留** |
+| s2 | -31 天 | 第三新 | ✅ 满足 | ✅ 满足 | **删除** |
+| s3 | -45 天 | 最旧 | ✅ 满足 | ✅ 满足 | **删除** |
+
+测试断言与分析完全一致：s1 和 s4 保留，s2 和 s3 被删除。
+
+> **设计意图**：保证每个用户+资源类型**至少保留一个有效同步游标**（最新的那个），即使它已经超过 30 天；同时清理真正过期的历史 Token，控制表膨胀速度。
 
 > **注意**：Sync Token 不是安全凭证，只是同步游标。它不参与认证或授权判定。
 
