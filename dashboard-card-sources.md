@@ -245,7 +245,9 @@ $items = ContactFeedItem::whereIn('contact_id', $contactIds)
 
 **ViewHelper**: [ModuleLifeEventViewHelper::data()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageLifeEvents/Web/ViewHelpers/ModuleLifeEventViewHelper.php#L18-L42)
 
-**异步加载 API**: `contact.timeline_event.index`
+**异步加载 API**: `contact.timeline_event.index` → [ContactModuleTimelineEventController::index()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ContactModuleTimelineEventController.php#L18-L31)
+
+> **注意区分两个控制器**：Dashboard SSR 渲染中 `url.load` 指向的路由实际由 `ContactModuleTimelineEventController` 处理（路由定义在 `routes/web.php:382`），而 [VaultLifeEventController::show()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultLifeEventController.php#L14-L28) 是另一个独立的端点，二者功能相似但路由不同。
 
 ### 服务端返回结构：Categories 和 Types
 
@@ -321,6 +323,55 @@ axios.get(paginator.value.nextPageUrl)
 每页固定 15 条 timeline events，通过 `paginator.hasMorePages` 控制底部按钮是否显示。
 
 > **NPE 风险**：后端 `ModuleLifeEventViewHelper::data(Contact $contact, ...)` 签名要求 `Contact` 类型，调用方 [VaultController::show() 第78行](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultController.php#L78) 将 `Auth::user()->getContactInVault($vault)` 的返回值（可能为 null）直接传入，若当前用户在该 Vault 中没有对应的 contact，则 PHP 会抛 TypeError。详见下方"空 contact 导致的 NPE 问题"章节。
+
+### 前端异常捕获但未处理
+
+[LifeEvent.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/resources/js/Shared/Modules/LifeEvent.vue) 中所有 axios 请求的 `.catch()` 均为空函数，异常被静默吞没：
+
+```js
+// 第25-36行: onMounted 异步加载
+axios.get(props.data.url.load)
+  .then(...)
+  .catch(() => {});   // ← 空捕获，错误不显示
+
+// 第38-49行: loadMore 分页加载
+axios.get(paginator.value.nextPageUrl)
+  .then(...)
+  .catch(() => {});   // ← 同上
+
+// 第51-60行: destroy 删除 timeline event
+axios.delete(timelineEvent.url.destroy)
+  .then(...)
+  .catch(() => {});   // ← 同上
+
+// 第62-74行: destroyLifeEvent 删除 life event
+axios.delete(lifeEvent.url.destroy)
+  .then(...)
+  .catch(() => {});   // ← 同上
+```
+
+> **影响**：当后端返回 4xx/5xx 错误时（如 contact 不存在、权限不足等），前端不会有任何反馈——加载失败后 `loadingData` 仍为 true（一直显示 Loading 状态），删除失败后列表不更新但不提示用户。
+
+### url.load 空 contact 导致的 NPE
+
+[ModuleLifeEventViewHelper::data()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageLifeEvents/Web/ViewHelpers/ModuleLifeEventViewHelper.php#L18-L42) 生成的 `url.load` 和 `url.store` 路由中嵌入了 `$contact->id`：
+
+```php
+'url' => [
+    'load' => route('contact.timeline_event.index', [
+        'vault' => $contact->vault_id,
+        'contact' => $contact->id,    // ← 包含 contact ID
+    ]),
+    'store' => route('contact.timeline_event.store', [
+        'vault' => $contact->vault_id,
+        'contact' => $contact->id,    // ← 同上
+    ]),
+],
+```
+
+> **双层 NPE 问题**：
+> 1. **SSR 层**：`VaultController::show()` 中 `$contact` 为 null 时，传给 `ModuleLifeEventViewHelper::data($contact, ...)` 直接 TypeError，页面无法渲染
+> 2. **即使 SSR 层 $contact 不为 null**，如果前端 `url.load` 中嵌入的 contactId 在后端 [ContactModuleTimelineEventController::index()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ContactModuleTimelineEventController.php#L18-L31) 中 `Contact::where('vault_id', $vaultId)->findOrFail($contactId)` 找不到（该 contact 被删除），异步请求返回 404，但前端 `.catch(() => {})` 静默吞掉，导致一直显示 Loading 状态
 
 ### 展示逻辑
 
@@ -431,6 +482,35 @@ VaultDefaultTabOnDashboardController::update()
 - 可能值：`'activity'` | `'life_events'` | `'life_metrics'`
 - 注意：`$vault->default_activity_tab` 可为 null（数据库默认值），此时前端 `ref(props.defaultTab)` 会得到 `null`，导致初始没有任何 Tab 被选中高亮
 - 前端切换 Tab 后立即发送 PUT 请求持久化，用户下次进入 Dashboard 时直接显示上次选择的 Tab
+
+### defaultTab 为 null 导致中栏空白
+
+[Dashboard/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/resources/js/Pages/Vault/Dashboard/Index.vue) 的中栏内容区使用 `v-if` / `v-else-if` 链条件渲染：
+
+```html
+<!-- 第107-113行 -->
+<Feed v-if="currentTab === 'activity'" :url="url.feed" :contact-view-mode="false" />
+<LifeEvent v-else-if="currentTab === 'life_events'" :data="lifeEvents" :layout-data="layoutData" />
+<LifeMetrics v-else-if="currentTab === 'life_metrics'" :data="lifeMetrics" />
+```
+
+当 `$vault->default_activity_tab` 为 null 时：
+
+```
+VaultController::show() → $vault->default_activity_tab = null
+                                ↓
+Index.vue: const currentTab = ref(null)   // props.defaultTab = null
+                                ↓
+v-if="null === 'activity'"       → false
+v-else-if="null === 'life_events'" → false
+v-else-if="null === 'life_metrics'" → false
+                                ↓
+结果：中栏内容区完全空白，三个 Tab 按钮均无高亮
+```
+
+> **影响**：用户首次进入新创建的 Vault 时，Dashboard 中栏会显示 Tab 按钮行（但无高亮）+ 完全空白的内容区域。用户必须手动点击某个 Tab 才能触发 `changeTab()` 写入 `default_activity_tab`，此后再访问才有默认内容。
+>
+> **修复方向**：前端可在 `ref(props.defaultTab ?? 'activity')` 设置 fallback，或后端在 Vault 创建时给 `default_activity_tab` 设默认值。
 
 ---
 
@@ -567,8 +647,9 @@ Monica 的 Dashboard 数据流遵循三层架构：
                        │
                        ▼
 ┌─────────────────────────────────────────────────────────┐
-│ ViewHelper (展示层 / 读操作层)                           │
-│  • 纯静态方法，无副作用（不写入 DB）                      │
+│ ViewHelper (展示层 / 只读查询 + DTO 转换层)               │
+│  • 纯静态方法，不执行写操作（不 INSERT/UPDATE/DELETE）      │
+│  • 可执行 Eloquent 只读查询（SELECT），组装数据             │
 │  • 接收 Model 作为入参，组装前端所需 array                │
 │  • 负责 DTO 转换：Eloquent Model → 前端 props 结构        │
 │  • 负责拼接 route URL                                    │
@@ -594,9 +675,11 @@ Monica 的 Dashboard 数据流遵循三层架构：
 class XxxViewHelper
 {
     // 入口方法：接收 Model 入参，返回 array
+    // 注意：内部会执行 Eloquent 只读查询（如 with()、get()、paginate()），
+    //       但绝不执行写操作（create/update/delete）
     public static function data(Vault $vault, User $user, ...): array
     {
-        // 1. Eloquent 查询（只读）
+        // 1. Eloquent 只读查询（SELECT）
         // 2. 嵌套调用 dto() 做单条记录转换
         // 3. 拼接 route URL
         // 4. 返回前端所需完整结构
@@ -692,5 +775,6 @@ vaults
 
 | 版本 | 修订内容 |
 |------|---------|
+| v4 | 1. **修正 Timeline 异步接口名称**：明确 `url.load` 命中 [ContactModuleTimelineEventController::index()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ContactModuleTimelineEventController.php#L18-L31)，与 [VaultLifeEventController](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultLifeEventController.php#L14-L28) 是两个独立端点<br>2. **补充 url.load 空 contact 导致的 NPE**：SSR 层 null 传参 TypeError + 异步层 contactId 失效后 404 被 `.catch(() => {})` 静默吞没<br>3. **补充 defaultTab 为 null 导致中栏空白**：`ref(null)` 不匹配任何 `v-if` 条件，三个 Tab 内容区均不渲染<br>4. **补充 Life Events 前端异常捕获未处理**：4 处 `.catch(() => {})` 空捕获，加载失败永远 Loading、删除失败无反馈<br>5. **修正 ViewHelper 用词**：ViewHelper "不写入 DB"→"不执行写操作（不 INSERT/UPDATE/DELETE）"，明确**可以执行只读查询（SELECT）** |
 | v3 | 1. 补充 **Life Events categories/types 服务端返回结构**（dtoLifeEventCategory → dtoLifeEventType 嵌套 DTO）<br>2. 补充 **TimelineEvent 前端异步加载流程**（SSR 只返回结构 + onMounted 异步拉取 + 分页 loadMore）<br>3. 补充 **Default Tab 机制**（Vault.default_activity_tab 字段 + 前端 changeTab PUT 持久化）<br>4. 补充 **空 Contact NPE 问题**（getContactInVault 返回 null 的所有风险点、触发场景、防护情况）<br>5. 补充 **Timezone 与 Carbon Mutable 边界**（DateHelper 就地修改 Mutable Carbon、timezone 使用不一致、VaultLifeMetricsViewHelper 中 Mutable/Immutable 混用）<br>6. 补充 **Controller 与 ViewHelper 职责划分**（三层架构概览、各 Controller 职责表、ViewHelper 规范、读操作越过 Service 层的约定） |
 | v2 | 1. LifeMetrics 明确按**登录用户 contact** 聚合（非 Vault 全量），dto/stats/years 各自独立查询（每 Metric 共 5 次 DB 查询）<br>2. Feed 标注 **VaultFeedController 直接分页**查询，不经 Service 层<br>3. Reminders 与 DueTasks 明确**只设上界、含过期**（scheduled_at / due_at 均只有 <= now+30d 条件）<br>4. 补齐 **8 个 ActionFeed\* 类**的派发分支明细及数据结构 |
