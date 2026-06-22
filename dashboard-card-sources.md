@@ -247,7 +247,7 @@ $items = ContactFeedItem::whereIn('contact_id', $contactIds)
 
 **异步加载 API**: `contact.timeline_event.index` → [ContactModuleTimelineEventController::index()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ContactModuleTimelineEventController.php#L18-L31)
 
-> **注意区分两个控制器**：Dashboard SSR 渲染中 `url.load` 指向的路由实际由 `ContactModuleTimelineEventController` 处理（路由定义在 `routes/web.php:382`），而 [VaultLifeEventController::show()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultLifeEventController.php#L14-L28) 是另一个独立的端点，二者功能相似但路由不同。
+> **关于 VaultLifeEventController**：代码库中还存在 [VaultLifeEventController](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultLifeEventController.php) 文件，但**无任何路由注册，属于无效代码（dead code）**。实际生效的异步接口是 `ContactModuleTimelineEventController`，路由定义在 `routes/web.php:382`。
 
 ### 服务端返回结构：Categories 和 Types
 
@@ -547,7 +547,8 @@ public function getContactInVault(Vault $vault): ?Contact
 | [VaultController.php:78](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultController.php#L78) | `ModuleLifeEventViewHelper::data($contact, Auth::user())` | 签名要求 `Contact`，传 null → TypeError |
 | [VaultLifeMetricsViewHelper.php:24](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageLifeMetrics/Web/ViewHelpers/VaultLifeMetricsViewHelper.php#L24) → 第38行 dto() 签名 | `dto(LifeMetric, int, Contact $contact)` | 签名要求 `Contact`，传 null → TypeError |
 | [VaultShowViewHelper.php:189](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultShowViewHelper.php#L189) | `'contact' => $user->getContactInVault($vault)->id` | 直接 `->id`，无 null 检查 |
-| [VaultLifeEventController.php:17](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultLifeEventController.php#L17) → 第19行 | `$contact->timelineEvents()` | 直接调用方法，无 null 检查 |
+| [ContactModuleTimelineEventController.php:18](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ContactModuleTimelineEventController.php#L18-L31) → 第23行 | `Contact::where('vault_id', $vaultId)->findOrFail($contactId)` | 传入的 contactId 不存在 → ModelNotFoundException |
+| ~~VaultLifeEventController~~ | — | **无效代码（无路由注册）**，不参与实际请求，无运行时 NPE 风险 |
 | [LifeMetricController.php:29](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricController.php#L29) → 第32行 | `VaultLifeMetricsViewHelper::dto($lifeMetric, ..., $contact)` | 签名要求 Contact |
 | [LifeMetricController.php:48](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricController.php#L48) → 第51行 | `VaultLifeMetricsViewHelper::dto($lifeMetric, ..., $contact)` | 同上 |
 | [LifeMetricContactController.php:27](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricContactController.php#L27) | 后续使用 $contact | 同上 |
@@ -662,7 +663,8 @@ Monica 的 Dashboard 数据流遵循三层架构：
 |-----------|------|----------------|------------------|
 | [VaultController::show()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultController.php#L66-L89) | 渲染 Dashboard 页面（SSR），一次性编排所有卡片数据 | —（只读） | `VaultShowViewHelper::*`, `ModuleLifeEventViewHelper::data()`, `VaultLifeMetricsViewHelper::data()` |
 | [VaultFeedController::show()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultFeedController.php#L16-L36) | Feed AJAX 分页接口，**直接在 Controller 层做 Eloquent 查询**（越过 Service 层） | —（只读） | `ModuleFeedViewHelper::data()` |
-| [VaultLifeEventController::show()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultLifeEventController.php#L14-L28) | Life Events AJAX 分页接口，直接做查询 | —（只读） | `ModuleLifeEventViewHelper::timelineEvents()` |
+| [ContactModuleTimelineEventController::index()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ContactModuleTimelineEventController.php#L18-L31) | Life Events Timeline AJAX 分页接口，直接做查询 | —（只读） | `ModuleLifeEventViewHelper::timelineEvents()` |
+| ~~VaultLifeEventController~~ | — | **无效代码（无路由注册）** | — |
 | [VaultDefaultTabOnDashboardController::update()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultDefaultTabOnDashboardController.php#L12-L26) | 保存默认 Tab | `UpdateVaultDashboardDefaultTab` | — |
 | [LifeMetricController::store/update/destroy](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricController.php) | Life Metric CRUD | `CreateLifeMetric`, `UpdateLifeMetric`, `DestroyLifeMetric` | `VaultLifeMetricsViewHelper::dto()` |
 | [LifeMetricContactController](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageLifeMetrics/Web/Controllers/LifeMetricContactController.php) | Life Metric "+1" 记录一次事件 | `IncrementLifeMetric` | — |
@@ -704,7 +706,7 @@ Dashboard 中涉及的 ViewHelper 文件：
 不同于标准 CRUD 流程（Controller → Service → DB），**读操作的分页查询直接在 Controller 层完成**：
 
 - `VaultFeedController::show()` 直接调用 `ContactFeedItem::whereIn(...)->paginate(15)`
-- `VaultLifeEventController::show()` 直接调用 `$contact->timelineEvents()->paginate(15)`
+- `ContactModuleTimelineEventController::index()` 直接调用 `Contact::where('vault_id', $vaultId)->findOrFail($contactId) → timelineEvents() → paginate(15)`
 
 这是代码库的约定：**Service 层只处理写操作（CUD），读操作（R）可以直接在 Controller 中用 Eloquent 查询后交给 ViewHelper 转 DTO**。
 
@@ -775,6 +777,7 @@ vaults
 
 | 版本 | 修订内容 |
 |------|---------|
-| v4 | 1. **修正 Timeline 异步接口名称**：明确 `url.load` 命中 [ContactModuleTimelineEventController::index()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ContactModuleTimelineEventController.php#L18-L31)，与 [VaultLifeEventController](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultLifeEventController.php#L14-L28) 是两个独立端点<br>2. **补充 url.load 空 contact 导致的 NPE**：SSR 层 null 传参 TypeError + 异步层 contactId 失效后 404 被 `.catch(() => {})` 静默吞没<br>3. **补充 defaultTab 为 null 导致中栏空白**：`ref(null)` 不匹配任何 `v-if` 条件，三个 Tab 内容区均不渲染<br>4. **补充 Life Events 前端异常捕获未处理**：4 处 `.catch(() => {})` 空捕获，加载失败永远 Loading、删除失败无反馈<br>5. **修正 ViewHelper 用词**：ViewHelper "不写入 DB"→"不执行写操作（不 INSERT/UPDATE/DELETE）"，明确**可以执行只读查询（SELECT）** |
+| v5 | 1. **修正 VaultLifeEventController 为无效代码**：经路由核实 `VaultLifeEventController` 无任何路由注册，属于 dead code。NPE 风险清单、Controller 职责表、跳过 Service 层示例均已替换为实际生效的 `ContactModuleTimelineEventController`<br>2. **修正 v4 的 两个独立端点 表述**：`VaultLifeEventController` 并非独立端点，而是未注册路由的遗留代码 |
+| v4 | 1. **修正 Timeline 异步接口名称**：明确 `url.load` 命中 [ContactModuleTimelineEventController::index()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageLifeEvents/Web/Controllers/ContactModuleTimelineEventController.php#L18-L31)（路由 `routes/web.php:382`），代码库中同目录的 `VaultLifeEventController` 因无路由注册而属于无效代码<br>2. **补充 url.load 空 contact 导致的 NPE**：SSR 层 null 传参 TypeError + 异步层 contactId 失效后 404 被 `.catch(() => {})` 静默吞没<br>3. **补充 defaultTab 为 null 导致中栏空白**：`ref(null)` 不匹配任何 `v-if` 条件，三个 Tab 内容区均不渲染<br>4. **补充 Life Events 前端异常捕获未处理**：4 处 `.catch(() => {})` 空捕获，加载失败永远 Loading、删除失败无反馈<br>5. **修正 ViewHelper 用词**：ViewHelper "不写入 DB"→"不执行写操作（不 INSERT/UPDATE/DELETE）"，明确**可以执行只读查询（SELECT）** |
 | v3 | 1. 补充 **Life Events categories/types 服务端返回结构**（dtoLifeEventCategory → dtoLifeEventType 嵌套 DTO）<br>2. 补充 **TimelineEvent 前端异步加载流程**（SSR 只返回结构 + onMounted 异步拉取 + 分页 loadMore）<br>3. 补充 **Default Tab 机制**（Vault.default_activity_tab 字段 + 前端 changeTab PUT 持久化）<br>4. 补充 **空 Contact NPE 问题**（getContactInVault 返回 null 的所有风险点、触发场景、防护情况）<br>5. 补充 **Timezone 与 Carbon Mutable 边界**（DateHelper 就地修改 Mutable Carbon、timezone 使用不一致、VaultLifeMetricsViewHelper 中 Mutable/Immutable 混用）<br>6. 补充 **Controller 与 ViewHelper 职责划分**（三层架构概览、各 Controller 职责表、ViewHelper 规范、读操作越过 Service 层的约定） |
 | v2 | 1. LifeMetrics 明确按**登录用户 contact** 聚合（非 Vault 全量），dto/stats/years 各自独立查询（每 Metric 共 5 次 DB 查询）<br>2. Feed 标注 **VaultFeedController 直接分页**查询，不经 Service 层<br>3. Reminders 与 DueTasks 明确**只设上界、含过期**（scheduled_at / due_at 均只有 <= now+30d 条件）<br>4. 补齐 **8 个 ActionFeed\* 类**的派发分支明细及数据结构 |
