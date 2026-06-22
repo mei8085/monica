@@ -712,7 +712,7 @@ vCard 的导入（Import）与导出（Export）共用同一套数据模型，�
 9. **UID 两条路径不对称**：补 UID 用 distant_uuid → uuid → id 三级，新建 VCard 时只有 uuid → id 两级，首次导出或 vcard 损坏时 distant_uuid 可能丢失
 10. **ReadVObject 两处调用**：除了 ExportVCard 增量导出，CardDAVBackend::rev() 还有第二处调用，两处都有 null 路径
 11. **ReadVObject null 路径数据丢失**：ExportVCard 中触发 → 降级为重建全新 VCard（丢失自定义字段 + distant_uuid）；CardDAVBackend 中触发 → 判定缓存过期 → 重导
-12. **静态缓存生命周期**：`self::$exporters` 为类静态属性，生命周期 = 单次 PHP 请求（FPM）；**常驻进程（Octane/RoadRunner）下断言不成立**——缓存跨请求存活，新增导出器类需重启 Worker
+9. **静态缓存生命周期**：`self::$exporters` 为类静态属性，生命周期 = 单次 PHP 请求（FPM 模式）；**常驻进程（Octane/RoadRunner/Swoole）下该断言不成立**——缓存跨请求存活，新增导出器类需重启 Worker；ImportVCard 的 `self::$importers` 同理
 13. **subClasses Generator 与硬编码 skip**：扫描 `app_path()`，硬编码排除 helpers.php、TelescopeServiceProvider.php，新增非类文件需手动补排除项
 14. **先删后写原则**：所有导出器先删再写，保证导出结果纯净；ExportContactInformation 更一次性删五个字段，即便部分字段当前无数据也要清空
 15. **五联系方式参数不对称**：只有 email/phone 消费 kind 和 pref 字段，IMPP/X-SOCIAL-PROFILE/URL 即便数据库中有这些属性也不写入 vCard 参数
