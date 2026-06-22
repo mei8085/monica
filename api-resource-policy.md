@@ -563,3 +563,433 @@ PUT /api/vaults/{id}
 > **设计隐患**：`NotEnoughPermissionException` 在 API 通道中应返回 403 而非 500。修复方案有两种：
 > 1. 在 `Handler.php` 中注册 `renderable` 回调，将 `NotEnoughPermissionException` 映射为 403
 > 2. 让 `NotEnoughPermissionException` 继承 `AuthorizationException` 而非 `Exception`
+
+---
+
+## 十一、Token Abilities 颁发与存储链路
+
+### 11.1 Abilities 定义与默认值 - [JetstreamServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Providers/JetstreamServiceProvider.php#L48-L56)
+
+Monica 的 Token abilities 由 Jetstream 管理，仅定义了 **两种能力**：
+
+```php
+Jetstream::defaultApiTokenPermissions(['read']);  // 新 Token 默认只有 read
+Jetstream::permissions([
+    'read',   // 读操作权限
+    'write',  // 写操作权限
+]);
+```
+
+| 能力 | 用途 | 对应接口 |
+|------|------|---------|
+| `read` | 只读查询 | GET 接口 |
+| `write` | 数据修改 | POST/PUT/DELETE 接口 |
+
+### 11.2 数据库存储结构 - [2019_12_14_000001_create_personal_access_tokens_table.php](file:///d:/fz/0601-2\solo-dogfeeding\code\70-monica\database\migrations\2019_12_14_000001_create_personal_access_tokens_table.php#L16-L25)
+
+Token 存储在 `personal_access_tokens` 表中，核心字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `tokenable_type` | morphs | 关联模型类型（通常是 `App\Models\User`） |
+| `tokenable_id` | morphs | 关联模型 ID |
+| `name` | string | Token 名称（用户备注用） |
+| `token` | string(64) | 哈希后的 Token 串（唯一索引） |
+| `abilities` | text, nullable | **JSON 格式的能力数组**，如 `["read","write"]` |
+| `last_used_at` | timestamp | 最后使用时间 |
+| `expires_at` | timestamp | 过期时间 |
+
+> **重要**：`abilities` 字段以 JSON 字符串存储，Laravel Sanctum 会自动将其序列化为数组。
+
+### 11.3 Token 创建流程
+
+Monica 使用 Jetstream 内置的 API Token 管理功能，Token 创建完全通过 Jetstream 标准路由完成，**项目代码中无自定义创建逻辑**。
+
+```
+用户在 Web 界面创建 Token
+  ↓
+POST /user/api-tokens  (Jetstream 标准路由)
+  ↓
+Jetstream 内部处理:
+  ├─ 读取 JetstreamServiceProvider 配置
+  ├─ defaultApiTokenPermissions = ['read']  ← 用户未勾选 write 时
+  │  或 permissions 用户勾选的 ['read','write'] ← 用户勾选 write 时
+  ├─ 生成随机 40 字符明文 Token (仅首次显示给用户)
+  ├─ SHA-256 哈希后存入 `token` 字段
+  ├─ abilities 以 JSON 数组存入 `abilities` 字段
+  ↓
+返回明文 Token 给用户 (只显示一次)
+```
+
+创建后的数据库记录示例：
+```
+tokenable_type: App\Models\User
+tokenable_id:   {uuid}
+name:           "My Script Token"
+token:          sha256('abc123...') (64位哈希)
+abilities:      ["read","write"]    (JSON)
+```
+
+### 11.4 Token Abilities 更新流程 - [ApiTokenPermissionsTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/tests/Feature/Auth/ApiTokenPermissionsTest.php#L31-L41)
+
+Token 权限可通过 Web 界面修改，走 Jetstream 标准路由：
+
+```
+PUT /user/api-tokens/{tokenId}
+  ↓
+Jetstream 内部处理:
+  ├─ 验证提交的 permissions 数组
+  ├─ 只保留在 Jetstream::permissions() 中声明过的有效能力
+  │  (无效能力如 'missing-permission' 会被静默过滤)
+  ├─ 更新 `abilities` 字段为新的 JSON 数组
+  ↓
+返回成功
+```
+
+测试中的示例：
+```php
+$token = $user->tokens()->create([
+    'name' => 'Test Token',
+    'token' => Str::random(40),
+    'abilities' => ['read'],           // 初始只有 read
+]);
+
+// 提交更新: ['write', 'missing-permission']
+// 结果: abilities 变为 ["write"]（invalid 被过滤）
+$token->can('write');      // true
+$token->can('read');       // false (被覆盖了)
+$token->can('missing-permission');  // false
+```
+
+### 11.5 Token Abilities 验证流程
+
+**第一步：Sanctum 解析 Token**
+
+请求携带 `Authorization: Bearer {plainTextToken}`，`auth:sanctum` 中间件：
+1. 对 plainTextToken 做 SHA-256 哈希
+2. 在 `personal_access_tokens` 表中匹配 `token` 字段
+3. 加载关联的 User 模型并设置到 `Auth::user()`
+4. Token 模型挂载到 `$user->currentAccessToken()`
+
+**第二步：CheckAbilities 中间件验证**
+
+`abilities:read` 中间件（[bootstrap/app.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/bootstrap/app.php#L27)）的逻辑：
+
+```php
+// 伪代码
+public function handle($request, $next, ...$abilities)
+{
+    $token = $request->user()->currentAccessToken();
+    
+    // 检查 Token 是否具备 ALL 所需能力
+    foreach ($abilities as $ability) {
+        if (! $token->can($ability)) {
+            throw new MissingAbilityException($ability);
+            // Laravel 默认转为 403 {"message":"Invalid ability provided."}
+        }
+    }
+    
+    return $next($request);
+}
+```
+
+`$token->can($ability)` 的判断逻辑：
+1. 如果 `abilities` 字段为 `null` → 返回 `true`（无限制）
+2. 否则检查 `$ability` 是否在 `abilities` 数组中
+
+> **注意**：DAV 通道中的 `TransientToken`（虚拟 Token）的 `can()` 方法始终返回 `true`，因此 DAV 认证后的请求拥有全部能力。
+
+---
+
+## 十二、所有 API 路由的 Abilities 中间件挂载清单
+
+### 12.1 API 路由总览 - [routes/api.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/api.php#L18-L25)
+
+```php
+Route::middleware('auth:sanctum')->name('api.')->group(function () {
+    Route::get('user', [UserController::class, 'user']);
+    Route::apiResource('users', UserController::class)->only(['index', 'show']);
+    Route::apiResource('vaults', VaultController::class);
+});
+```
+
+### 12.2 各控制器的 Abilities 中间件挂载详情
+
+#### [VaultController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Vault/ManageVault/Api/Controllers/VaultController.php#L21-L27)
+
+```php
+public function __construct()
+{
+    $this->middleware('abilities:read')->only(['index', 'show']);
+    $this->middleware('abilities:write')->only(['store', 'update', 'delete']);
+    parent::__construct();
+}
+```
+
+| 方法 | HTTP 动词 | 路由 | 需要 ability | 说明 |
+|------|----------|------|-------------|------|
+| `index` | GET | `/api/vaults` | `read` | 列出所有 vaults |
+| `show` | GET | `/api/vaults/{vault}` | `read` | 获取单个 vault |
+| `store` | POST | `/api/vaults` | `write` | 创建 vault |
+| `update` | PUT | `/api/vaults/{vault}` | `write` | 更新 vault |
+| `destroy` | DELETE | `/api/vaults/{vault}` | `write` | 删除 vault |
+
+#### [UserController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Settings/ManageUsers/Api/Controllers/UserController.php#L18-L23)
+
+```php
+public function __construct()
+{
+    $this->middleware('abilities:read');  // 所有方法都需要 read
+    parent::__construct();
+}
+```
+
+| 方法 | HTTP 动词 | 路由 | 需要 ability | 说明 |
+|------|----------|------|-------------|------|
+| `user` | GET | `/api/user` | `read` | 获取当前登录用户 |
+| `index` | GET | `/api/users` | `read` | 列出账户内所有用户 |
+| `show` | GET | `/api/users/{user}` | `read` | 获取单个用户 |
+
+### 12.3 挂载总表
+
+| 资源 | 方法 | ability | 读写类型 |
+|------|------|---------|---------|
+| GET `/api/vaults` | index | read | **读** |
+| GET `/api/vaults/{vault}` | show | read | **读** |
+| POST `/api/vaults` | store | write | **写** |
+| PUT `/api/vaults/{vault}` | update | write | **写** |
+| DELETE `/api/vaults/{vault}` | destroy | write | **写** |
+| GET `/api/user` | user | read | **读** |
+| GET `/api/users` | index | read | **读** |
+| GET `/api/users/{user}` | show | read | **读** |
+
+> **目前 API 接口数量较少**，仅 2 个资源、8 个端点。所有写接口（3 个）都正确挂载了 `abilities:write`，所有读接口（5 个）都挂载了 `abilities:read`。
+
+---
+
+## 十三、DAV Principal 与 ACL 判定实现
+
+### 13.1 Principal 定义 - [PrincipalBackend.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Web/DAVACL/PrincipalBackend.php)
+
+Sabre DAV 使用 **Principal** 概念表示"可被授权的实体"，Monica 中 Principal 直接对应用户。
+
+Principal URI 格式：
+```php
+public const PRINCIPAL_PREFIX = 'principals/';
+
+public static function getPrincipalUser(User $user): string
+{
+    return static::PRINCIPAL_PREFIX.$user->email;
+}
+```
+
+实际示例：`principals/john@example.com`
+
+Principal 包含的属性：
+```php
+[
+    'uri' => 'principals/john@example.com',
+    '{DAV:}displayname' => 'John Doe',
+    '{http://sabredav.org/ns}email-address' => 'john@example.com',
+]
+```
+
+### 13.2 DAV Server 启动时的 Principal 注入 - [DAVServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Providers/DAVServiceProvider.php#L42-L56)
+
+每次 DAV 请求进入 Sabre Server 时，在 `nodes()` 回调中绑定当前用户：
+
+```php
+private function nodes(): array
+{
+    $user = Auth::user();  // 从 Laravel Auth 获取已认证用户
+    
+    // 注入当前用户到各个 Backend
+    $principalBackend = app(PrincipalBackend::class, ['user' => $user]);
+    $carddavBackend = app(CardDAVBackend::class)->withUser($user);
+    $caldavBackend = app(CalDAVBackend::class)->withUser($user);
+
+    return [
+        new PrincipalCollection($principalBackend),  // principals/ 根节点
+        new AddressBookRoot($principalBackend, $carddavBackend),  // 通讯录根
+        new CalendarRoot($principalBackend, $caldavBackend),      // 日历根
+    ];
+}
+```
+
+### 13.3 WithUser Trait - [WithUser.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Web/Backend/WithUser.php)
+
+所有 DAV Backend 共享此 trait，用于在 Backend 实例中保存当前用户引用：
+
+```php
+trait WithUser
+{
+    protected User $user;
+
+    public function withUser(User $user): self
+    {
+        $this->user = $user;
+        return $this;
+    }
+}
+```
+
+### 13.4 ACL 插件配置 - [DAVServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Providers/DAVServiceProvider.php#L80-L84)
+
+Sabre AclPlugin 配置：
+
+```php
+$aclPlugin = new AclPlugin;
+$aclPlugin->allowUnauthenticatedAccess = false;  // 禁止未认证访问
+$aclPlugin->hideNodesFromListings = true;        // 无权限则不显示在列表中
+yield $aclPlugin;
+```
+
+| 配置项 | 值 | 效果 |
+|--------|----|------|
+| `allowUnauthenticatedAccess` | `false` | 未认证用户直接返回 401，不会进入 ACL 判定 |
+| `hideNodesFromListings` | `true` | 对无权限的节点，在 PROPFIND 列表中直接隐藏（而非返回 403） |
+
+### 13.5 基于 Principal 的资源过滤（ACL 第一层）
+
+Sabre AclPlugin 会检查每个 DAV 资源的 ACL 属性。Monica 中 AddressBookHome 通过 principalUri 过滤用户可访问的地址簿：
+
+**[AddressBookHome.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Web/Backend/CardDAV/AddressBookHome.php#L20-L28)**
+
+```php
+public function getChildren(): array
+{
+    return collect($this->carddavBackend->getAddressBooksForUser($this->getPrincipalUri()))
+        ->map(fn (array $addressBookInfo) => new AddressBook($this->carddavBackend, $addressBookInfo))
+        ->toArray();
+}
+```
+
+**[CardDAVBackend.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php#L78-L83)**
+
+```php
+public function getAddressBooksForUser($principalUri): array
+{
+    return $this->vaults()
+        ->map(fn (Vault $vault) => $this->getAddressBookDetails($vault))
+        ->toArray();
+}
+```
+
+### 13.6 基于 Vault 权限的过滤（ACL 第二层） - [GetVaults.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Web/Backend/GetVaults.php)
+
+这是 DAV ACL 的**核心判定逻辑**，通过 `vaults()` 方法按用户在 vault 中的权限过滤：
+
+```php
+public function vaults(?string $collectionId = null, int $permission = Vault::PERMISSION_VIEW): Collection
+{
+    $vaults = $this->user->vaults()
+        ->wherePivot('permission', '<=', $permission);  // 反向等级：数值越小权限越高
+
+    if ($collectionId !== null) {
+        $vaults = $vaults->where('id', $collectionId);
+    }
+
+    return $vaults->get();
+}
+```
+
+#### 各操作使用的权限等级
+
+| 操作 | 调用位置 | 权限等级 | 说明 |
+|------|---------|---------|------|
+| 列出地址簿 | `getAddressBooksForUser()` | `PERMISSION_VIEW (300)` | 只要在 vault 中就能看到 |
+| 读取联系人 | `getObjects()` | `PERMISSION_VIEW (300)` | 查看权限 |
+| 创建/更新联系人 | `updateCard()` [L439](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php#L439) | `PERMISSION_EDIT (200)` | 编辑权限 |
+| 访问特定 collection | `getObjectUuid()` [L262](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php#L262) | `PERMISSION_VIEW (300)` | 无权限则抛出 `NotEnoughPermissionException` |
+
+> **关键**：当 `collectionId` 不为空（访问具体地址簿）但用户无权限时，`vaults()` 返回空集合。`getObjectUuid()` 检测到空集合后会抛出 `NotEnoughPermissionException`。
+
+### 13.7 AddressBook 中的 Principal 绑定 - [CardDAVBackend.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php#L92)
+
+每个 AddressBook 资源上都标记了其所属的 Principal：
+
+```php
+private function getAddressBookDetails(Vault $vault): array
+{
+    return [
+        'id' => $vault->id,
+        'uri' => $vault->name,
+        'principaluri' => PrincipalBackend::getPrincipalUser($this->user),  // 关键绑定
+        '{DAV:}displayname' => $vault->name,
+    ];
+}
+```
+
+Sabre AclPlugin 使用 `principaluri` 判定：只有匹配当前登录 Principal 的请求才能访问该资源。
+
+### 13.8 DAV ACL 完整判定流程图
+
+```
+PROPFIND /dav/addressbooks/  (列出地址簿)
+  │
+  ├─ EnsureDavRequestsAreStateful 中间件
+  │   ├─ Session 已登录 → TransientToken (全能)
+  │   └─ Basic Auth → 验证 Token → 设置 Auth::user()
+  │
+  ├─ abilities:read,write 中间件
+  │   └─ DAV 要求 Token 同时具备 read 和 write 能力
+  │
+  ├─ Sabre AuthPlugin
+  │   └─ AuthBackend::check() → Auth::check() → 确认已登录
+  │
+  ├─ DAVServiceProvider::nodes()
+  │   └─ 注入当前 $user 到 PrincipalBackend / CardDAVBackend
+  │
+  ├─ Sabre AclPlugin
+  │   ├─ 检查当前 Principal: principals/john@example.com
+  │   └─ hideNodesFromListings = true (无权限不显示)
+  │
+  ├─ AddressBookHome::getChildren()
+  │   └─ CardDAVBackend::getAddressBooksForUser(principalUri)
+  │       └─ GetVaults::vaults(PERMISSION_VIEW)
+  │           └─ $user->vaults()->wherePivot('permission', '<=', 300)
+  │               └─ 返回用户有权限查看的所有 vault
+  │
+  └─ 结果: 只返回用户有 VIEW 以上权限的 vault 对应的地址簿
+```
+
+```
+PUT /dav/addressbooks/{vaultId}/{contactUuid}.vcf  (更新联系人)
+  │
+  ├─ ... 同上认证流程 ...
+  │
+  ├─ CardDAVBackend::updateCard($addressBookId, $cardUri, $cardData)
+  │   └─ GetVaults::vaults($addressBookId, PERMISSION_EDIT)
+  │       ├─ $user->vaults()
+  │       │   ->where('id', $addressBookId)
+  │       │   ->wherePivot('permission', '<=', 200)
+  │       ├─ 找到 vault → 继续执行，队列 UpdateVCard Job
+  │       └─ 未找到 → firstOrFail() → ModelNotFoundException
+  │           → Sabre 捕获转为 404
+  │
+  └─ 结果: 只有 EDIT 以上权限才能修改联系人
+```
+
+### 13.9 CalDAV 与 CardDAV 的一致性
+
+CalDAV 后端（日历/任务）使用完全相同的 ACL 机制：
+- 同样使用 `WithUser` trait 注入用户
+- 同样使用 `GetVaults::vaults()` 过滤 vault
+- 同样使用 `PrincipalBackend::getPrincipalUser()` 标记 principaluri
+
+区别仅在于：
+- CardDAV 操作 Contact / Group 模型
+- CalDAV 操作 Reminder（日历）/ Task（任务）模型
+
+---
+
+## 十四、三阶段权限校验总结（全通道统一视图）
+
+| 阶段 | REST API | DAV 同步 | Web 浏览器 |
+|------|----------|---------|-----------|
+| **1. 认证层** | `auth:sanctum` 解析 Bearer Token | `EnsureDavRequestsAreStateful` (Basic Auth 或 Session) | `auth:sanctum` (Session Cookie) |
+| **2. 粗粒度能力层** | `abilities:read/write` 检查 Token 能力 | `abilities:read,write` 检查 Token 同时具备读写 | `verified` 邮箱验证 |
+| **3. 细粒度权限层** | 读: 关联查询 `$user->account->vaults()`<br>写: BaseService 依赖图校验 | `GetVaults::vaults()` 按 pivot permission 过滤<br>+ Sabre AclPlugin principal 检查 | `authorizeResource` → Policy → Gate<br>`can:*` 中间件 → Gate |
+
+所有通道最终都汇聚到同一个权限数据源：**`user_vault` 中间表的 `permission` 字段**。
+
