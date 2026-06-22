@@ -247,7 +247,46 @@ public function show(Request $request, string $vaultId, string $contactId)
 
 ### 5.2 多层面包屑回链规则模式
 
-通过分析以上 8 个典型页面，面包屑层级来源有明确的规则模式：
+####  联系人重要日期页（3 层面包屑）
+- **文件**：[Contact/ImportantDates/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Contact/ImportantDates/Index.vue#L63-L107)
+- **路由**：`vaults/{vault}/contacts/{contact}/dates`
+- **面包屑**：
+
+| 层级 | 显示文本 | 链接来源 | 链接值 | 后端生成 |
+|------|---------|---------|--------|---------|
+| 1 | Contacts | `layoutData.vault.url.contacts` | `contact.index` | layoutData |
+| 2 | Profile of {name} | `data.url.contact` | `contact.show` | [ContactImportantDatesViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Contact/ManageContactImportantDates/Web/ViewHelpers/ContactImportantDatesViewHelper.php#L48-L52) |
+| 3 | All the important dates | 无（终端节点） | - | 前端静态文本 |
+
+####  报表子页面（2~3 层面包屑）
+
+报表模块下的子页共有三种层级深度：
+
+**-1 报表一级子页（2 层）**  直接挂在 Reports 下：
+
+| 页面 | 文件 | 路由 | 面包屑 |
+|------|------|------|--------|
+| 地址报表 | [Reports/Address/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/Address/Index.vue#L13-L39) | `vaults/{vault}/reports/addresses` | Reports  List of addresses |
+| 重要日期报表 | [Reports/ImportantDate/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/ImportantDate/Index.vue#L14-L36) | `vaults/{vault}/reports/importantDates` | Reports  The important dates in the next 12 months |
+| 心情记录报表 | [Reports/MoodTrackingEvents/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/MoodTrackingEvents/Index.vue#L13-L36) | `vaults/{vault}/reports/moodTrackingEvents` | Reports  Mood in the year |
+
+**-2 报表二级子页（3 层）**  挂在 Addresses 下：
+
+| 页面 | 文件 | 路由 | 面包屑 |
+|------|------|------|--------|
+| 城市地址报表 | [Reports/Address/Cities/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/Address/Cities/Index.vue#L14-L54) | `vaults/{vault}/reports/addresses/city/{city}` | Reports  List of addresses  {city} |
+| 国家地址报表 | [Reports/Address/Countries/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/Address/Countries/Index.vue) | `vaults/{vault}/reports/addresses/country/{country}` | Reports  List of addresses  {country} |
+
+**报表子页 URL 来源一览**：
+
+| 层级 | 链接来源 | 链接值 | 后端生成 |
+|------|---------|--------|---------|
+| Reports（1层） | `layoutData.vault.url.reports` 或 `data.url.reports` | `vault.reports.index` | [ReportImportantDateSummaryIndexViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportImportantDateSummaryIndexViewHelper.php#L57-L61)、[ReportMoodTrackingEventIndexViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportMoodTrackingEventIndexViewHelper.php#L17-L21) |
+| List of addresses（2层） | `data.url.addresses` | `vault.reports.addresses.index` | [ReportCitiesShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportCitiesShowViewHelper.php#L41-L45) |
+| {city}/{country}（终端层） | 无（终端节点） | - | 从路由参数或 `data.city` / `data.country` 读取 |
+
+
+通过分析以上 10 个典型页面，面包屑层级来源有明确的规则模式：
 
 ```
 第 1 层 → 🔗 layoutData.vault.url.xxx
