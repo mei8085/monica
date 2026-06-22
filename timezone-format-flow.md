@@ -45,17 +45,33 @@ protected $appends = [
 | 提供者 | 命名空间 | 位置 | 注册方式 | 职责 |
 |--------|---------|------|---------|------|
 | **项目自身的** JetstreamServiceProvider | `App\Providers\JetstreamServiceProvider` | [app/Providers/JetstreamServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/app/Providers/JetstreamServiceProvider.php) | [bootstrap/providers.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/bootstrap/providers.php#L8) 显式注册 | 配置权限、whenRendering 回调等项目自定义逻辑 |
-| **Jetstream 包自带的** JetstreamServiceProvider | `Laravel\Jetstream\JetstreamServiceProvider` | vendor/laravel/jetstream/src/ | Composer 包自动发现（[composer.json#extra.laravel.providers](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/composer.json) 声明） | 注册路由、追加中间件、共享 Inertia 数据等核心功能 |
+| **Jetstream 包自带的** JetstreamServiceProvider | `Laravel\Jetstream\JetstreamServiceProvider` | vendor/laravel/jetstream/src/ | Composer 包自动发现（[composer.lock#L2808-L2813](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/composer.lock#L2808-L2813) 声明 `extra.laravel.providers`） | 注册路由、追加中间件、共享 Inertia 数据等核心功能 |
 
 > **重要**：下文提到"Jetstream 包"时，指的是 `laravel/jetstream` Composer 包及其 `Laravel\Jetstream\JetstreamServiceProvider`，而非项目自身的 `App\Providers\JetstreamServiceProvider`。
 
 ### 2.2 Jetstream 包注册共享中间件的完整链路
 
-以下源码均来自 `laravel/jetstream` v5.x 分支（[GitHub 5.x](https://github.com/laravel/jetstream/tree/5.x)），为项目 [composer.json](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/composer.json#L27) 锁定的版本。
+#### Jetstream 锁定版本核实
+
+根据 [composer.lock#L2776-L2841](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/composer.lock#L2776-L2841)，项目实际锁定的 Jetstream 信息如下：
+
+| 项 | 值 |
+|----|---|
+| 包名 | `laravel/jetstream` |
+| 锁定版本 | `v5.3.8` |
+| Git URL | `https://github.com/laravel/jetstream.git` |
+| Commit ref | `5720f0c0a81ad4bc44602d45c2d5ce55f8c7fe24` |
+| 发布时间 | `2025-07-18T18:49:50+00:00` |
+| 自动发现 Provider | `Laravel\Jetstream\JetstreamServiceProvider`（[composer.lock#L2808-L2813](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/composer.lock#L2808-L2813) 的 `extra.laravel.providers`） |
+| 命名空间映射 | `Laravel\Jetstream\` → `src/`（PSR-4，[composer.lock#L2815-L2819](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/composer.lock#L2815-L2819)） |
+
+> **注意**：Jetstream 包的 `composer.json` 将 `inertiajs/inertia-laravel` 放在 `require-dev` 中（非强制依赖），因此 Inertia 能力需要项目自身声明。项目在 [composer.json](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/composer.json#L22) 中显式声明了 `"inertiajs/inertia-laravel": "^2.0"`。
+
+以下源码均来自锁定 commit `5720f0c` 对应的 `laravel/jetstream` v5.3.8 版本。
 
 #### 第一步：JetstreamServiceProvider::boot() 触发 bootInertia()
 
-**源码位置**：`vendor/laravel/jetstream/src/JetstreamServiceProvider.php`
+**源码位置**：`vendor/laravel/jetstream/src/JetstreamServiceProvider.php`（锁定 commit `5720f0c`）
 
 ```php
 public function boot()
@@ -84,7 +100,7 @@ public function boot()
 
 #### 第二步：bootInertia() 追加 ShareInertiaData 中间件到 web 组
 
-**源码位置**：`vendor/laravel/jetstream/src/JetstreamServiceProvider.php`
+**源码位置**：`vendor/laravel/jetstream/src/JetstreamServiceProvider.php`（锁定 commit `5720f0c`）
 
 ```php
 protected function bootInertia()
@@ -133,7 +149,7 @@ $kernel->appendMiddlewareToGroup('web', ShareInertiaData::class);  // ← Jetstr
 
 **完整类名**：`Laravel\Jetstream\Http\Middleware\ShareInertiaData`
 
-**源码位置**：`vendor/laravel/jetstream/src/Http/Middleware/ShareInertiaData.php`
+**源码位置**：`vendor/laravel/jetstream/src/Http/Middleware/ShareInertiaData.php`（锁定 commit `5720f0c`）
 
 ```php
 class ShareInertiaData
