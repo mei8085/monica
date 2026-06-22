@@ -88,12 +88,15 @@ Vault → contacts() (HasMany)
 Vault → users() (BelongsToMany)
       → flatMap → notificationChannels() (HasMany, 表: user_notification_channels)
       → flatMap → contactReminders() (BelongsToMany, 中间表: contact_reminder_scheduled)
-              → wherePivot('scheduled_at', '<=', now + 30 days)
+              → wherePivot('scheduled_at', '<=', now + 30 days)   ← 只设上界
               → wherePivot('triggered_at', null)
               → orderByPivot('scheduled_at', 'asc')
 ```
 
-然后对每个 reminder 检查其 `contact.vault_id` 是否匹配当前 Vault，过滤掉不属于当前 Vault 的提醒，最后按 `contact_reminder_id` 去重。
+> **关键说明**：`scheduled_at` **只设上界**（`<= 当前时间 + 30天`），没有下界，因此**包含所有已过期但尚未触发**的提醒。
+> 只要 `triggered_at IS NULL`（未触发过）且 `scheduled_at <= now+30d`，就会出现在列表中，哪怕 scheduled_at 是过去的日期。
+
+然后对每个 reminder 检查其 `contact.vault_id` 是否匹配当前 Vault，过滤掉不属于当前 Vault 的提醒，最后按 `contact_reminder_id` 去重（因为同一提醒可能关联多个 notification channel）。
 
 - **涉及数据库表**:
   - `vaults` → `vault_user`（中间表）→ `users`
@@ -101,9 +104,10 @@ Vault → users() (BelongsToMany)
   - `user_notification_channels` → `contact_reminder_scheduled`（中间表）→ `contact_reminders`
   - `contact_reminders` → `contacts`
 - **关键过滤条件**:
-  - `scheduled_at <= 当前时间 + 30天`
+  - `scheduled_at <= 当前时间 + 30天`（仅上界，含过期）
   - `triggered_at IS NULL`（尚未触发的提醒）
   - `contact.vault_id == 当前 Vault ID`
+- **去重逻辑**: 按 `contact_reminder.id` 去重，避免同一提醒因多个通知渠道重复显示
 - **返回数据**: `id`, `label`, `scheduled_at`（格式化后的日期）, `contact.{id, name, avatar, url.show}`
 
 ### 展示逻辑
@@ -127,18 +131,21 @@ Vault → users() (BelongsToMany)
 Vault → contacts() (HasMany, with('tasks'))
       → flatMap → tasks (HasMany, 表: contact_tasks)
       → where('completed', false)
-      → where('due_at', '<=', now + 30 days)
+      → where('due_at', '<=', now + 30 days)   ← 只设上界
       → sortBy('due_at')
 ```
 
-- **查询**: 该 Vault 下所有联系人的未完成任务，且截止日期在 30 天以内
+> **关键说明**：`due_at` **只设上界**（`<= 当前时间 + 30天`），没有下界，因此**包含所有已过期但未完成**的任务。
+> 凡是 `completed = false` 且 `due_at <= now+30d` 的任务都会显示，哪怕 due_at 是过去很久的日期。
+
+- **查询**: 该 Vault 下所有联系人的未完成任务，且截止日期在 30 天以内（含已过期）
 - **数据库表**: `contact_tasks`（字段 `completed`, `due_at`）
 - **关联**: `Contact` hasMany `ContactTask`
 - **关键过滤条件**:
   - `completed = false`
-  - `due_at <= 当前时间 + 30天`
+  - `due_at <= 当前时间 + 30天`（仅上界，含过期）
 - **返回数据**: `id`, `label`, `description`, `completed`, `completed_at`, `due_at.{formatted, value, is_late}`, `url.toggle`, `contact.{id, name, avatar, url.show}`
-- **统计值 `is_late`**: `due_at->isPast()` 判断任务是否已逾期
+- **统计值 `is_late`**: `due_at->isPast()` 判断任务是否已逾期（逾期显示红色标签）
 
 ### 展示逻辑
 
@@ -167,6 +174,7 @@ Vault → moodTrackingParameters() (HasMany, 表: mood_tracking_parameters)
 - **数据库表**: `mood_tracking_parameters`（字段 `vault_id`, `label`, `label_translation_key`, `hex_color`, `position`）
 - **返回数据**: `mood_tracking_parameters: [{id, label, hex_color}]`, `current_date`, `url.{history, store}`
 - **注意**: 此卡片不返回已有心情事件列表，只提供参数供用户录入新心情
+- **提交目标**: `contact.mood_tracking_event.store`（作用于当前用户在 Vault 中的 contact）
 
 ### 展示逻辑
 
@@ -180,34 +188,54 @@ Vault → moodTrackingParameters() (HasMany, 表: mood_tracking_parameters)
 
 ## 6. Activity Feed（活动动态，中栏 Tab 1）
 
-**前端组件**: [Feed.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/resources/js/Pages/Vault/Dashboard/Partials/Feed.vue)（通过 [Feed.vue 共享模块](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/resources/js/Shared/Modules/Feed.vue)）
+**前端组件**: [Feed.vue 共享模块](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/resources/js/Shared/Modules/Feed.vue)
 
-**API 控制器**: [VaultFeedController::show()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultFeedController.php#L16-L36)
+**API 控制器**: [VaultFeedController::show()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultFeedController.php#L16-L36) — **直接分页查询，不经 Service 层**
 
 **ViewHelper**: [ModuleFeedViewHelper::data()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/ModuleFeedViewHelper.php#L21-L35)
 
 ### 数据来源
 
+```php
+// VaultFeedController::show() 直接操作
+$contactIds = Contact::where('vault_id', $vaultId)->select('id')->get()->toArray();
+
+$items = ContactFeedItem::whereIn('contact_id', $contactIds)
+    ->with(['author', 'contact.importantDates'])
+    ->orderBy('created_at', 'desc')
+    ->paginate(15);   // ← 直接用 Eloquent 分页
 ```
-Contact::where('vault_id', $vaultId) → pluck('id')
-ContactFeedItem::whereIn('contact_id', $contactIds)
-      → with(['author', 'contact.importantDates'])
-      → orderBy('created_at', 'desc')
-      -> paginate(15)
-```
+
+> **关键说明**：`VaultFeedController` 直接在控制器层用 `ContactFeedItem::whereIn(...)->paginate(15)` 分页查询，**没有经过 Service 层**。每页固定 15 条。
 
 - **查询**: 该 Vault 下所有联系人的动态 feed 项，分页每页 15 条
 - **数据库表**: `contact_feed_items`（字段 `author_id`, `contact_id`, `action`, `description`, `feedable_id`, `feedable_type`）
 - **关联**: `ContactFeedItem` belongsTo `User`(author), belongsTo `Contact`, morphTo `feedable`
-- **action 类型**: `contact_created`, `information_updated`, `note_created/updated/deleted`, `address_created/updated/destroyed`, `label_assigned/removed`, `pet_created/updated/destroyed`, `goal_created/updated/destroyed`, `mood_tracking_event_added/updated/deleted` 等
 - **返回数据**: `id`, `action`, `author.{name, avatar, url}`, `sentence`, `data`（根据 action 类型不同，由各 ActionFeed* 辅助类构建）, `created_at`
+
+### ActionFeed* 派发分支
+
+`ModuleFeedViewHelper::getData()` 根据 `$item->action` 值，通过 switch 派发到 8 个不同的 ActionFeed 类构建 `data` 字段：
+
+| Action 类型 | 派发类 | feedable 模型 | data 返回结构 |
+|------------|--------|-------------|-------------|
+| `label_assigned` / `label_removed` | [ActionFeedLabelAssigned](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedLabelAssigned.php) | `Label` | `{ label: { object:{id,name,bg_color,text_color,url}, description }, contact:{...} }` |
+| `address_created` / `address_updated` / `address_destroyed` | [ActionFeedAddress](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedAddress.php) | `Address` | `{ address: { object:{id,line_1,line_2,city,province,postal_code,country,type,image,url}, description }, contact:{...} }` |
+| `contact_information_created` / `contact_information_updated` / `contact_information_destroyed` | [ActionFeedContactInformation](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedContactInformation.php) | `ContactInformation` | `{ information: { object:{id,label,data,contact_information_type}, description }, contact:{...} }` |
+| `pet_created` / `pet_updated` / `pet_destroyed` | [ActionFeedPet](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedPet.php) | `Pet` | `{ pet: { object:{id,name,pet_category}, description }, contact:{...} }` |
+| `note_created` / `note_updated` / `note_destroyed` | [ActionFeedNote](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedNote.php) | `Note` | `{ note: { object:{id,title,body(前30字)}, description }, contact:{...} }` |
+| `goal_created` / `goal_updated` / `goal_destroyed` | [ActionFeedGoal](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedGoal.php) | `Goal` | `{ goal: { object:{id,name}, description }, contact:{...} }` |
+| `mood_tracking_event_added` / `mood_tracking_event_updated` / `mood_tracking_event_deleted` | [ActionFeedMoodTrackingEvent](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedMoodTrackingEvent.php) | `MoodTrackingEvent` | `{ mood_tracking_event: { object:{id,rated_at,note,number_of_hours_slept}, description }, contact:{...} }` |
+| **default**（其他所有 action） | [ActionFeedGenericContactInformation](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Contact/ManageContactFeed/Web/ViewHelpers/Actions/ActionFeedGenericContactInformation.php) | —（仅 contact 信息） | `{ id,name,age,avatar,url }` |
+
+> **兜底逻辑**：`contact_created`, `information_updated`, `job_information_updated`, `religion_updated`, `archived`, `unarchived`, `favorited`, `unfavorited`, `changed_avatar`, `important_date_created/updated/destroyed`, `added_to_group`, `removed_from_group`, `added_to_post`, `removed_from_post`, `author_deleted` 等 action 都走 `ActionFeedGenericContactInformation` 兜底分支，只返回 contact 基本信息。
 
 ### 展示逻辑
 
 - 时间线样式展示
 - 每个 feed 项显示：操作者头像 + 名称 + 动作描述 + 时间
-- 部分动作类型附带详情卡片
-- 支持分页加载更多
+- 部分动作类型附带详情卡片（地址、标签、宠物、笔记等）
+- 支持分页加载更多（通过 `paginator.nextPageUrl`）
 
 ---
 
@@ -221,10 +249,10 @@ ContactFeedItem::whereIn('contact_id', $contactIds)
 
 ### 数据来源
 
-初始数据由 ViewHelper 提供：
+初始数据由 ViewHelper 提供（基于当前用户在 Vault 中的 contact）：
 
 ```
-Contact(用户在Vault中的联系人) → vault → lifeEventCategories() (HasMany)
+User → getContactInVault($vault) → vault → lifeEventCategories() (HasMany)
       → with('lifeEventTypes')
       → orderBy('position', 'asc')
 ```
@@ -264,33 +292,48 @@ GET contact.timeline_event.index → TimelineEvent 列表
 ```
 Vault → lifeMetrics() (HasMany, 表: life_metrics)
       → map → dto(lifeMetric, year, contact)
+              → contact = $user->getContactInVault($vault)  ← 登录用户自己的 contact
               → contact → lifeMetrics() (BelongsToMany, 中间表: contact_life_metric)
                         → where('life_metric_id', $id)
-                        → 过滤当年事件
 ```
+
+> **关键说明 1**：Life Metrics **只按登录用户自己的 contact 聚合**，不是 Vault 下所有联系人的总和。每个用户在每个 Vault 中有一个对应的 contact（通过 `$user->getContactInVault($vault)` 获取），统计值基于该 contact 的 `contact_life_metric` 中间表记录。
+>
+> **关键说明 2**：dto() 方法内部调用了 `self::stats()` 和 `self::years()`，加上自身的查询，**每个 LifeMetric 共触发 5 次数据库查询**：
+> - `dto()` 自身：查询该 metric 的所有事件（用于 12 月统计）—— 第 1 次
+> - `stats()` 内：weekly / monthly / yearly 各一次 COUNT 查询—— 第 2、3、4 次
+> - `years()` 内：查询所有事件提取年份—— 第 5 次
 
 #### 统计值详情（stats 方法，第 109-137 行）
 
+[VaultLifeMetricsViewHelper::stats()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageLifeMetrics/Web/ViewHelpers/VaultLifeMetricsViewHelper.php#L109-L137)
+
 | 统计值 | 查询逻辑 | 数据库来源 |
 |--------|---------|-----------|
-| `weekly_events` | `contact_life_metric` 当周记录数（`startOfWeek` ~ `endOfWeek`） | `contact_life_metric.pivot.created_at` |
-| `monthly_events` | `contact_life_metric` 当月记录数（`startOfMonth` ~ `endOfMonth`） | `contact_life_metric.pivot.created_at` |
-| `yearly_events` | `contact_life_metric` 当年记录数（`startOfYear` ~ `endOfYear`） | `contact_life_metric.pivot.created_at` |
+| `weekly_events` | 当周记录数（`startOfWeek` ~ `endOfWeek`），独立 COUNT 查询 | `contact_life_metric.pivot.created_at` |
+| `monthly_events` | 当月记录数（`startOfMonth` ~ `endOfMonth`），独立 COUNT 查询 | `contact_life_metric.pivot.created_at` |
+| `yearly_events` | 当年记录数（`startOfYear` ~ `endOfYear`），独立 COUNT 查询 | `contact_life_metric.pivot.created_at` |
+
+> stats() 方法的三个统计值都是**独立的数据库 COUNT 查询**，不依赖 dto() 中已获取的 events 集合。
 
 #### 月度分布（dto 方法，第 38-94 行）
 
-对每个 LifeMetric，按当年 1-12 月统计每月事件次数，用于柱状图展示：
+[VaultLifeMetricsViewHelper::dto()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageLifeMetrics/Web/ViewHelpers/VaultLifeMetricsViewHelper.php#L38-L94)
+
+对每个 LifeMetric，先查询该 contact 的所有事件，然后在 PHP 层遍历 1-12 月统计每月次数：
 
 | 数据项 | 查询逻辑 |
 |--------|---------|
-| `months[{id, friendly_name, events}]` | 遍历 1-12 月，统计 `contact_life_metric.pivot.created_at` 落在该月的事件数 |
+| `months[{id, friendly_name, events}]` | 遍历 1-12 月，在 PHP 层统计 `contact_life_metric.pivot.created_at` 落在该月的事件数 |
 | `max_number_of_events` | 12 个月中事件数的最大值，用于图表 Y 轴缩放 |
 
 #### 年份列表（years 方法，第 96-107 行）
 
+[VaultLifeMetricsViewHelper::years()](file:///d:/fz/0601-2/solo-dogfeeding/code/77-monica/app/Domains/Vault/ManageLifeMetrics/Web/ViewHelpers/VaultLifeMetricsViewHelper.php#L96-L107)
+
 | 数据项 | 查询逻辑 |
 |--------|---------|
-| `years[{year}]` | 从 `contact_life_metric.pivot.created_at` 提取所有不重复年份，降序排列 |
+| `years[{year}]` | 独立查询所有事件，从 `contact_life_metric.pivot.created_at` 提取所有不重复年份，降序排列 |
 
 ### 展示逻辑
 
@@ -334,7 +377,7 @@ vaults
    - `lastUpdatedContacts`, `upcomingReminders`, `favorites`, `dueTasks`, `moodTrackingEvents`, `lifeEvents`, `lifeMetrics` 全部在服务端查询完成
 
 2. **前端异步请求**：
-   - Activity Feed: mounted 时 `GET vault.feed.show`，分页加载更多
+   - Activity Feed: mounted 时 `GET vault.feed.show`（VaultFeedController 直接分页，15条/页），分页加载更多
    - Life Events 时间线: mounted 时 `GET contact.timeline_event.index`，分页加载更多
    - Life Metrics "+1": `POST vault.life_metrics.contact.store`
    - Mood Record: `POST contact.mood_tracking_event.store`
@@ -347,14 +390,22 @@ vaults
 
 | Card | 统计/展示内容 | 汇总方式 | 数据库表/字段 |
 |------|-------------|---------|-------------|
-| Favorites | 收藏联系人列表 | `contact_vault_user.is_favorite = true` | `contact_vault_user.is_favorite` |
+| Favorites | 收藏联系人列表 | `contact_vault_user.is_favorite = true`（当前用户） | `contact_vault_user.is_favorite` |
 | Last Updated | 最近更新 5 人 | `contacts.last_updated_at DESC LIMIT 5` | `contacts.last_updated_at` |
-| Upcoming Reminders | 30 天内未触发提醒 | `contact_reminder_scheduled.scheduled_at <= now+30d AND triggered_at IS NULL` | `contact_reminder_scheduled.scheduled_at, triggered_at` |
-| Due Tasks | 30 天内到期未完成任务 | `contact_tasks.completed = false AND due_at <= now+30d` | `contact_tasks.completed, contact_tasks.due_at` |
+| Upcoming Reminders | 30 天内未触发提醒（含过期） | `contact_reminder_scheduled.scheduled_at <= now+30d AND triggered_at IS NULL`（只设上界） | `contact_reminder_scheduled.scheduled_at, triggered_at` |
+| Due Tasks | 30 天内到期未完成任务（含过期） | `contact_tasks.completed = false AND due_at <= now+30d`（只设上界） | `contact_tasks.completed, contact_tasks.due_at` |
 | Mood Tracking | 心情参数列表 + 录入表单 | `mood_tracking_parameters WHERE vault_id = ?` | `mood_tracking_parameters.*` |
-| Activity Feed | 联系人操作动态流 | `contact_feed_items WHERE contact_id IN (vault_contacts) ORDER BY created_at DESC` | `contact_feed_items.*` |
+| Activity Feed | 联系人操作动态流 | `ContactFeedItem::whereIn(contact_id IN vault_contacts) ORDER BY created_at DESC` 直接分页 | `contact_feed_items.*` |
 | Life Events | 时间线 + 人生事件 | `timeline_events + life_events WHERE vault_id = ?` | `timeline_events.*, life_events.*` |
-| Life Metrics - weekly | 本周事件次数 | `COUNT contact_life_metric WHERE created_at IN current week` | `contact_life_metric.created_at` |
-| Life Metrics - monthly | 本月事件次数 | `COUNT contact_life_metric WHERE created_at IN current month` | `contact_life_metric.created_at` |
-| Life Metrics - yearly | 本年事件次数 | `COUNT contact_life_metric WHERE created_at IN current year` | `contact_life_metric.created_at` |
-| Life Metrics - months | 12 月事件分布 | 遍历 1-12 月统计 `contact_life_metric.created_at` | `contact_life_metric.created_at` |
+| Life Metrics - weekly | 本周事件次数（登录用户 contact） | 独立 COUNT 查询：`contact_life_metric WHERE created_at IN current week` | `contact_life_metric.created_at` |
+| Life Metrics - monthly | 本月事件次数（登录用户 contact） | 独立 COUNT 查询：`contact_life_metric WHERE created_at IN current month` | `contact_life_metric.created_at` |
+| Life Metrics - yearly | 本年事件次数（登录用户 contact） | 独立 COUNT 查询：`contact_life_metric WHERE created_at IN current year` | `contact_life_metric.created_at` |
+| Life Metrics - months | 12 月事件分布（登录用户 contact） | dto 查询全部事件 + PHP 层遍历 1-12 月统计 | `contact_life_metric.created_at` |
+
+---
+
+## 修订记录
+
+| 版本 | 修订内容 |
+|------|---------|
+| v2 | 1. LifeMetrics 明确按**登录用户 contact** 聚合（非 Vault 全量），dto/stats/years 各自独立查询（每 Metric 共 5 次 DB 查询）<br>2. Feed 标注 **VaultFeedController 直接分页**查询，不经 Service 层<br>3. Reminders 与 DueTasks 明确**只设上界、含过期**（scheduled_at / due_at 均只有 <= now+30d 条件）<br>4. 补齐 **8 个 ActionFeed\* 类**的派发分支明细及数据结构 |
