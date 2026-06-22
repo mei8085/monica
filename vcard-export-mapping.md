@@ -99,6 +99,38 @@ if ($carddata === null || empty($carddata) || $timestamp === null || $timestamp 
 
 `withoutTimestamps` 保证了：导出写回 vcard 字段时，`updated_at` 保持不变，使得 `REV == updated_at`，缓存有效。
 
+#### withoutTimestamps 不阻止模型事件
+
+Laravel/Eloquent 的 `withoutTimestamps` 闭包只做一件事：**跳过 `updated_at` / `created_at` 的自动赋值**。它不阻止任何模型事件。
+
+在 ExportVCard::execute 中调用 `$obj->save()` 时：
+- ❌ 被禁用的：`saving` 前自动设置 `updated_at` / `created_at`、`updating` 前自动刷新 `updated_at`
+- ✅ 正常触发的：`saving` / `saved` / `updating` / `updated` 事件全部按正常生命周期派发
+
+**风险**：如果存在监听 `saved` / `updated` 的模型观察者或事件订阅者（审计日志、缓存刷新、Elasticsearch 索引、第三方通知等），每次 vCard 导出缓存回写都会触发这些监听器，产生"只读操作产生大量副作用"的反模式。
+
+#### REV 秒级精度 vs. 亚秒级 updated_at：仍然判过期
+
+缓存脏检查核心比较：[CardDAVBackend::prepareCard()](app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php#L191-L192)
+
+```php
+$timestamp = $this->rev($carddata);
+if ($timestamp === null || $timestamp < $resource->updated_at) { /* 重新导出 */ }
+```
+
+**精度不对称导致的 bug**：
+
+| 变量 | 来源 | 精度 |
+|------|------|------|
+| `$timestamp`（REV） | VCard 中 `20240622T103025Z` 经 `Carbon::parse()` | 秒级（微秒位=0） |
+| `$resource->updated_at` | 数据库 `datetime` / `datetime(6)` 字段 | **可能带微秒**（取决于数据库配置） |
+
+导出时 [ExportTimestamp](app/Domains/Contact/ManageContact/Dav/ExportTimestamp.php#L29) 的 REV 格式是 `Ymd\THis\Z`，**截断到秒**，微秒信息丢失。
+
+**场景**：用户在 10:30:25.456789（含微秒）编辑联系人 → `updated_at = 2024-06-22 10:30:25.456789` → 导出时 REV = `20240622T103025Z`（微秒截断） → 下次 prepareCard 时：`Carbon(10:30:25.000000) < Carbon(10:30:25.456789)` = **true** → 每次都判定缓存过期 → 每次都重新导出 → withoutTimestamps 的防死循环设计**完全失效**。
+
+> 触发条件取决于数据库是否启用了 datetime 微秒精度（MySQL 5.6+ 支持 `DATETIME(6)`，PostgreSQL 默认支持）。如果数据库字段是秒级精度则不会触发。
+
 #### vCard 导出的两类入口
 
 vCard 导出在代码中有两类独立调用入口：
@@ -132,7 +164,15 @@ UID 的赋值存在**两条路径，优先级不对称**：
 
 ### ReadVObject 返回 null 的路径
 
-[ReadVObject::execute()](app/Domains/Contact/Dav/Services/ReadVObject.php#L34-L43) 结构：
+ReadVObject 在代码中有**两处独立调用点**：
+
+#### 调用点 1：ExportVCard 增量导出
+[ExportVCard::export() L81-L83](app/Domains/Contact/Dav/Services/ExportVCard.php#L81-L83) — 反序列化已有 vcard 字段以在其基础上增量修改字段。
+
+#### 调用点 2：CardDAVBackend 脏检查
+[CardDAVBackend::rev()](app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php#L217-L229) — 只为解析 VCard 中的 REV 字段值用于缓存过期判断。
+
+两处调用点都使用了相同的 [ReadVObject::execute()](app/Domains/Contact/Dav/Services/ReadVObject.php#L34-L43)，其结构：
 
 ```php
 $this->validateRules($data);  // 先校验 entry 是 string 或 resource，不通过会抛 ValidationException（不被 try/catch 捕获）
@@ -146,8 +186,12 @@ try {
 - **validateRules 阶段**：校验失败抛 `ValidationException`，**不被 try 包裹**，会向上冒泡异常，**不会**走到 null 分支
 - **try 阶段**：仅捕获 `ParseException`。即使启用了 `OPTION_FORGIVING`（宽容模式）和 `OPTION_IGNORE_INVALID_LINES`（忽略非法行），如果输入字符串完全损坏（不是 VObject 文档、字节流截断等），Sabre/VObject 仍可能抛 `ParseException`
 
-**ReadVObject 返回 null 时的级联效果**：
-`$vcard = (new ReadVObject)->execute(...)` 赋值为 null → `if ($vcard !== null && !$vcard->UID)` 判断为 false → 进入 `if (!isset($vcard))` 分支**重建全新 VCard** → 旧 vcard 中所有自定义字段、扩展属性全部丢失。
+**两处调用点 null 路径的级联效果**：
+
+| 调用点 | null 结果时的影响 |
+|-------|----------------|
+| ExportVCard | `$vcard` 为 null → 跳过"补 UID"分支 → 进入 `!isset($vcard)` 分支重建全新 VCard → 旧 vcard 自定义字段全部丢失，且新 UID 退化为 uuid/id 两级（无 distant_uuid） |
+| CardDAVBackend::rev() | prepareCard 中 `$timestamp === null` → 判定缓存过期 → 重新导出 |
 
 ### 导出器发现与排序
 
@@ -158,19 +202,44 @@ try {
 - 按 `getType()` 返回值过滤，只保留与当前资源类型匹配的导出器
 - 结果静态缓存（`self::$exporters`），避免重复反射
 
-#### 静态缓存生命周期
+#### 静态缓存生命周期与常驻进程风险
 
-`self::$exporters` 是 PHP 类静态属性，**生命周期 = 单次 PHP 请求**：
+`self::$exporters` 是 PHP 类静态属性。
 
+**传统 FPM 模式**：**生命周期 = 单次 PHP 请求**
 - 首次调用 `exporters()` 时为 null → 触发 `subClasses()` 扫描
 - `subClasses()` 遍历 `app_path()` 下所有 `*.php` 文件，逐个反射判断是否为目标接口的非抽象子类
 - 扫描结果排序后存入 `self::$exporters`
 - 同一次请求内后续调用直接返回缓存，零开销
 - 请求结束时内存释放，不跨请求、不跨进程
 
+**常驻进程模式（Octane / RoadRunner / Swoole）：上述断言不成立**
+- 类静态属性会在整个 Worker 进程生命周期内持久化，跨请求存活
+- `if (self::$exporters === null)` 在后续请求中永远不成立 → 不再重新扫描
+- **问题 1**：如果开发环境中新增了导出器类（或通过 Composer 安装了新包），必须重启 Worker 才会生效
+- **问题 2**：缓存中还保留了已 `newInstance()` 后的 ExportVCardResource 对象实例，如果对象内部持有状态（单例化容器依赖），可能出现状态泄漏
+- **问题 3**：缓存不区分用户/账号/vault——所有请求共享同一份对象实例（这本身是 OK 的，因为导出器是无状态的），但如果未来某个导出器内部有成员变量缓存，就可能产生跨请求串数据
+
 开销说明：文件扫描 + 反射是相对较重的操作，每个请求每个服务类（ExportVCard / ExportVCalendar 各有一份独立静态缓存）各执行一次。
 
 > 注：`ExportVCalendar` 服务也有完全相同的静态缓存模式，缓存 VCalendar 导出器。两份缓存互相独立。
+
+#### subClasses：Generator 与硬编码排除项
+
+[helpers.php::subClasses()](app/Helpers/helpers.php#L88-L110) 返回 `Generator`，遍历策略：
+
+1. 使用 `Symfony\Component\Finder\Finder` 扫描 `app_path()` 下所有 `*.php` 文件
+2. **硬编码排除项**：`->notName(['helpers.php', 'TelescopeServiceProvider.php'])`
+   - `helpers.php`：避免把全局函数注册文件作为类反射（否则 `new ReflectionClass('helpers')` 会抛 ReflectionException 因为 helpers 不是类）
+   - `TelescopeServiceProvider.php`：Laravel Telescope 的服务提供者，不需要反射
+   - 风险：**排除项是硬编码的**，如果未来新增其他"非类文件"或全局 helper 文件，需要手动补到此列表
+3. 对每个文件构造完整命名空间类名，`new ReflectionClass($file)`
+4. 判断 `isSubclassOf($className) && !isAbstract()`，符合则 `yield`
+
+**Generator 的惰性特性**：
+- 每次 `foreach (subClasses(...))` 都会重新执行 Finder 扫描（除非外部缓存，如 self::$exporters 就是做这件事）
+- 如果调用方没有在外部缓存结果，会产生重复扫描开销
+- ExportVCard / ExportVCalendar 通过 `self::$exporters = collect(subClasses(...))` 先一次性消费 Generator 转为 Collection，再缓存，避免重复扫描
 
 ### 通用模式：先删后写
 
@@ -303,6 +372,72 @@ $vcard->remove('URL');
 1. **只有 email 和 phone 两种类型消费了 `kind` 和 `pref`** 字段；IMPP、X-SOCIAL-PROFILE、URL 三种类型即便是 ContactInformation 记录有 kind 或 pref=true，也不会体现在 vCard 参数中
 2. **X-SOCIAL-PROFILE 的值位置特殊**：`$vcard->add('X-SOCIAL-PROFILE', '', ['TYPE' => ..., 'X-USER' => $contactInformation->data])` —— VALUE 部分写空字符串，实际用户名放在 `X-USER` 参数中。这与其他四种类型（直接把 data 写在 VALUE 部分）不同
 3. **URL 分支的值拼接**：不是直接写 `data`，而是 `escape($type . $contactInformation->data)`，将 type（协议前缀/URL前缀）与 data 直接字符串拼接后作为 VALUE；同时再把原始 type 写进 TYPE 参数（出现两次）
+
+#### kind 经 Str::upper 的大写漂移（导→导回不可逆）
+
+Export 时对 kind 做了大写化：
+```php
+// ExportContactInformation L48 / L59
+$parameters['TYPE'] = Str::upper($contactInformation->kind);
+```
+
+Import 时直接存回，**不做小写化还原**：
+```php
+// ImportContactInformation::createContactInformation L186
+'contact_information_kind' => self::getParameter($data),
+// getParameter 读取 TYPE 参数的原始值（已被 Str::upper 为大写）
+```
+
+**漂移路径**：
+1. 初始值（数据库）：`kind = "work"` / `kind = "home"` / `kind = "cell"`（小写，来自前端预设下拉）
+2. 导出 → `Str::upper` → vCard 中 `TYPE=WORK` / `TYPE=HOME` / `TYPE=CELL`（大写）
+3. 导回（Import）→ 直接存回 → 数据库中 `kind = "WORK"` / `kind = "HOME"` / `kind = "CELL"`（变成大写）
+4. 再导出：`Str::upper("WORK") = "WORK"`（已稳定，不再变化）
+
+**前端补偿**：[ModuleContactInformationViewHelper](resources/js/Shared/Modules/ContactInformationViewHelpers/ModuleContactInformationViewHelper.php#L83) 中用 `Str::lower($info->kind)` 匹配预设种类 id——这说明前端已经"知道"kind 可能被大写化，做了补偿。但这是补丁而不是设计：如果有区分大小写的自定义 kind 或其他代码路径直接做精确匹配，会失败。
+
+#### URL：在 Import 的 keys 列表里却被 getTypeId 全程屏蔽
+
+[ImportContactInformation 的 $keys](app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php#L33-L39) 包含 'URL'：
+```php
+private $keys = ['EMAIL', 'IMPP', 'TEL', 'URL', 'X-SOCIAL-PROFILE'];
+```
+
+但 [ImportContactInformation::getTypeId()](app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php#L110-L155) 中：
+- `EMAIL`、`TEL`：有专门分支
+- `IMPP`：有专门分支（X-SERVICE-TYPE 匹配）
+- `X-SOCIAL-PROFILE`：有专门分支（TYPE 参数匹配）
+- **`URL`：落到 `else` 分支，直接 `return null`**（L133-L135 注释 "Type not supported"）
+
+**导致的后果**：
+1. 导入 vCard 中的 URL 属性时：`getTypeId() === null` → [L92 `if ($typeId === null) { continue; }`](app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php#L92-L94) → **整项被跳过不导入**
+2. 现有记录同步判断时：[`getContactInformations()`](app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php#L58-L74) 中自定义 URL 类型落入 `default` → 键名是 `'OTHER'`，但 $key 循环到 `'URL'` 时 `$contactInformations->get('URL', collect())` 得到空集合 → **无法和现有 OTHER 类型记录对齐**
+3. **导→导回结果**：Export 时自定义类型成功写到 URL 字段 → Import 时 URL 字段不识别、OTHER 键不匹配 → **整项联系方式被当成新增失败（null typeId）+ 原有 OTHER 记录被当成删除**
+
+### Import 兜底新建 type 膨胀
+
+[getTypeId() L145-L152](app/Domains/Contact/ManageContactInformation/Dav/ImportContactInformation.php#L145-L152) 有三级兜底策略，逐级失败后会**新建 ContactInformationType 记录**：
+
+```
+第 1 级：按专门分支查找（EMAIL/TEL/IMPP/X-SOCIAL-PROFILE）
+  ↓ 失败
+第 2 级：通用兜底：UPPER(type) LIKE %PROPERTY_NAME% 且 name = $name
+  ↓ 失败
+第 3 级：CreateContactInformationType 执行新建
+```
+
+**新建时的参数**：
+```php
+'name' => $name,         // EMAIL/TEL 时 $name=null；IMPP/X-SOCIAL-PROFILE 时为参数值（如 "WhatsApp"）
+'type' => Str::upper($property->name),  // 如 "EMAIL" / "TEL" / "X-SOCIAL-PROFILE"
+```
+
+**膨胀风险**：
+1. **name=null 时重复创建**：如果某次同步中 EMAIL 类型被误删（外键级联风险）或查找因字符集问题不命中，第 2 级查找 `where('name', null)` 可能不命中（因数据库 `NULL = NULL` 语义），每同步一次就新建一条 `{ name: null, type: 'EMAIL' }` 类型——type 字段没有唯一约束，可无限重复
+2. **自定义 IMPP/社交平台参数值**：vCard 发送方传任意 X-SERVICE-TYPE / TYPE 参数值（如 "WeChat"、"Telegram"、拼写错误的 "Whatsapp"），Monica 没有预设 name_translation_key 对应 → 第三级兜底每次都新建 → 类型表无限增长
+3. **跨账号各自新建**：查找和新建都在账号（account）维度隔离，1000 个账号各自同步一次就会产生 1000 条类似的新类型记录
+
+> 与 Export 的对比：Export 对无法识别的类型"降级为 URL 导出"，Import 对 URL"直接跳过"，而对 IMPP/X-SOCIAL-PROFILE 查找失败"直接新建类型"——三者行为完全不对称。
 
 #### contactInformationType 的 null 边界问题
 
@@ -570,20 +705,27 @@ vCard 的导入（Import）与导出（Export）共用同一套数据模型，�
 2. **鉴权副作用**：contact/group 对象的获取发生在 BaseService 权限校验阶段，并非 ExportVCard::execute() 自己查询——`$this->contact` / `$this->group` 是校验链的副产品
 3. **contact/group 校验顺序**：`contact_must_belong_to_vault` 在 `group_must_belong_to_vault` 之前，contact 校验先于 group
 4. **withoutTimestamps 持久化**：vCard 序列化结果保存时不触发模型时间戳，防止与 `prepareCard()` 的 REV/updated_at 脏检查形成"缓存雪崩死循环"
-5. **两类导出入口**：Web 前端下载（ContactVCardController）与 CardDAV 同步（CardDAVBackend）两条路径，最终都调用 ExportVCard 服务，且都会写回 vcard 缓存
-6. **prepareCard 脏检查**：CardDAV 的 prepareCard 先比对 VCard 中 REV 与模型 updated_at，过期才调用 refreshObject 重新导出
-7. **UID 两条路径不对称**：补 UID 用 distant_uuid → uuid → id 三级，新建 VCard 时只有 uuid → id 两级，首次导出或 vcard 损坏时 distant_uuid 可能丢失
-8. **ReadVObject null 路径数据丢失**：ParseException 触发时会降级为重建全新 VCard，旧 VCard 中所有自定义字段被清除
-9. **静态缓存生命周期**：`self::$exporters` 为类静态属性，生命周期 = 单次 PHP 请求，首次调用扫描全部文件，后续零开销
-10. **先删后写原则**：所有导出器先删再写，保证导出结果纯净；ExportContactInformation 更一次性删五个字段，即便部分字段当前无数据也要清空
-11. **五联系方式参数不对称**：只有 email/phone 消费 kind 和 pref 字段，IMPP/X-SOCIAL-PROFILE/URL 即便数据库中有这些属性也不写入 vCard 参数
-12. **contactInformationType null 边界**：数据库外键级联删除保证关系不会为 null，但存在 N+1 查询性能问题，且 type 字段为空字符串时会静默跳过该条联系方式
-13. **地址槽位反直觉**：line_1 → Extended Address（公寓号槽），line_2 → Street Address（主街道槽），与用户对"line_1=第一行=主地址"的直觉相反
-14. **前端地址错位 bug**：前端 label 中 line_1 = "Address"（主街道）、line_2 = "Apartment, suite"（公寓号），与 vCard 导出时的槽位分配恰好颠倒
-15. **getVCardDate 占位细节**：年仅 padLeft 到 2 位、月日占位用单 `-`、输出紧凑格式而非 ISO 横杠分隔，部分日期组合（如 `---22`）可能不符合 RFC 预期
-16. **非生日重要日期丢失**：只有 birthdate 类型映射到 BDAY，其余日期类型不导出
-17. **Import/Export 不完全对称**：工作信息（ORG/TITLE）、PREF 参数、URL 类型等存在"导出有、导入丢"或"导出写、导入不读"的不对称
-18. **与 RFC 的多处偏离**：N 结构缺前后缀、BDAY 部分日期非标准、X-SOCIAL-PROFILE 非标准扩展、PREF 简化为布尔值、优先使用苹果 X-ADDRESSBOOKSERVER-* 扩展而非标准 KIND/MEMBER
-19. **Group 完整导出器列表**：ExportKind (1) + ExportNames (10) + ExportMembers (20) + ExportTimestamp (1000)，共四个导出器
-20. **成员增量同步**：Group 成员不采用"先全删再重写"，而是用集合对比增删，避免破坏已有属性节点上可能附带的参数信息
-21. **X-SOCIAL-PROFILE 值位置异常**：用户名不写在 VALUE 部分（VALUE 为空串），而放在 `X-USER` 参数中；URL 分支值由 `type + data` 直接拼接生成
+5. **withoutTimestamps 不阻 saved 事件**：只禁用 `updated_at/created_at` 自动赋值，不阻止 `saving/saved/updating/updated` 事件派发，观察者可能被意外触发
+6. **REV 秒级 vs 亚秒 updated_at**：REV 格式化为秒级（`YmdTHisZ`），若数据库 `datetime(6)` 带微秒，`Carbon(秒级 REV) < Carbon(含微秒 updated_at)` 恒真，缓存永远判过期，withoutTimestamps 失效
+7. **两类导出入口**：Web 前端下载（ContactVCardController）与 CardDAV 同步（CardDAVBackend）两条路径，最终都调用 ExportVCard 服务，且都会写回 vcard 缓存
+8. **prepareCard 脏检查**：CardDAV 的 prepareCard 先比对 VCard 中 REV 与模型 updated_at，过期才调用 refreshObject 重新导出
+9. **UID 两条路径不对称**：补 UID 用 distant_uuid → uuid → id 三级，新建 VCard 时只有 uuid → id 两级，首次导出或 vcard 损坏时 distant_uuid 可能丢失
+10. **ReadVObject 两处调用**：除了 ExportVCard 增量导出，CardDAVBackend::rev() 还有第二处调用，两处都有 null 路径
+11. **ReadVObject null 路径数据丢失**：ExportVCard 中触发 → 降级为重建全新 VCard（丢失自定义字段 + distant_uuid）；CardDAVBackend 中触发 → 判定缓存过期 → 重导
+12. **静态缓存生命周期**：`self::$exporters` 为类静态属性，生命周期 = 单次 PHP 请求（FPM）；**常驻进程（Octane/RoadRunner）下断言不成立**——缓存跨请求存活，新增导出器类需重启 Worker
+13. **subClasses Generator 与硬编码 skip**：扫描 `app_path()`，硬编码排除 helpers.php、TelescopeServiceProvider.php，新增非类文件需手动补排除项
+14. **先删后写原则**：所有导出器先删再写，保证导出结果纯净；ExportContactInformation 更一次性删五个字段，即便部分字段当前无数据也要清空
+15. **五联系方式参数不对称**：只有 email/phone 消费 kind 和 pref 字段，IMPP/X-SOCIAL-PROFILE/URL 即便数据库中有这些属性也不写入 vCard 参数
+16. **kind 大写漂移**：Export `Str::upper($kind)`，Import 直接存回不还原，导一次后所有小写 kind 永久变大写，靠前端 ViewHelper `Str::lower()` 打补丁
+17. **URL 在 Import keys 中却被屏蔽**：`$keys` 含 'URL' 但 `getTypeId()` 中 URL 落 else→`return null`，被全程跳过；且现有 URL 类型记录在 `getContactInformations()` 中归入 'OTHER' 键，无法对齐
+18. **Import 兜底新建 type 膨胀**：三级查找失败就 `CreateContactInformationType`，name=null 时 `NULL = NULL` 语义可能每次新建；自定义 IMPP/社交参数跨账号各自新建 → 类型表无限增长
+19. **contactInformationType null 边界**：数据库外键级联删除保证关系不会为 null，但存在 N+1 查询性能问题，且 type 字段为空字符串时会静默跳过该条联系方式
+20. **地址槽位反直觉**：line_1 → Extended Address（公寓号槽），line_2 → Street Address（主街道槽），与用户对"line_1=第一行=主地址"的直觉相反
+21. **前端地址错位 bug**：前端 label 中 line_1 = "Address"（主街道）、line_2 = "Apartment, suite"（公寓号），与 vCard 导出时的槽位分配恰好颠倒
+22. **getVCardDate 占位细节**：年仅 padLeft 到 2 位、月日占位用单 `-`、输出紧凑格式而非 ISO 横杠分隔，部分日期组合（如 `---22`）可能不符合 RFC 预期
+23. **非生日重要日期丢失**：只有 birthdate 类型映射到 BDAY，其余日期类型不导出
+24. **Import/Export 不完全对称**：工作信息（ORG/TITLE）、PREF 参数、URL 类型等存在"导出有、导入丢"或"导出写、导入不读"的不对称
+25. **与 RFC 的多处偏离**：N 结构缺前后缀、BDAY 部分日期非标准、X-SOCIAL-PROFILE 非标准扩展、PREF 简化为布尔值、优先使用苹果 X-ADDRESSBOOKSERVER-* 扩展而非标准 KIND/MEMBER
+26. **Group 完整导出器列表**：ExportKind (1) + ExportNames (10) + ExportMembers (20) + ExportTimestamp (1000)，共四个导出器
+27. **成员增量同步**：Group 成员不采用"先全删再重写"，而是用集合对比增删，避免破坏已有属性节点上可能附带的参数信息
+28. **X-SOCIAL-PROFILE 值位置异常**：用户名不写在 VALUE 部分（VALUE 为空串），而放在 `X-USER` 参数中；URL 分支值由 `type + data` 直接拼接生成
