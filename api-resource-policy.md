@@ -310,3 +310,256 @@ $this->middleware('abilities:write')->only(['store', 'update', 'delete']);
 > 3. **Service 层**：BaseService 权限依赖图做细粒度权限 + 归属双重检查（写操作必走）
 
 Web 通道则使用 `Policy → Gate` 链条实现同等效果，但写操作最终也会落到 Service 层的二次校验，形成"双重保险"。
+
+---
+
+## 七、异常处理链路与 HTTP 状态码映射
+
+### 7.1 异常处理器 - [Handler.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Exceptions/Handler.php)
+
+Monica 的异常处理器**极度精简**——没有覆盖 `render()` 方法，也没有注册任何自定义 `renderable` 回调。唯一的自定义逻辑是将异常上报到 Sentry。
+
+这意味着：**所有异常到 HTTP 响应的转换，完全依赖 Laravel 框架的默认行为**，外加少量控制器级别的手动捕获。
+
+### 7.2 各类异常 → HTTP 状态码完整映射
+
+#### 场景 A：Sanctum Token 无效或缺失
+
+| 触发点 | 抛出的异常 | 最终 HTTP 状态码 | 响应体 |
+|--------|-----------|-----------------|--------|
+| `auth:sanctum` 中间件 | `AuthenticationException` | **401** | Laravel 默认 JSON: `{"message": "Unauthenticated."}` |
+| `abilities:read` / `abilities:write` | `MissingAbilityException` | **403** | Laravel Sanctum 默认 JSON: `{"message": "Invalid ability provided."}` |
+
+> `CheckAbilities` 中间件（[bootstrap/app.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/bootstrap/app.php#L27)）在 Token 缺少所需能力时抛出 `MissingAbilityException`，Laravel 默认将其转为 403。
+
+#### 场景 B：API 控制器中的数据查询失败
+
+ApiController 的 `callAction()` [L54-L65](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Http/Controllers/ApiController.php#L54-L65) 手动捕获了三种异常：
+
+| 触发点 | 捕获的异常 | 最终 HTTP 状态码 | 响应体 |
+|--------|-----------|-----------------|--------|
+| `findOrFail()` 在关联查询中 | `ModelNotFoundException` | **404** | `{"error": {"message": "The resource has not been found", "error_code": 31}}` |
+| SQL 约束违反等 | `QueryException` | **500** | `{"error": {"message": "Invalid query", "error_code": 40}}` |
+| 请求验证失败 | `ValidationException` | **422** | `{"error": {"message": [...], "error_code": 32}}` |
+
+#### 场景 C：BaseService 权限不足
+
+| 触发点 | 抛出的异常 | 最终 HTTP 状态码 | 响应体 |
+|--------|-----------|-----------------|--------|
+| `validateUserPermissionInVault()` 失败 | `NotEnoughPermissionException` | **500**（⚠️ 见下文分析） | Laravel 默认: `{"message": "Server Error"}` |
+| `findOrFail()` 在 Service 校验中 | `ModelNotFoundException` | 被 ApiController 捕获 → **404** | 同场景 B |
+| `validateAuthorIsAccountAdministrator()` 失败 | `NotEnoughPermissionException` | **500**（⚠️ 见下文分析） | Laravel 默认: `{"message": "Server Error"}` |
+
+> ⚠️ **关键发现**：`NotEnoughPermissionException` 继承自 `\Exception`，不是 `AccessDeniedHttpException` 或 `AuthorizationException`。Laravel 框架无法将其自动识别为 403，默认转为 **500 Internal Server Error**。这在 API 通道中是一个设计缺陷——Web 通道通过 `Gate::authorize()` 抛出的 `AuthorizationException`（Laravel 内置类）会正确转为 403，但 Service 层的 `NotEnoughPermissionException` 走了不同的异常层次结构。
+
+#### 场景 D：Web 通道 Gate/Policy 授权失败
+
+| 触发点 | 抛出的异常 | 最终 HTTP 状态码 | 响应体 |
+|--------|-----------|-----------------|--------|
+| `$this->authorizeResource()` / `Gate::authorize()` | `AuthorizationException` | **403** | Inertia 渲染 403 页面（Web），或 JSON `{"message": "This action is unauthorized."}`（AJAX） |
+| 路由中间件 `can:vault-viewer,vault` | `AuthorizationException` | **403** | 同上 |
+
+#### 场景 E：Web 通道未登录
+
+| 触发点 | 抛出的异常 | 最终 HTTP 状态码 | 行为 |
+|--------|-----------|-----------------|------|
+| `auth:sanctum` + `verified` 中间件 | `AuthenticationException` | **302** → 重定向 | 重定向到登录页 [Authenticate.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Http/Middleware/Authenticate.php#L15-L18) |
+| JSON 请求时的 `AuthenticationException` | - | **401** | `{"message": "Unauthenticated."}` |
+
+### 7.3 状态码速查总表
+
+| 状态码 | 含义 | 触发场景 | 通道 |
+|--------|------|---------|------|
+| **401** | 未认证 | Token 无效/缺失；Web 未登录 + JSON 请求 | API + Web |
+| **403** | 无权限 | Gate/Policy 拒绝；Token 缺少 ability | API + Web |
+| **404** | 资源不存在 | 关联查询 findOrFail 失败（含隐式权限过滤） | API |
+| **422** | 数据校验失败 | ValidationException | API + Web |
+| **500** | 服务器错误 | NotEnoughPermissionException ⚠️；QueryException | API |
+
+---
+
+## 八、多种入口通道的中间件链路
+
+### 8.1 API Token 通道（REST API）
+
+**入口**：`/api/*` 路由
+
+```
+请求 → api 中间件组
+  ├─ throttleApi (限流)
+  ├─ EnsureFrontendRequestsAreStateful (Sanctum，使前端 Cookie 请求也能通过)
+  ├─ SubstituteBindings (路由模型绑定)
+  │
+  ├─ auth:sanctum (Token 认证，无 Token → 401)
+  │
+  ├─ abilities:read 或 abilities:write (Token 能力，不足 → 403)
+  │
+  └─ ApiController 构造函数 (limit 校验 → 400)
+```
+
+配置来源：[bootstrap/app.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/bootstrap/app.php#L41-L43)，[routes/api.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/api.php#L18)
+
+### 8.2 DAV 同步通道（CardDAV / CalDAV）
+
+**入口**：`/dav/*` 路由（由 LaravelSabre 注册）
+
+DAV 通道有**独特的双重认证机制**——同时支持 HTTP Basic Auth 和 Session Cookie。
+
+```
+请求 → laravelsabre 中间件组 [配置: laravelsabre.php]
+  ├─ api (API 中间件组基础)
+  ├─ EnsureDavRequestsAreStateful ← 核心分叉逻辑
+  │   ├─ 已有 Session 登录？
+  │   │   ├─ 是 (本地环境) → SanctumSetUser
+  │   │   │     给当前用户附加 TransientToken（虚拟 Token，拥有全部能力）
+  │   │   └─ 否 → 进入 Basic Auth 流程:
+  │   │         ├─ 修改 Sanctum 使其同时从 HTTP Password 字段提取 Token
+  │   │         ├─ EncryptCookies → AddQueuedCookies → StartSession → VerifyCsrfToken
+  │   │         └─ AuthenticateWithTokenOnBasicAuth
+  │   │               ├─ 用 Sanctum 验证 Token → 成功则设置用户
+  │   │               └─ 失败 → 抛出 UnauthorizedHttpException → 401
+  │   │                     响应头: WWW-Authenticate: Basic realm="..."
+  │   │
+  ├─ abilities:read,write (DAV 需要 Token 同时有读写能力)
+  │
+  └─ Sabre DAV Server 内部
+      ├─ AuthPlugin (AuthBackend::check → Auth::check())
+      │     未认证 → 401 + WWW-Authenticate: Bearer
+      ├─ AclPlugin (allowUnauthenticatedAccess = false)
+      └─ 业务处理 (CardDAV / CalDAV)
+```
+
+关键文件：
+- [laravelsabre.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/config/laravelsabre.php#L52-L56) - DAV 中间件配置
+- [EnsureDavRequestsAreStateful.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Http/Middleware/EnsureDavRequestsAreStateful.php) - DAV 认证分叉
+- [AuthenticateWithTokenOnBasicAuth.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Http/Middleware/AuthenticateWithTokenOnBasicAuth.php) - Basic Auth Token 映射
+- [AuthBackend.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Web/Auth/AuthBackend.php) - Sabre 层认证
+- [DAVServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Providers/DAVServiceProvider.php) - Sabre 插件注册
+
+> **DAV 认证的特殊之处**：CalDAV/CardDAV 客户端（如 macOS Contacts、Thunderbird）不支持 Bearer Token，只能通过 HTTP Basic Auth 发送凭据。`AuthenticateWithTokenOnBasicAuth` 将 Basic Auth 的 password 字段映射为 Sanctum Token，兼容标准 DAV 客户端。
+
+### 8.3 Web + WebAuthn 通道（浏览器）
+
+**入口**：Web 路由 + Fortify 登录
+
+```
+请求 → web 中间件组
+  ├─ EncryptCookies
+  ├─ AddQueuedCookies
+  ├─ StartSession
+  ├─ SetLocale (CodeZero Localizer)
+  ├─ SubstituteBindings (路由模型绑定)
+  ├─ HandleInertiaRequests (Inertia 协议头处理)
+  ├─ AddLinkHeadersForPreloadedAssets
+  │
+  ├─ auth:sanctum (Session 认证)
+  ├─ jetstream.auth_session (AuthenticateSession，验证 Session 绑定)
+  ├─ verified (邮箱验证)
+  │
+  └─ 控制器层权限:
+      ├─ authorizeResource(Vault::class, 'vault') → Policy → Gate
+      ├─ Route::middleware('can:vault-viewer,vault') → Gate 直接检查
+      └─ Route::middleware('can:administrator') → Gate 直接检查
+```
+
+#### WebAuthn 二次验证流程
+
+WebAuthn 不改变上述中间件链路，而是**插入登录流程内部**。
+
+```
+用户提交密码 → Fortify Login Pipeline
+  ├─ RedirectIfTwoFactorAuthenticatable [L28-L38]
+  │   ├─ 验证邮箱+密码 → 失败: ValidationException (422)
+  │   ├─ 检查是否启用了 2FA 或 WebAuthn
+  │   │   ├─ 是 → 重定向到二次验证页面
+  │   │   │   (two-factor.login 或 webauthn.authenticate)
+  │   │   └─ 否 → 直接登录
+  │   └─
+  └─ 二次验证:
+      ├─ TOTP 验证码 (标准 2FA)
+      └─ WebAuthn 断言验证
+          └─ AttemptToAuthenticateWebauthn [L32-L42]
+              ├─ validateAssertion(user, credentials)
+              │   ├─ 通过 → 登录成功
+              │   └─ 失败 → ValidationException (422)
+              └─ guard->attempt() 兜底
+```
+
+关键文件：
+- [RedirectIfTwoFactorAuthenticatable.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Actions/Fortify/RedirectIfTwoFactorAuthenticatable.php#L28-L38) - 登录流程分叉
+- [AttemptToAuthenticateWebauthn.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Actions/AttemptToAuthenticateWebauthn.php) - WebAuthn 断言验证
+
+> **WebAuthn 不走独立的中间件通道**。`webauthn` 中间件别名已在 [bootstrap/app.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/bootstrap/app.php#L29) 注册，但项目路由中**未实际使用**该中间件。WebAuthn 仅作为登录流程的一环，通过 Fortify Pipeline 集成。
+
+#### auth 配置中的 WebAuthn 用户提供者
+
+[auth.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/config/auth.php#L62-L66) 配置用户提供者为 `webauthn` driver：
+
+```php
+'providers' => [
+    'users' => [
+        'driver' => 'webauthn',
+        'model' => User::class,
+    ],
+],
+```
+
+这使得 `web` guard 的用户查询支持 WebAuthn 凭据验证，但**不影响中间件链路**——它只决定了如何从数据库加载用户。
+
+---
+
+## 九、四种通道对比总览
+
+| 通道 | 认证方式 | 授权中间件 | 权限不足时状态码 | 响应格式 |
+|------|---------|-----------|----------------|---------|
+| **REST API** | Sanctum Bearer Token | `auth:sanctum` + `abilities:read/write` | 401 (无Token) / 403 (能力不足) / 404 (资源不属于你) / 500 ⚠️ (Service权限不足) | JSON |
+| **DAV 同步** | Basic Auth (password=Token) 或 Session Cookie | `EnsureDavRequestsAreStateful` + `abilities:read,write` + Sabre AuthPlugin | 401 (WWW-Authenticate: Basic/Bearer) | Sabre XML |
+| **Web 浏览器** | Session + Cookie | `auth:sanctum` + `can:*` 中间件 / `authorizeResource` | 302 → 登录页 (未登录) / 403 (Gate拒绝) | Inertia HTML |
+| **WebAuthn 二次验证** | 内嵌于 Web 登录流程 | 无独立中间件（通过 Fortify Pipeline） | 422 (断言失败) | Inertia HTML / JSON |
+
+---
+
+## 十、异常链路时序图（API 通道写操作）
+
+以 `PUT /api/vaults/{id}` 权限不足为例，展示完整异常传播路径：
+
+```
+PUT /api/vaults/{id}
+  │
+  ├─ auth:sanctum ─── Token 无效 ──→ AuthenticationException
+  │                                    ↓
+  │                              Laravel Handler 默认渲染
+  │                                    ↓
+  │                              401 {"message":"Unauthenticated."}
+  │
+  ├─ abilities:write ── Token 缺少 write ──→ MissingAbilityException
+  │                                           ↓
+  │                                     Laravel Handler 默认渲染
+  │                                           ↓
+  │                                     403 {"message":"Invalid ability provided."}
+  │
+  ├─ UpdateVault->execute($data)
+  │   │
+  │   ├─ validateAuthorBelongsToAccount() ──→ findOrFail 失败
+  │   │                                       ↓
+  │   │                                 ModelNotFoundException
+  │   │                                       ↓
+  │   │                              ApiController::callAction 捕获
+  │   │                                       ↓
+  │   │                              404 {"error":{"message":"The resource has not been found","error_code":31}}
+  │   │
+  │   └─ validateUserPermissionInVault(100) ──→ 用户只有 EDIT(200) 权限
+  │                                            ↓
+  │                                      NotEnoughPermissionException
+  │                                            ↓
+  │                                  ⚠️ 无自定义 render，Laravel 默认
+  │                                            ↓
+  │                                  500 {"message":"Server Error"}
+  │                                  (debug 模式下会暴露堆栈)
+  │
+  └─ 成功 → 200 + VaultResource JSON
+```
+
+> **设计隐患**：`NotEnoughPermissionException` 在 API 通道中应返回 403 而非 500。修复方案有两种：
+> 1. 在 `Handler.php` 中注册 `renderable` 回调，将 `NotEnoughPermissionException` 映射为 403
+> 2. 让 `NotEnoughPermissionException` 继承 `AuthorizationException` 而非 `Exception`
