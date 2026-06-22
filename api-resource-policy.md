@@ -993,3 +993,305 @@ CalDAV 后端（日历/任务）使用完全相同的 ACL 机制：
 
 所有通道最终都汇聚到同一个权限数据源：**`user_vault` 中间表的 `permission` 字段**。
 
+---
+
+## 十五、Web 路由 can 中间件与 Gate 注册名逐一比对
+
+### 15.1 Gate 定义清单 - [AuthServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Providers/AuthServiceProvider.php#L32-L109)
+
+Monica 共定义了 **8 个 Gate**（不含 Telescope/Pulse 等调试工具 Gate）：
+
+| # | Gate 名称 | 参数 | 判定方式 |
+|---|----------|------|---------|
+| 1 | `administrator` | `User $user` | `$user->is_account_administrator` |
+| 2 | `vault-viewer` | `$user, $vault` | pivot 存在即可 |
+| 3 | `vault-editor` | `$user, $vault` | pivot `permission <= 200` |
+| 4 | `vault-manager` | `$user, $vault` | pivot `permission <= 100` |
+| 5 | `contact-owner` | `$user, $vault, $contact` | `contact.vault_id == vault_id` |
+| 6 | `group-owner` | `$user, $vault, $group` | `group.vault_id == vault_id` |
+| 7 | `journal-owner` | `$user, $vault, $journal` | `journal.vault_id == vault_id` |
+| 8 | `post-owner` | `$user, $journal, $post` | `post.journal_id == journal_id` |
+| 9 | `sliceOfLife-owner` | `$user, $journal, $sliceOfLife` | `sliceOfLife.journal_id == journal_id` |
+
+### 15.2 Web 路由 can 中间件挂载清单 - [web.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/web.php)
+
+| # | 路由位置 | can 中间件 | 路由参数 | 对应 Gate | 匹配状态 |
+|---|---------|-----------|---------|----------|---------|
+| 1 | [L199](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/web.php#L199) | `can:vault-viewer,vault` | `{vault}` | `vault-viewer` | ✅ 匹配 |
+| 2 | [L250](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/web.php#L250) | `can:contact-owner,vault,contact` | `{vault},{contact}` | `contact-owner` | ✅ 匹配 |
+| 3 | [L398](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/web.php#L398) | `can:group-owner,vault,group` | `{vault},{group}` | `group-owner` | ✅ 匹配 |
+| 4 | [L413](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/web.php#L413) | `can:journal-owner,vault,journal` | `{vault},{journal}` | `journal-owner` | ✅ 匹配 |
+| 5 | [L426](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/web.php#L426) | `can:post-owner,journal,post` | `{journal},{post}` | `post-owner` | ✅ 匹配 |
+| 6 | [L452](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/web.php#L452) | `can:slice-owner,journal,slice` | `{journal},{slice}` | `sliceOfLife-owner` | ⚠️ **不匹配！** |
+| 7 | [L485](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/web.php#L485) | `can:vault-manager,vault` | `{vault}` | `vault-manager` | ✅ 匹配 |
+| 8 | [L580](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/web.php#L580) | `can:administrator` | （无参数） | `administrator` | ✅ 匹配 |
+
+### 15.3 ⚠️ 发现 Bug：`slice-owner` vs `sliceOfLife-owner`
+
+**问题**：路由中使用 `can:slice-owner,journal,slice`，但 Gate 实际注册名为 `sliceOfLife-owner`。
+
+**影响范围**：[web.php L452-L459](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/web.php#L452-L459) 内所有 SliceOfLife 相关路由：
+
+```php
+Route::middleware('can:slice-owner,journal,slice')->prefix('slices/{slice}')->group(function () {
+    Route::get('', [SliceOfLifeController::class, 'show'])->name('slices.show');
+    Route::get('edit', [SliceOfLifeController::class, 'edit'])->name('slices.edit');
+    Route::put('', [SliceOfLifeController::class, 'update'])->name('slices.update');
+    Route::put('cover', [SliceOfLifeCoverImageController::class, 'update'])->name('slices.cover.update');
+    Route::delete('cover', [SliceOfLifeCoverImageController::class, 'destroy'])->name('slices.cover.destroy');
+    Route::delete('', [SliceOfLifeController::class, 'destroy'])->name('slices.destroy');
+});
+```
+
+**后果**：Laravel 无法找到名为 `slice-owner` 的 Gate，会返回 **false**，导致所有已登录用户（即使是 vault 管理者）访问 SliceOfLife 页面时都会被拒绝（403）。
+
+**修复方案**：二选一
+- 方案 A（推荐）：将路由改为 `can:sliceOfLife-owner,journal,slice`
+- 方案 B：在 AuthServiceProvider 中额外注册一个别名 Gate：`Gate::define('slice-owner', ...)`
+
+### 15.4 控制器内 Gate 调用（非路由级 can 中间件）
+
+除了路由级 can 中间件，部分控制器在方法内部显式调用 `Gate::authorize()`：
+
+| 控制器 | 方法 | Gate 调用 | 行号 |
+|--------|------|----------|------|
+| [VaultController](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultController.php#L30) | 构造函数 | `$this->authorizeResource(Vault::class, 'vault')` | L30 |
+| [JournalController](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Vault/ManageJournals/Web/Controllers/JournalController.php#L35) | create/store | `Gate::authorize('vault-editor', $vault)` | L35, L45 |
+| [GroupController](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/ManageGroups/Web/Controllers/GroupController.php#L49) | create/store/update/destroy | `Gate::authorize('vault-editor', $vaultId)` | L49, L65, L88 |
+| [ContactController](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php#L57) | create/store | `Gate::authorize('vault-editor', $vault)` | L57, L67 |
+
+`authorizeResource` 会自动将 CRUD 方法映射到 Policy 的对应方法，最终委托给 Gate：
+
+| Policy 方法 | 对应 Gate |
+|-------------|-----------|
+| `viewAny()` | 无（直接返回 true） |
+| `view($vault)` | `vault-viewer` |
+| `create()` | 无（直接返回 true） |
+| `update($vault)` | `vault-editor` |
+| `delete($vault)` | `vault-manager` |
+
+---
+
+## 十六、Telegram Webhook 免 CSRF 入口的鉴权链路
+
+### 16.1 CSRF 豁免配置 - [bootstrap/app.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/bootstrap/app.php#L21-L25)
+
+```php
+$middleware->validateCsrfTokens(except: [
+    '/dav',
+    '/dav/*',
+    '/telegram/webhook/*',   // Telegram webhook 免 CSRF
+]);
+```
+
+共 3 类路径免于 CSRF 校验：DAV 根路径、DAV 子路径、Telegram webhook。
+
+### 16.2 Telegram Webhook 路由注册 - [web.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/routes/web.php#L177-L182)
+
+```php
+if (config('services.telegram-bot-api.token') !== null) {
+    Route::post(
+        '/telegram/webhook/'.config('services.telegram-bot-api.webhook'),
+        [TelegramWebhookController::class, 'store']
+    );
+}
+```
+
+关键特征：
+- **路由位置**：在 `auth:sanctum` 中间件组**之外**，完全不经过认证中间件
+- **环境依赖**：仅当配置了 `services.telegram-bot-api.token` 时才注册
+- **URL 保密**：路径包含随机 webhook 密钥 (`config('services.telegram-bot-api.webhook')`)，防止未授权访问
+
+### 16.3 Telegram Webhook 控制器鉴权逻辑 - [TelegramWebhookController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/TelegramWebhookController.php#L19-L63)
+
+该入口不使用 Laravel Auth，而是采用 **"验证码 + URL 保密"双层校验**：
+
+```
+Telegram Bot 发送 POST /telegram/webhook/{secret}
+  │
+  ├─ 第一层：URL 路径中的 webhook secret（由配置提供）
+  │   只有 Telegram Bot 知道这个 URL，攻击者无法猜测
+  │
+  ├─ 解析消息体中的 $request->message['text']
+  │
+  ├─ 第二层：消息格式校验
+  │   正则: /^\/start\s[A-Za-z0-9-]{36}$/
+  │   必须是 "/start " 后跟 36 字符 UUID（verification_token）
+  │   不匹配 → 返回 202 Accepted（让 Telegram 停止重试）
+  │
+  ├─ 第三层：verification_token 查库
+  │   UserNotificationChannel::where('verification_token', $key)->firstOrFail()
+  │   ├─ 找到 → 绑定 chat_id，激活通知通道
+  │   └─ 未找到 → 返回 404 Error
+  │
+  └─ 成功 → 200 Success，绑定 Telegram Chat ID 到用户通知渠道
+```
+
+| 阶段 | 校验方式 | 失败响应 |
+|------|---------|---------|
+| URL 保密 | webhook secret 路径参数 | 路由不匹配 → 404 |
+| 消息格式 | 正则匹配 `/start {36位UUID}` | 202 Accepted（静默丢弃） |
+| Token 有效性 | `user_notification_channels.verification_token` 查库 | 404 Error |
+
+> **设计要点**：失败时返回 202 而非 4xx，是为了让 Telegram Bot Platform 停止重试（Telegram 对非 2xx 响应会指数退避重试）。
+
+### 16.4 对比：另一个 Telegram 入口（需认证） - [TelegramNotificationsController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/TelegramNotificationsController.php#L14-L33)
+
+`POST /settings/notifications/telegram` 是 Web 界面创建通知渠道的入口，位于 `auth:sanctum` 中间件组内：
+- 需要正常登录
+- 通过 `CreateUserNotificationChannel` Service（走 BaseService 权限校验）
+- 生成 `verification_token` 并存储
+- 返回给用户用于后续 Telegram Webhook 绑定
+
+---
+
+## 十七、Token 生命周期闭环与撤销/到期判定
+
+Monica 项目中存在 **三种完全独立的 Token 体系**，各自有不同的生命周期管理：
+
+### 17.1 Token 体系概览
+
+| 体系 | 存储表 | 模型 | 用途 | 撤销方式 | 过期策略 |
+|------|--------|------|------|---------|---------|
+| **Sanctum API Token** | `personal_access_tokens` | Laravel 内置 `PersonalAccessToken` | REST API 认证、DAV Basic Auth | Jetstream 路由删除 | 永不过期（未设置 expires_at） |
+| **OAuth 社交登录 Token** | `user_tokens` | [UserToken.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Models/UserToken.php) | Google/GitHub 等 OAuth 登录 | `DELETE /auth/{driver}` | 由 OAuth provider 决定（`expires_in` 字段） |
+| **DAV Sync Token** | `sync_tokens` | `SyncToken`（Eloquent 模型） | CardDAV/CalDAV 增量同步 | CleanSyncToken 定时任务 | 保留 30 天后自动清理 |
+
+### 17.2 Sanctum API Token 生命周期
+
+#### 创建
+
+走 Jetstream 标准路由 `POST /user/api-tokens`，在 [JetstreamServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Providers/JetstreamServiceProvider.php#L50-L55) 中配置：
+- 默认能力：`['read']`（`Jetstream::defaultApiTokenPermissions`）
+- 可选能力：`['read', 'write']`（`Jetstream::permissions`）
+- 明文 Token 仅在创建时返回一次，后续无法恢复
+
+数据库存储：
+```
+personal_access_tokens
+  ├─ tokenable_type / tokenable_id → 关联 User
+  ├─ name: Token 名称（用户备注）
+  ├─ token: SHA-256 哈希值
+  ├─ abilities: JSON 数组 ["read","write"]
+  ├─ last_used_at: 最后使用时间（每次请求自动更新）
+  └─ expires_at: NULL（Monica 不使用过期机制）
+```
+
+#### 能力更新
+
+`PUT /user/api-tokens/{tokenId}` - [ApiTokenPermissionsTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/tests/Feature/Auth/ApiTokenPermissionsTest.php#L31-L41)
+- 覆盖 `abilities` 字段
+- 无效能力名被静默过滤（白名单校验）
+
+#### 撤销（删除）
+
+`DELETE /user/api-tokens/{tokenId}` - [DeleteApiTokenTest.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/tests/Feature/Auth/DeleteApiTokenTest.php#L31-L33)
+- Jetstream 内置逻辑，直接删除对应行
+- 删除后该 Token 立即失效（下次请求哈希匹配不到）
+
+#### 到期判定
+
+Monica **从不设置 `expires_at`**，Token 永不过期。Sanctum 的过期检查逻辑（Laravel 内置）：
+```php
+// Sanctum 伪代码
+if ($token->expires_at && $token->expires_at->isPast()) {
+    throw new AuthenticationException;  // 401
+}
+```
+由于 `expires_at` 始终为 null，该检查直接跳过。
+
+### 17.3 OAuth 社交登录 Token 生命周期 - [UserToken.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Models/UserToken.php)
+
+存储字段：
+```php
+protected $fillable = [
+    'user_id', 'driver', 'driver_id', 'email', 'format',
+    'token', 'token_secret', 'refresh_token', 'expires_in',
+];
+```
+
+#### 创建
+
+用户通过 Socialite 完成 OAuth 登录回调时，由 [AttemptToAuthenticateSocialite.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Actions/AttemptToAuthenticateSocialite.php) 写入 `user_tokens` 表。
+
+#### 撤销
+
+`DELETE /auth/{driver}` - [UserTokenController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Http/Controllers/Profile/UserTokenController.php#L15-L22)
+```php
+public function destroy(Request $request, string $driver)
+{
+    $request->user()->userTokens()
+        ->where('driver', $driver)
+        ->delete();
+    return redirect()->route('profile.show');
+}
+```
+按驱动名（`google`/`github` 等）批量删除该用户下所有对应 Provider 的 Token。
+
+#### 到期判定
+
+`expires_in` 字段存储 OAuth Provider 返回的秒数（如 3600 = 1 小时），但项目中**没有代码检查该字段**，仅作为记录保存。Socialite 驱动内部在调用 API 时会自动用 `refresh_token` 续期。
+
+### 17.4 DAV Sync Token 生命周期 - [CleanSyncToken.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Jobs/CleanSyncToken.php)
+
+这是 CardDAV/CalDAV 同步协议的增量同步令牌，与认证无关，用于客户端追踪服务端变更。
+
+#### 创建
+
+每次客户端请求 `sync-token` 时，若数据有变化则自动创建新 Token：
+- [SyncDAVBackend.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/app/Domains/Contact/Dav/Web/Backend/SyncDAVBackend.php#L61-L69) `createSyncTokenNow()`
+- 每个 Token 关联 `user_id` + `name`（如 `contacts-{vaultId}`）+ `timestamp`
+
+#### 到期判定与清理
+
+保留天数配置：[dav.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/config/dav.php#L24)
+```php
+'sync_token_keep_days' => 30,
+```
+
+清理逻辑（CleanSyncToken Job）：
+```
+1. 按 user_id + name 分组，找出每组最新的 token（max timestamp）
+2. 删除所有"老于最新 token 且老于 30 天"的 token
+3. 触发 TokenDeleteEvent 事件
+4. 保留每个用户+资源类型至少一个 token（即使超 30 天）
+```
+
+> **注意**：Sync Token 不是安全凭证，只是同步游标。它不参与认证或授权判定。
+
+### 17.5 Session Token（Cookie）生命周期
+
+Web 浏览器的 Session Cookie 由 Laravel 默认管理：
+- 配置文件：[session.php](file:///d:/fz/0601-2/solo-dogfeeding/code/70-monica/config/session.php#L30-L37)
+- `expire_on_close`：默认 `false`，浏览器关闭后 Session 仍有效
+- 有效期由 `lifetime` 配置控制（分钟）
+- 登出时销毁当前 Session：由 Jetstream/Fortify 标准路由 `POST /logout` 处理
+
+### 17.6 Token 撤销/过期时的 HTTP 响应
+
+| Token 类型 | 撤销/过期事件 | 中间件/检查点 | HTTP 状态码 |
+|-----------|-------------|-------------|------------|
+| Sanctum API Token | 已删除（DB 无匹配） | `auth:sanctum` | 401 Unauthenticated |
+| Sanctum API Token | 已过期（expires_at 过去） | `auth:sanctum` | 401 Unauthenticated |
+| Sanctum API Token | 能力不足 | `abilities:*` | 403 Invalid ability |
+| DAV Sync Token | 已清理（同步游标丢失） | `SyncDAVBackend::getSyncToken()` | 返回 null → 客户端做全量重新同步 |
+| Session Cookie | 已登出 / 过期 | `auth:sanctum` (Session) | 302 重定向到登录页（Web） / 401（JSON 请求） |
+
+---
+
+## 十八、所有入口通道的完整权限矩阵
+
+| 入口路径 | 认证中间件 | CSRF 校验 | 授权方式 | 权限数据源 |
+|---------|-----------|----------|---------|-----------|
+| `/api/*` | `auth:sanctum` | ✅ API 无 Cookie 不需 CSRF | `abilities:*` + 关联查询/BaseService | `personal_access_tokens.abilities` + `user_vault.permission` |
+| `/dav`、`/dav/*` | `EnsureDavRequestsAreStateful` | ❌ 豁免 | `abilities:read,write` + GetVaults + Sabre ACL | 同上 + Sabre principal |
+| `/telegram/webhook/*` | **无** | ❌ 豁免 | verification_token 查库 | `user_notification_channels.verification_token` |
+| `/user/api-tokens` * | `auth:sanctum` | ✅ | 无额外授权（仅需登录） | 登录状态即可 |
+| Web `vaults/{vault}/*` | `auth:sanctum` + `verified` | ✅ | `can:vault-viewer,vault` 等 | `user_vault.permission` |
+| Web `settings/*` | `auth:sanctum` + `verified` | ✅ | 部分需 `can:administrator` | `users.is_account_administrator` |
+| `GET /currencies` | **无** | ✅ | **无（公开）** | - |
+| `/auth/{driver}` (Socialite) | **无** | ✅ | OAuth Provider 验证 | - |
+| `GET /invitation/{code}` | **无** | ✅ | invitation code 查库 | `invitations.code` |
+
+> \* `/user/api-tokens` 是 Jetstream 内置路由，用于 Token 的 CRUD 管理，必须已登录但无细粒度权限检查。
+
