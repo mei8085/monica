@@ -146,33 +146,91 @@ protected function name(): Attribute
     └─ 最终返回 translation_key 本身
 ```
 
-#### 应用此模式的模型列表
-| 模型 | 翻译键字段 | 代码位置 |
-|------|-----------|----------|
-| Religion | `translation_key` | [Religion.php:48](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/Religion.php#L48) |
-| Gender | `name_translation_key` | [Gender.php:85](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/Gender.php#L85) |
-| RelationshipType | `name_translation_key`, `name_reverse_relationship_translation_key` | [RelationshipType.php:70](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/RelationshipType.php#L70) |
-| RelationshipGroupType | `name_translation_key` | [RelationshipGroupType.php:78](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/RelationshipGroupType.php#L78) |
-| LifeEventCategory | `label_translation_key` | [LifeEventCategory.php:62](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/LifeEventCategory.php#L62) |
-| LifeEventType | `label_translation_key` | [LifeEventType.php:62](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/LifeEventType.php#L62) |
-| Module | `name_translation_key` | [Module.php:135](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/Module.php#L135) |
-| Template | `name_translation_key` | [Template.php:78](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/Template.php#L78) |
-| PostTemplate | `label_translation_key` | [PostTemplate.php:71](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/PostTemplate.php#L71) |
-| Emotion | `name_translation_key` | [Emotion.php:59](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/Emotion.php#L59) |
-| GroupType | `label_translation_key` | [GroupType.php:61](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/GroupType.php#L61) |
-| GiftOccasion | `label_translation_key` | [GiftOccasion.php:50](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/GiftOccasion.php#L50) |
-| GiftState | `label_translation_key` | [GiftState.php:50](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/GiftState.php#L50) |
-| MoodTrackingParameter | `label_translation_key` | [MoodTrackingParameter.php:62](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/MoodTrackingParameter.php#L62) |
-| PetCategory | `name_translation_key` | [PetCategory.php:49](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/PetCategory.php#L49) |
-| Pronoun | `name_translation_key` | [Pronoun.php:47](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/Pronoun.php#L47) |
-| AddressType | `name_translation_key` | [AddressType.php:50](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/AddressType.php#L50) |
-| CallReason | `name_translation_key` | [CallReason.php:39](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/CallReason.php#L39) |
-| CallReasonType | `name_translation_key` | [CallReasonType.php:50](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/CallReasonType.php#L50) |
-| ContactInformationType | `name_translation_key` | [ContactInformationType.php:48](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/ContactInformationType.php#L48) |
-| GroupTypeRole | `label_translation_key` | [GroupTypeRole.php:50](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/GroupTypeRole.php#L50) |
-| PostTemplateSection | `label_translation_key` | [PostTemplateSection.php:59](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/PostTemplateSection.php#L59) |
-| TemplatePage | `name_translation_key` | [TemplatePage.php:82](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/TemplatePage.php#L82) |
-| VaultQuickFactsTemplate | `label_translation_key` | [VaultQuickFactsTemplate.php:50](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/VaultQuickFactsTemplate.php#L50) |
+#### 应用此模式的模型清单（精确审计）
+
+**重要澄清**：`grep translation_key` 会命中 **25 个模型文件**，但其中只有 **24 个模型**自身拥有 `*_translation_key` 字段并实现了翻译 Accessor。`ContactInformation` 模型只是**引用了关联模型的 translation_key 做匹配**，自身并无此字段。
+
+##### 自身拥有 translation_key 字段的 24 个模型（25 个 Accessor）
+
+| # | 模型 | 翻译键字段 | Accessor 返回属性 | 代码位置 |
+|---|------|-----------|-------------------|----------|
+| 1 | Religion | `translation_key` | `name` | [Religion.php:48](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/Religion.php#L48) |
+| 2 | Gender | `name_translation_key` | `name` | [Gender.php:85](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/Gender.php#L85) |
+| 3 | RelationshipType | `name_translation_key` | `name` | [RelationshipType.php:70](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/RelationshipType.php#L70) |
+| 4 | RelationshipType | `name_reverse_relationship_translation_key` | `name_reverse_relationship` | [RelationshipType.php:92](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/RelationshipType.php#L92) |
+| 5 | RelationshipGroupType | `name_translation_key` | `name` | [RelationshipGroupType.php:78](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/RelationshipGroupType.php#L78) |
+| 6 | LifeEventCategory | `label_translation_key` | `label` | [LifeEventCategory.php:62](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/LifeEventCategory.php#L62) |
+| 7 | LifeEventType | `label_translation_key` | `label` | [LifeEventType.php:62](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/LifeEventType.php#L62) |
+| 8 | Module | `name_translation_key` | `name` | [Module.php:135](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/Module.php#L135) |
+| 9 | Template | `name_translation_key` | `name` | [Template.php:78](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/Template.php#L78) |
+| 10 | TemplatePage | `name_translation_key` | `name` | [TemplatePage.php:82](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/TemplatePage.php#L82) |
+| 11 | PostTemplate | `label_translation_key` | `label` | [PostTemplate.php:71](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/PostTemplate.php#L71) |
+| 12 | PostTemplateSection | `label_translation_key` | `label` | [PostTemplateSection.php:59](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/PostTemplateSection.php#L59) |
+| 13 | Emotion | `name_translation_key` | `name` | [Emotion.php:59](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/Emotion.php#L59) |
+| 14 | GroupType | `label_translation_key` | `label` | [GroupType.php:61](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/GroupType.php#L61) |
+| 15 | GiftOccasion | `label_translation_key` | `label` | [GiftOccasion.php:50](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/GiftOccasion.php#L50) |
+| 16 | GiftState | `label_translation_key` | `label` | [GiftState.php:50](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/GiftState.php#L50) |
+| 17 | MoodTrackingParameter | `label_translation_key` | `label` | [MoodTrackingParameter.php:62](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/MoodTrackingParameter.php#L62) |
+| 18 | PetCategory | `name_translation_key` | `name` | [PetCategory.php:49](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/PetCategory.php#L49) |
+| 19 | Pronoun | `name_translation_key` | `name` | [Pronoun.php:47](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/Pronoun.php#L47) |
+| 20 | AddressType | `name_translation_key` | `name` | [AddressType.php:50](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/AddressType.php#L50) |
+| 21 | CallReason | `label_translation_key` | `label` | [CallReason.php:49](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/CallReason.php#L49) |
+| 22 | CallReasonType | `label_translation_key` | `label` | [CallReasonType.php:60](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/CallReasonType.php#L60) |
+| 23 | ContactInformationType | `name_translation_key` | `name` | [ContactInformationType.php:58](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/ContactInformationType.php#L58) |
+| 24 | GroupTypeRole | `label_translation_key` | `label` | [GroupTypeRole.php:50](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/GroupTypeRole.php#L50) |
+| 25 | VaultQuickFactsTemplate | `label_translation_key` | `label` | [VaultQuickFactsTemplate.php:50](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/VaultQuickFactsTemplate.php#L50) |
+
+**字段类型统计**：
+- `translation_key` (无前缀)：1 个模型（Religion）
+- `name_translation_key`：10 个模型 + RelationshipType 额外 1 个 = 11 个 Accessor
+- `label_translation_key`：13 个模型
+- **总计**：24 个模型文件，25 个 Accessor
+
+**审计修正说明**（与旧版文档对比）：
+- CallReason：原文档写 `name_translation_key` → 实际为 `label_translation_key`，Accessor 返回 `label` 而非 `name`
+- CallReasonType：原文档写 `name_translation_key` → 实际为 `label_translation_key`，Accessor 返回 `label`
+- ContactInformationType：原文档行号错误，正确在第 58 行
+
+---
+
+#### ContactInformation 与 CallReason 的字段差异对比
+
+这两个模型经常被混淆，因为都与"联系方式/通话原因"相关，但 translation_key 的使用方式完全不同：
+
+| 对比维度 | CallReason | ContactInformation |
+|----------|------------|--------------------|
+| **自身有 translation_key 字段** | ✅ 有 (`label_translation_key`) | ❌ 无 |
+| **有翻译 Accessor** | ✅ `label()` Accessor | ❌ 无（名称从关联类型获取） |
+| **fillable 中包含** | ✅ `label_translation_key` 在 `$fillable` 中 | ❌ 不在 |
+| **如何获取翻译名称** | 通过自身 `$callReason->label` 属性 | 通过关联 `$contactInfo->contactInformationType->name` |
+| **引用 translation_key 的用途** | （自身翻译用） | 在 `dataWithProtocol` Accessor 中用 `name_translation_key` 做数组匹配查找 protocol URL |
+
+**ContactInformation 引用 translation_key 的具体代码**：
+[ContactInformation.php:86](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/ContactInformation.php#L86)
+```php
+if (($protocol = $protocols->firstWhere(
+    'name_translation_key', 
+    $this->contactInformationType->name_translation_key
+)) !== null) {
+    return $protocol['url'].$this->data;
+}
+```
+
+这里 `name_translation_key` 是作为**匹配键**使用的，不是用来翻译的——它从 `config('app.social_protocols')` 配置数组中找到对应协议，再拼接 URL。
+
+---
+
+#### ContactInformationType 的翻译特殊性
+
+[ContactInformationType.php:56-61](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Models/ContactInformationType.php#L56-L61) 有一个特殊的判定条件：
+
+```php
+if ($value === null || $value == '') {
+    return __($attributes['name_translation_key']);
+}
+```
+
+与其他模型（只用 `is_null` 检查）不同，它多了 `$value == ''` 的空字符串判断，意味着**空字符串也会触发 fallback 到翻译键**。其他模型如 CallReason 只判断 `$value === null`。
 
 ---
 
@@ -764,7 +822,104 @@ $tChoice(':count apple|:count apples', 5, { count: 5 })
 
 ---
 
-## 十四、关键注意事项（补充）
+## 十四、Vendor 第三方包翻译资源加载与 Fallback
+
+### 14.1 Vendor 翻译目录结构
+项目中存在一个第三方包的翻译覆盖目录：
+
+```
+lang/vendor/
+└── webauthn/              ← LaravelWebauthn 包的命名空间
+    ├── de/
+    │   ├── errors.php
+    │   └── messages.php
+    ├── en/
+    │   ├── errors.php
+    │   └── messages.php
+    └── fr/
+        ├── errors.php
+        └── messages.php
+```
+
+**包来源**：`asbiin/laravel-webauthn`（见 [composer.json](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/composer.json#L15)）
+
+### 14.2 Vendor 翻译加载机制
+Laravel 的 Vendor 翻译资源通过 **"包命名空间 → 发布目录 → 包自带目录"** 的三级查找顺序加载：
+
+```
+调用 __('webauthn::errors.login_failed')
+    ↓
+解析命名空间 'webauthn' 和键 'errors.login_failed'
+    ↓
+第1级查找：项目 lang/vendor/webauthn/{locale}/errors.php
+    ↓ 找到 → 返回翻译
+    ↓ 未找到
+第2级查找：包自带 resources/lang/{locale}/errors.php
+    ↓ 找到 → 返回翻译
+    ↓ 未找到
+进入 fallback_locale 流程
+    ↓
+第3级查找：lang/vendor/webauthn/en/errors.php
+    ↓ 找到 → 返回翻译
+    ↓ 未找到
+第4级查找：包自带 resources/lang/en/errors.php
+    ↓ 找到 → 返回翻译
+    ↓ 未找到
+返回 'webauthn::errors.login_failed' 键本身
+```
+
+### 14.3 项目中实际使用 Vendor 翻译的位置
+全量搜索仅找到 **1 处** Vendor 翻译调用：
+
+[AttemptToAuthenticateWebauthn.php:88](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Actions/AttemptToAuthenticateWebauthn.php#L88)
+```php
+throw ValidationException::withMessages([
+    Webauthn::username() => [trans_ignore('webauthn::errors.login_failed')],
+]);
+```
+
+使用 `trans_ignore()` 包装是为了**不被翻译提取命令扫描**（Vendor 翻译由第三方包负责）。
+
+### 14.4 Vendor 翻译 Fallback 路径（以 webauthn 为例）
+```
+调用 trans_ignore('webauthn::errors.login_failed')  locale = fr
+    ↓
+查找 lang/vendor/webauthn/fr/errors.php
+    ├─ 'login_failed' => "Échec de l'authentification"  → 找到 → 返回法语翻译
+    └─ 未找到
+        ↓
+        查找 fallback_locale = en 的 lang/vendor/webauthn/en/errors.php
+            ├─ 'login_failed' => 'Authentication failed' → 找到 → 返回英文翻译
+            └─ 未找到
+                ↓
+                查找包自带的 vendor/asbiin/laravel-webauthn/resources/lang/en/errors.php
+                    ├─ 找到 → 返回包自带英文翻译
+                    └─ 未找到 → 返回 'webauthn::errors.login_failed'
+```
+
+### 14.5 Vendor 翻译与前端的关系
+**重要**：Vendor 翻译（`webauthn::*`）**仅在后端使用**，前端不加载 Vendor 翻译。
+
+证据：
+1. 前端 i18n 初始化仅加载 `lang/*.json`：[app.js:32](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/app.js#L32)
+   ```javascript
+   resolve: (lang) => resolvePageComponent(`../../lang/${lang}.json`, import.meta.glob('../../lang/*.json')),
+   ```
+   不包含 `lang/vendor/**` 路径。
+2. 前端代码中无任何 `webauthn::` 前缀的翻译调用。
+
+### 14.6 当前 Vendor 翻译语言支持
+| 语言 | errors.php | messages.php |
+|------|-----------|--------------|
+| de (德语) | ✅ 有 | ✅ 有 |
+| en (英语) | ✅ 有 | ✅ 有 |
+| fr (法语) | ✅ 有 | ✅ 有 |
+
+其他 26 种项目支持的语言（如 zh_CN, ja, es 等）**无 Vendor 翻译覆盖**，会 fallback 到英文或包自带翻译。
+
+---
+
+## 十五、关键注意事项（综合补充）
 
 1. **英语作为基准**：`en.json` 是所有翻译的基准，键和值相同。
 2. **双重 fallback**：模型层有自己的 fallback（用户值 → 翻译键），翻译系统又有一层 fallback（当前语言 → fallback 语言 → 键本身）。
@@ -777,3 +932,7 @@ $tChoice(':count apple|:count apples', 5, { count: 5 })
 9. **Inertia share 不传递 locale**：前端通过 HTML lang 属性和 `loadLanguageAsync` 管理语言，不依赖 Inertia 共享数据。
 10. **复数翻译参数替换**：即使翻译键缺失，占位符参数仍会被替换，避免显示原始 `:count` 等占位符。
 11. **语言名称自翻译技巧**：`__('auth.lang', [], $code)` 通过第三个参数强制指定 locale，实现语言名称用自身显示。
+12. **管道复数仅服务前端**：`|` 分隔的复数格式定义**完全由前端 `$tChoice()` 消费**，后端从不调用 `trans_choice()` 或 `@choice`。
+13. **Vendor 翻译仅后端可用**：`lang/vendor/webauthn/` 的翻译仅在后端通过 `trans_ignore('webauthn::xxx')` 调用，前端 i18n 不加载 Vendor 目录。
+14. **模型清单已审计**：24 个模型、25 个 Accessor，其中 CallReason 和 CallReasonType 的字段是 `label_translation_key`（非 `name_translation_key`）。
+15. **翻译提取工具空转**：[config/localizator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/config/localizator.php#L35) 配置了提取 `trans_choice`，但项目代码中实际无调用。
