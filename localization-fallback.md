@@ -868,36 +868,161 @@ Laravel 的 Vendor 翻译资源通过 **"包命名空间 → 发布目录 → �
 返回 'webauthn::errors.login_failed' 键本身
 ```
 
-### 14.3 项目中实际使用 Vendor 翻译的位置
-全量搜索仅找到 **1 处** Vendor 翻译调用：
+### 14.3 login_failed 调用入口链路
 
-[AttemptToAuthenticateWebauthn.php:88](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Actions/AttemptToAuthenticateWebauthn.php#L88)
+#### 唯一调用点
+项目中 `webauthn::errors.login_failed` 仅在 **1 处**被调用：
+
+[AttemptToAuthenticateWebauthn.php:83-90](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Actions/AttemptToAuthenticateWebauthn.php#L83-L90)
 ```php
-throw ValidationException::withMessages([
-    Webauthn::username() => [trans_ignore('webauthn::errors.login_failed')],
-]);
+protected function throwFailedAuthenticationException(Request $request)
+{
+    $this->limiter->increment($request);
+
+    throw ValidationException::withMessages([
+        Webauthn::username() => [trans_ignore('webauthn::errors.login_failed')],
+    ]);
+}
 ```
 
-使用 `trans_ignore()` 包装是为了**不被翻译提取命令扫描**（Vendor 翻译由第三方包负责）。
+**调用时机**：当 WebAuthn 断言验证失败时，抛出验证异常并附带错误消息。
 
-### 14.4 Vendor 翻译 Fallback 路径（以 webauthn 为例）
+#### 上游调用路径
+该 Action 类在 WebAuthn 登录流程中被调用（通过 Webauthn 中间件或 Guard 触发），涉及的配置：
+- [config/auth.php:64](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/config/auth.php#L64)：用户 provider 驱动为 `webauthn`
+- [config/webauthn.php:29](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/config/webauthn.php#L29)：Guard 为 `web`
+- [bootstrap/app.php:29](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/bootstrap/app.php#L29)：注册 `webauthn` 中间件别名
+
+#### 为什么用 trans_ignore
+使用 `trans_ignore()` 包装是为了**不被 `monica:localize` 翻译提取命令扫描**——Vendor 翻译由第三方包维护，不需要项目自己提取。
+
+---
+
+### 14.4 Vendor 翻译语言覆盖情况（精确核对）
+
+#### 目录级覆盖 vs Key 级覆盖（重要概念区分）
+
+在理解 Vendor 翻译之前，必须区分**两个不同层级的覆盖**：
+
+| 层级 | 含义 | 判定方式 |
+|------|------|----------|
+| **目录级覆盖** | 某种语言是否有完整的翻译目录和文件 | 检查 `lang/vendor/webauthn/{locale}/` 目录是否存在 |
+| **Key 级覆盖** | 某个具体翻译键在该语言文件中是否存在 | 在文件存在的前提下，检查 `'login_failed'` 键是否在返回数组中 |
+
+**目录级覆盖情况**：3 种语言都有目录，均**存在**
+
+**Key 级覆盖情况（login_failed）**：en 存在，fr/de 不存在 ← 这是本章节的核心发现
+
+---
+
+#### errors.php 逐文件逐行精确核对
+
+##### 1. en/errors.php（基准，10 个键）
+[lang/vendor/webauthn/en/errors.php](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/lang/vendor/webauthn/en/errors.php)
 ```
-调用 trans_ignore('webauthn::errors.login_failed')  locale = fr
+L4:  'login_failed'            ← 第 1 个键 ★ 存在
+L5:  'user_unauthenticated'
+L6:  'auth_data_not_found'
+L7:  'create_data_not_found'
+L8:  'cannot_register_new_key'
+L9:  'wrong_validation'        ← 第 6 个键（en 独有）
+L10: 'object_not_found'
+L12: 'not_supported'
+L13: 'not_secured'
+L14: 'key_already_used'
+L15: 'key_not_allowed'
+```
+共 10 个键，**含 `login_failed` 和 `wrong_validation`**。
+
+##### 2. fr/errors.php（9 个键，缺 2 个）
+[lang/vendor/webauthn/fr/errors.php](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/lang/vendor/webauthn/fr/errors.php)
+```
+L4:  'user_unauthenticated'    ← 第 1 个键（从这里开始，跳过了 login_failed）
+L5:  'auth_data_not_found'
+L6:  'create_data_not_found'
+L7:  'cannot_register_new_key'
+L8:  'object_not_found'
+L10: 'not_supported'
+L11: 'not_secured'
+L12: 'key_already_used'
+L13: 'key_not_allowed'
+```
+共 9 个键，**缺少 `login_failed` 和 `wrong_validation`**。
+
+##### 3. de/errors.php（9 个键，缺 2 个）
+[lang/vendor/webauthn/de/errors.php](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/lang/vendor/webauthn/de/errors.php)
+```
+L4:  'user_unauthenticated'    ← 第 1 个键（从这里开始，跳过了 login_failed）
+L5:  'auth_data_not_found'
+L6:  'create_data_not_found'
+L7:  'cannot_register_new_key'
+L8:  'object_not_found'
+L10: 'not_supported'
+L11: 'not_secured'
+L12: 'key_already_used'
+L13: 'key_not_allowed'
+```
+共 9 个键，**缺少 `login_failed` 和 `wrong_validation`**，与 fr 完全一致。
+
+---
+
+#### 完整键分布对比表
+
+| Key | en | fr | de | 缺失语言 |
+|-----|:--:|:--:|:--:|----------|
+| `login_failed` | ✅ | ❌ | ❌ | fr, de |
+| `user_unauthenticated` | ✅ | ✅ | ✅ | - |
+| `auth_data_not_found` | ✅ | ✅ | ✅ | - |
+| `create_data_not_found` | ✅ | ✅ | ✅ | - |
+| `cannot_register_new_key` | ✅ | ✅ | ✅ | - |
+| `wrong_validation` | ✅ | ❌ | ❌ | fr, de |
+| `object_not_found` | ✅ | ✅ | ✅ | - |
+| `not_supported` | ✅ | ✅ | ✅ | - |
+| `not_secured` | ✅ | ✅ | ✅ | - |
+| `key_already_used` | ✅ | ✅ | ✅ | - |
+| `key_not_allowed` | ✅ | ✅ | ✅ | - |
+| **键数** | **10** | **9** | **9** | - |
+
+**结论**：de 和 fr 的 errors.php 是"不完整翻译"——目录和文件存在，但内部缺少 `login_failed` 和 `wrong_validation` 两个键。这不是目录级缺失，而是 **Key 级缺失**。
+
+---
+
+### 14.5 缺失语言时回退到英文的完整路径（login_failed 实例）
+
+以 `locale = fr` 调用 `trans_ignore('webauthn::errors.login_failed')` 为例，这是一个**真实存在的缺失翻译场景**：
+
+```
+调用 trans_ignore('webauthn::errors.login_failed')
+    ↓  locale = fr
+解析命名空间 'webauthn' 和文件 'errors'
     ↓
-查找 lang/vendor/webauthn/fr/errors.php
-    ├─ 'login_failed' => "Échec de l'authentification"  → 找到 → 返回法语翻译
-    └─ 未找到
-        ↓
-        查找 fallback_locale = en 的 lang/vendor/webauthn/en/errors.php
-            ├─ 'login_failed' => 'Authentication failed' → 找到 → 返回英文翻译
-            └─ 未找到
-                ↓
-                查找包自带的 vendor/asbiin/laravel-webauthn/resources/lang/en/errors.php
-                    ├─ 找到 → 返回包自带英文翻译
-                    └─ 未找到 → 返回 'webauthn::errors.login_failed'
+第 1 级：当前 locale 的项目覆盖文件
+    查找 lang/vendor/webauthn/fr/errors.php
+        ├─ 找到文件，但 'login_failed' 键不存在
+        └─ 未找到 → 继续
+    ↓
+第 2 级：当前 locale 的包自带文件
+    查找 vendor/asbiin/laravel-webauthn/resources/lang/fr/errors.php
+        ├─ （可能有也可能没有，取决于包）
+        └─ 如未找到 → 进入 fallback 流程
+    ↓
+第 3 级：fallback_locale = en 的项目覆盖文件 ★ 关键回退点
+    查找 lang/vendor/webauthn/en/errors.php
+        └─ 找到 'login_failed' => 'Authentication failed'
+    ↓
+返回 'Authentication failed'（英文）
 ```
 
-### 14.5 Vendor 翻译与前端的关系
+**四级查找优先级总结**（从高到低）：
+1. 项目覆盖 - 当前 locale：`lang/vendor/{namespace}/{locale}/{file}.php`
+2. 包自带 - 当前 locale：`vendor/{package}/resources/lang/{locale}/{file}.php`
+3. 项目覆盖 - fallback locale (en)：`lang/vendor/{namespace}/en/{file}.php`
+4. 包自带 - fallback locale (en)：`vendor/{package}/resources/lang/en/{file}.php`
+5. 最终保底：返回键本身（如 `'webauthn::errors.login_failed'`）
+
+---
+
+### 14.6 Vendor 翻译与前端的关系
 **重要**：Vendor 翻译（`webauthn::*`）**仅在后端使用**，前端不加载 Vendor 翻译。
 
 证据：
@@ -907,15 +1032,14 @@ throw ValidationException::withMessages([
    ```
    不包含 `lang/vendor/**` 路径。
 2. 前端代码中无任何 `webauthn::` 前缀的翻译调用。
+3. 前端 WebAuthn 相关组件（如 [WebauthnLogin.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Webauthn/WebauthnLogin.vue)）的文案全部使用普通 `$t()` 从主语言文件读取。
 
-### 14.6 当前 Vendor 翻译语言支持
-| 语言 | errors.php | messages.php |
-|------|-----------|--------------|
-| de (德语) | ✅ 有 | ✅ 有 |
-| en (英语) | ✅ 有 | ✅ 有 |
-| fr (法语) | ✅ 有 | ✅ 有 |
+---
 
-其他 26 种项目支持的语言（如 zh_CN, ja, es 等）**无 Vendor 翻译覆盖**，会 fallback 到英文或包自带翻译。
+### 14.7 当前 Vendor 翻译缺口
+- **语言缺口**：29 种项目支持语言中，仅 3 种有 WebAuthn Vendor 翻译，其余 26 种（zh_CN, ja, es, ru 等）全部 fallback 到英文
+- **键缺口**：即使在有翻译的 fr 和 de 中，`login_failed` 键也缺失，会 fallback 到英文
+- **影响范围**：WebAuthn 登录失败时的错误消息，多语言用户可能看到英文提示
 
 ---
 
