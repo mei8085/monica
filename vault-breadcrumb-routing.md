@@ -218,7 +218,7 @@ public function show(Request $request, string $vaultId, string $contactId)
 | 3 | {post.title} | `data.url.show` | `post.show` | [PostEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostEditViewHelper.php#L88-L92) |
 | 4 | Edit a post | 无（终端节点） | - | 前端静态文本 |
 
-#### ⑦ 切片详情页（5 层面包屑）
+####  切片详情页（4 层面包屑）
 - **文件**：[Journal/Slices/Show.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Journal/Slices/Show.vue#L60-L117)
 - **路由**：`vaults/{vault}/journals/{journal}/slices/{slice}`
 - **面包屑**：
@@ -232,7 +232,7 @@ public function show(Request $request, string $vaultId, string $contactId)
 
 > **注意**：切片详情页的终端层使用 `localSlice` 而非 `data.slice.name`，因为封面图更新后会更新本地响应式变量，面包屑名称随之变化。
 
-#### ⑧ 切片编辑页（6 层面包屑）
+####  切片编辑页（5 层面包屑）
 - **文件**：[Journal/Slices/Edit.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Journal/Slices/Edit.vue#L34-L102)
 - **路由**：`vaults/{vault}/journals/{journal}/slices/{slice}/edit`
 - **面包屑**：
@@ -271,16 +271,16 @@ public function show(Request $request, string $vaultId, string $contactId)
 
 **URL 来源口诀**：**一层 layoutData，深层 data 挖，最后是文本。
 
-### 5.3 `data.url.back 的两种模式对比
+### 5.3 `data.url.back` 的两种模式对比
 
 不同 ViewHelper 中，面包屑回链 URL 的命名并不统一，存在两种模式：
 
 | 模式 | 示例 | 所在 ViewHelper |
 |------|------|---------------|
 | **`data.url.back`** | 帖子详情/编辑页 | [PostShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostShowViewHelper.php#L111-L114)、[PostEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostEditViewHelper.php#L113-L116) |
-| **`data.journal.url.show** | 切片详情/编辑页 | [SliceOfLifeShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeShowViewHelper.php#L48-L57)、[SliceOfLifeEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeEditViewHelper.php#L24-L33) |
+| **`data.journal.url.show`** | 切片详情/编辑页 | [SliceOfLifeShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeShowViewHelper.php#L48-L57)、[SliceOfLifeEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeEditViewHelper.php#L24-L33) |
 
-- **模式一（扁平模式（扁平结构不同模块约定俗成，并无强制规范。新增页面时需参考同模块其他页面的写法。
+- 两种模式在不同模块约定俗成，并无强制规范。新增页面时需参考同模块其他页面的写法。
 
 ### 5.4 层级来源总结
 
@@ -411,16 +411,19 @@ Vault 模型中有 7 个布尔型字段控制 Tab 的显示与隐藏，存储在
 | 字段名 | 对应 Tab | 默认值 |
 |--------|---------|--------|
 | `show_journal_tab` | 日记 (Journals) | true |
-| `show_contact_tab` | 联系人 (Contacts) | true |
 | `show_group_tab` | 分组 (Groups) | true |
-| `show_report_tab` | 报告 (Reports) | true |
-| `show_gift_tab` | 礼物 (Gifts) | true |
-| `show_file_tab` | 文件 (Files) | true |
-| `show_notes_tab` | 笔记 (Notes) | true |
+| `show_tasks_tab` | 任务 (Tasks) | true |
+| `show_files_tab` | 文件 (Files) | true |
+| `show_companies_tab` | 公司 (Companies) | true |
+| `show_reports_tab` | 报告 (Reports) | true |
+| `show_calendar_tab` | 日历 (Calendar) | true |
 
 **设置入口**：Vault 设置  Tab 显示开关页面，由 [VaultSettingsTabVisibilityController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsTabVisibilityController.php) 处理。
 
 **前端设置组件**：[TabVisibility.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Settings/Partials/TabVisibility.vue)
+
+
+> **注意**：Dashboard、Contacts 两个 Tab 始终显示，没有对应的显示开关字段；Settings Tab 由 `permission.at_least_editor` 权限控制，也不受 visibility 开关影响。
 
 ### 8.5 layoutData 中的权限与可见性结构
 
@@ -428,27 +431,33 @@ Vault 模型中有 7 个布尔型字段控制 Tab 的显示与隐藏，存储在
 
 ```
 layoutData.vault
- permission         当前用户权限级别数值（100/200/300）
- visibility         7 个 Tab 显示开关布尔值
+  permission         当前用户权限布尔判断对象
+    at_least_editor     permission <= 200（可编辑内容）
+    at_least_manager    permission <= 100（可管理 Vault）
+  visibility         7 个 Tab 显示开关布尔值
     show_journal_tab
-    show_contact_tab
     show_group_tab
-    show_report_tab
-    show_gift_tab
-    show_file_tab
-    show_notes_tab
- url                所有 Tab 的顶层链接（全部生成，不受可见性影响）
-     journals
-     contacts
-     groups
-     reports
-     gifts
-     files
-     notes
+    show_tasks_tab
+    show_files_tab
+    show_companies_tab
+    show_reports_tab
+    show_calendar_tab
+  url                所有 Tab 的顶层链接（全部生成，不受可见性影响）
+      dashboard
+      contacts
+      calendar
+      journals
+      groups
+      companies
+      tasks
+      files
+      reports
+      settings
+      search
 ```
 
 **关键耦合规则**：
-1. **URL 始终全量生成**：`layoutData.vault.url.*` 不论 Tab 是否显示，都会生成所有 7 个链接
+1. **URL 始终全量生成**：`layoutData.vault.url.*` 不论 Tab 是否显示，都会生成所有 URL
 2. **Tab 按钮按可见性过滤**：Layout 中的 Tab 导航通过 `v-if="visibility.show_xxx_tab"` 控制显示
 3. **面包屑不检查可见性**：面包屑链接直接使用 `layoutData.vault.url.*`，不判断 Tab 是否隐藏
 4. **权限在路由层拦截**：能否访问页面由路由中间件的 Gate 检查决定，面包屑层面不做权限校验
