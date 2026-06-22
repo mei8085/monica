@@ -317,8 +317,6 @@ lang/
 
 ---
 
----
-
 ## 八、Locale 持久化：Stores 三件套
 
 当检测器确定当前 locale 后，`asbiin/laravel-localizer` 会通过配置的 `stores` 将 locale 持久化，确保后续请求能保持语言设置。
@@ -627,8 +625,58 @@ public function share(Request $request)
 Monica 项目使用 Laravel 标准的 `|` 分隔符定义复数形式，支持复杂的数量区间匹配。
 
 ### 13.1 复数格式定义
-#### 后端：`trans_choice()`
-虽然项目中未直接使用 `trans_choice()`，但翻译文件中已定义复数格式：
+
+#### 后端：`trans_choice()` 与 `@choice` 实际使用情况
+
+经过全量代码搜索，项目后端**从未直接调用** `trans_choice()`、`choice()` 或 Blade 的 `@choice` 指令：
+
+| 函数/指令 | 搜索范围 | 命中数 |
+|-----------|----------|--------|
+| `trans_choice(` | 整个项目 | 0 条（仅 markdown 文档中有提及） |
+| `@choice` | 整个项目 | 0 条 |
+| `choice(` | `app/` 目录 | 0 条 |
+
+**后端复数翻译现状**：
+- 翻译文件 [lang/en.json](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/lang/en.json#L3) 中确实定义了复数格式字符串（含 `|` 分隔符），但后端代码从不消费这些复数定义
+- 后端所有翻译调用均使用 `__()`、`trans()`、`trans_ignore()` 等单数形式
+- 翻译提取工具 [config/localizator.php](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/config/localizator.php#L35) 配置了 `trans_choice` 提取函数，但实际代码中从未使用
+
+#### 前端：`$tChoice()` 是管道复数定义的唯一消费方
+
+管道 `|` 分隔的复数格式**完全服务于前端** `$tChoice()` 调用。项目中共找到 **12 处** `$tChoice()` 调用：
+
+| 文件 | 调用位置 | 翻译内容 |
+|------|----------|----------|
+| [MoodTrackingEvent.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Shared/Modules/FeedItems/MoodTrackingEvent.vue#L31-L35) | L31 | `Slept :count hour\|Slept :count hours` |
+| [Tags.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Vault/Settings/Partials/Tags.vue#L53) | L53 | `:count post\|:count posts` |
+| [Labels.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Vault/Settings/Partials/Labels.vue#L75) | L75 | `:count contact\|:count contacts` |
+| [Show.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Vault/Journal/Slices/Show.vue#L196) | L196 | `:count post\|:count posts` |
+| [Show.vue (Post)](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Vault/Journal/Post/Show.vue#L212-L214) | L212 | `Slept :count hour\|Slept :count hours` |
+| [Template.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Vault/Journal/Post/Template.vue#L73-L75) | L73 | `:count template section\|:count template sections` |
+| [Edit.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Vault/Journal/Post/Edit.vue#L431) | L431 | `:count word\|:count words` |
+| [Edit.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Vault/Journal/Post/Edit.vue#L449) | L449 | `:count min read` (特殊：单区间无管道) |
+| [Edit.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Vault/Journal/Post/Edit.vue#L470) | L470 | `Read :count time\|Read :count times` |
+| [Show.vue (Group)](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Vault/Group/Show.vue#L95) | L95 | `:count contact\|:count contacts` |
+| [Index.vue (Calendar)](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Vault/Calendar/Index.vue#L132) | L132 | `:count post\|:count posts` |
+| [Index.vue (Calendar)](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Vault/Calendar/Index.vue#L181-L183) | L181 | `:count hour slept\|:count hours slept` |
+
+**lang/en.json 中的 8 条管道复数定义**：
+```json
+"(and :count more errors)": "(and :count more error)|(and :count more errors)|(and :count more errors)",
+":count contact|:count contacts": ":count contact|:count contacts",
+":count hour slept|:count hours slept": ":count hour slept|:count hours slept",
+":count post|:count posts": ":count post|:count posts",
+":count template section|:count template sections": ":count template section|:count template sections",
+":count word|:count words": ":count word|:count words",
+"Read :count time|Read :count times": "Read :count time|Read :count times",
+"Slept :count hour|Slept :count hours": "Slept :count hour|Slept :count hours"
+```
+
+**关键结论**：管道复数定义 (`|`) **仅服务于前端** `$tChoice()`，后端完全不使用。如果有后端需要复数翻译的场景，需要改用 `trans_choice()` 并确保后端 fallback 逻辑正确。
+
+---
+
+### 13.2 Laravel 复数规则
 
 [lang/en.json:3](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/lang/en.json#L3)
 ```json
