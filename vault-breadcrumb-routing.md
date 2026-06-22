@@ -206,7 +206,83 @@ public function show(Request $request, string $vaultId, string $contactId)
 | 1 | Groups | `layoutData.vault.url.groups` | route('group.index') |
 | 2 | {group.name} | 无（终端节点） | - |
 
-### 5.2 层级来源总结
+#### ⑥ 帖子编辑页（4 层面包屑）
+- **文件**：[Journal/Post/Edit.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Journal/Post/Edit.vue#L154-L213)
+- **路由**：`vaults/{vault}/journals/{journal}/posts/{post}/edit`
+- **面包屑**：
+
+| 层级 | 显示文本 | 链接来源 | 链接值 | 后端生成 |
+|------|---------|---------|--------|---------|
+| 1 | Journals | `layoutData.vault.url.journals` | `journal.index` | layoutData |
+| 2 | {journal.name} | `data.url.back` | `journal.show` | [PostEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostEditViewHelper.php#L113-L116) |
+| 3 | {post.title} | `data.url.show` | `post.show` | [PostEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostEditViewHelper.php#L88-L92) |
+| 4 | Edit a post | 无（终端节点） | - | 前端静态文本 |
+
+#### ⑦ 切片详情页（5 层面包屑）
+- **文件**：[Journal/Slices/Show.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Journal/Slices/Show.vue#L60-L117)
+- **路由**：`vaults/{vault}/journals/{journal}/slices/{slice}`
+- **面包屑**：
+
+| 层级 | 显示文本 | 链接来源 | 链接值 | 后端生成 |
+|------|---------|---------|--------|---------|
+| 1 | Journals | `layoutData.vault.url.journals` | `journal.index` | layoutData |
+| 2 | {journal.name} | `data.journal.url.show` | `journal.show` | [SliceOfLifeShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeShowViewHelper.php#L48-L57) |
+| 3 | Slices of life | `data.url.slices_index` | `slices.index` | [SliceOfLifeShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeShowViewHelper.php#L63-L68) |
+| 4 | {slice.name} | 无（终端节点） | - | （通过 `localSlice.name` 本地响应式变量 |
+
+> **注意**：切片详情页的终端层使用 `localSlice` 而非 `data.slice.name`，因为封面图更新后会更新本地响应式变量，面包屑名称随之变化。
+
+#### ⑧ 切片编辑页（6 层面包屑）
+- **文件**：[Journal/Slices/Edit.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Journal/Slices/Edit.vue#L34-L102)
+- **路由**：`vaults/{vault}/journals/{journal}/slices/{slice}/edit`
+- **面包屑**：
+
+| 层级 | 显示文本 | 链接来源 | 链接值 | 后端生成 |
+|------|---------|---------|--------|---------|
+| 1 | Journals | `layoutData.vault.url.journals` | `journal.index` | layoutData |
+| 2 | {journal.name} | `data.journal.url.show` | `journal.show` | [SliceOfLifeEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeEditViewHelper.php#L24-L33) |
+| 3 | Slices of life | `data.url.slices_index` | `slices.index` | [SliceOfLifeEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeEditViewHelper.php#L40-L43) |
+| 4 | {slice.name} | `data.slice.url.show` | `slices.show` | [SliceOfLifeEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeEditViewHelper.php#L12-L23) |
+| 5 | Edit slice of life | 无（终端节点） | - | 前端静态文本 |
+
+### 5.2 多层面包屑回链规则模式
+
+通过分析以上 8 个典型页面，面包屑层级来源有明确的规则模式：
+
+```
+第 1 层 → 🔗 layoutData.vault.url.xxx
+             （永远对应 Vault 一级 Tab 列表页）
+             例：Journals / Contacts / Groups / Reports
+             ← layoutData.vault.url.journals
+
+第 2 ~ N-2 层 → 🔗 data.*.url.show 或 data.url.xxx_index
+             （中间层级：父实体详情页 / 中间列表页
+             例：{journal.name} ← data.journal.url.show
+             例：Slices of life ← data.url.slices_index
+
+第 N-1 层 → 🔗 data.url.show（编辑/创建页的"前一层
+             （当前实体的详情页，仅在编辑/创建页存在）
+             例：{post.title} ← data.url.show
+
+第 N 层 → 📝 纯文本（终端节点
+             （当前页的标题/操作名）
+             例：Edit a post / Profile of John Doe
+```
+
+**URL 来源口诀**：**一层 layoutData，深层 data 挖，最后是文本。
+
+### 5.3 `data.url.back 的两种模式对比
+
+不同 ViewHelper 中，面包屑回链 URL 的命名并不统一，存在两种模式：
+
+| 模式 | 示例 | 所在 ViewHelper |
+|------|------|---------------|
+| **`data.url.back`** | 帖子详情/编辑页 | [PostShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostShowViewHelper.php#L111-L114)、[PostEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostEditViewHelper.php#L113-L116) |
+| **`data.journal.url.show** | 切片详情/编辑页 | [SliceOfLifeShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeShowViewHelper.php#L48-L57)、[SliceOfLifeEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeEditViewHelper.php#L24-L33) |
+
+- **模式一（扁平模式（扁平结构不同模块约定俗成，并无强制规范。新增页面时需参考同模块其他页面的写法。
+
+### 5.4 层级来源总结
 
 ```
 面包屑层级来源：
@@ -279,7 +355,127 @@ Monica 的 Vault 页面实际上存在 **三层导航结构**，面包屑只是�
 
 ---
 
-## 8. 关键文件索引
+---
+
+## 8. 权限与 Tab 显示开关的耦合关系
+
+### 8.1 Vault 三级权限体系
+
+Vault 采用数值型权限分级，数值越小权限越高。权限值存储在 `vault_users` 表的 `permission` 字段。
+
+**权限常量定义**：[Vault.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Models/Vault.php#L379-L388)
+
+| 权限级别 | 常量名 | 数值 | 说明 |
+|---------|--------|------|------|
+| 管理员 | `PERMISSION_MANAGE` | 100 | 最高权限，可管理 Vault 设置和成员 |
+| 编辑者 | `PERMISSION_EDIT` | 200 | 可创建、编辑、删除内容 |
+| 查看者 | `PERMISSION_VIEW` | 300 | 只读访问 |
+
+**权限比较逻辑**：权限值越小权限越高。判断是否有编辑权限时，比较 `permission <= PERMISSION_EDIT`。
+
+### 8.2 Gate 定义与权限检查
+
+权限通过 Laravel Gate 系统封装，定义在 [AuthServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Providers/AuthServiceProvider.php)。
+
+**主要 Gate 列表**：
+
+| Gate 名称 | 对应权限 | 用途 |
+|----------|---------|------|
+| `vault-viewer` | PERMISSION_VIEW (300) | 查看 Vault 基本权限 |
+| `vault-editor` | PERMISSION_EDIT (200) | 编辑内容权限 |
+| `vault-manager` | PERMISSION_MANAGE (100) | 管理 Vault 权限 |
+| `contact-owner` | vault-editor | 联系人操作权限 |
+| `journal-owner` | vault-editor | 日记操作权限 |
+| `post-owner` | vault-editor | 帖子操作权限 |
+| `sliceOfLife-owner` | vault-editor | 人生切片操作权限 |
+| `group-owner` | vault-editor | 分组操作权限 |
+
+注意：`contact-owner`、`journal-owner` 等实体级 Gate 均直接复用 `vault-editor` 权限，不做更细粒度的实体所有权检查。
+
+### 8.3 VaultHelper 权限辅助
+
+[VaultHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Helpers/VaultHelper.php) 提供静态方法获取当前用户在指定 Vault 中的权限，并带 5 秒数组缓存。
+
+```php
+// 获取权限值（带缓存）
+public static function getPermission(Vault $vault): int
+
+// 检查权限
+public static function can(Vault $vault, string $ability): bool
+```
+
+### 8.4 Tab 显示开关字段
+
+Vault 模型中有 7 个布尔型字段控制 Tab 的显示与隐藏，存储在 `vaults` 表中：
+
+| 字段名 | 对应 Tab | 默认值 |
+|--------|---------|--------|
+| `show_journal_tab` | 日记 (Journals) | true |
+| `show_contact_tab` | 联系人 (Contacts) | true |
+| `show_group_tab` | 分组 (Groups) | true |
+| `show_report_tab` | 报告 (Reports) | true |
+| `show_gift_tab` | 礼物 (Gifts) | true |
+| `show_file_tab` | 文件 (Files) | true |
+| `show_notes_tab` | 笔记 (Notes) | true |
+
+**设置入口**：Vault 设置  Tab 显示开关页面，由 [VaultSettingsTabVisibilityController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsTabVisibilityController.php) 处理。
+
+**前端设置组件**：[TabVisibility.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Settings/Partials/TabVisibility.vue)
+
+### 8.5 layoutData 中的权限与可见性结构
+
+每个 Vault 页面的 `layoutData.vault` 都包含权限、可见性和 URL 三部分数据：
+
+```
+layoutData.vault
+ permission         当前用户权限级别数值（100/200/300）
+ visibility         7 个 Tab 显示开关布尔值
+    show_journal_tab
+    show_contact_tab
+    show_group_tab
+    show_report_tab
+    show_gift_tab
+    show_file_tab
+    show_notes_tab
+ url                所有 Tab 的顶层链接（全部生成，不受可见性影响）
+     journals
+     contacts
+     groups
+     reports
+     gifts
+     files
+     notes
+```
+
+**关键耦合规则**：
+1. **URL 始终全量生成**：`layoutData.vault.url.*` 不论 Tab 是否显示，都会生成所有 7 个链接
+2. **Tab 按钮按可见性过滤**：Layout 中的 Tab 导航通过 `v-if="visibility.show_xxx_tab"` 控制显示
+3. **面包屑不检查可见性**：面包屑链接直接使用 `layoutData.vault.url.*`，不判断 Tab 是否隐藏
+4. **权限在路由层拦截**：能否访问页面由路由中间件的 Gate 检查决定，面包屑层面不做权限校验
+
+### 8.6 Tab 显示与路由权限的关系
+
+Tab 显示开关和权限是两个独立的维度：
+
+| 场景 | Tab 显示 | 有访问权限 | 面包屑链接 | 直接访问URL |
+|------|---------|-----------|-----------|------------|
+| 正常 |  显示 |  有权限 |  可见可点 |  可访问 |
+| Tab 隐藏 |  隐藏 |  有权限 |  面包屑仍可跳转 |  可访问 |
+| 无权限 |  不显示 |  无权限 |  到不了页面 |  403 |
+
+结论：**面包屑的顶层链接总是可用的，只要用户有权限访问**。Tab 隐藏只是视觉上不显示导航入口，不影响通过面包屑或直接 URL 访问。
+
+### 8.7 面包屑与权限的关系
+
+面包屑本身不包含任何权限判断逻辑，它遵循以下原则：
+
+1. **可达即可用**：如果用户能到达当前页面，那么面包屑中的所有回链都应该是可访问的
+2. **权限前置校验**：权限检查发生在路由中间件层（`can:vault-viewer` 等），在进入 Controller 之前完成
+3. **数据信任**：面包屑直接信任后端传入的 URL 数据，不做二次验证
+4. **可见性不影响面包屑**：即使某个 Tab 被隐藏，面包屑中对应的顶层链接仍然可以点击跳转
+
+---
+## 9. 关键文件索引
 
 | 功能 | 文件路径 |
 |------|---------|
@@ -291,40 +487,66 @@ Monica 的 Vault 页面实际上存在 **三层导航结构**，面包屑只是�
 | Vault Controller | [VaultController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageVault/Web/Controllers/VaultController.php) |
 | Contact Controller | [ContactController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Contact/ManageContact/Web/Controllers/ContactController.php) |
 | Journal Controller | [JournalController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/Controllers/JournalController.php) |
+| Post Controller（帖子 CRUD） | [PostController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/Controllers/PostController.php) |
+| SliceOfLife Controller（人生切片 CRUD） | [SliceOfLifeController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/Controllers/SliceOfLifeController.php) |
+| Post 详情数据 | [PostShowViewHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostShowViewHelper.php) |
+| Post 编辑数据 | [PostEditViewHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostEditViewHelper.php) |
+| Post 创建数据 | [PostCreateViewHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostCreateViewHelper.php) |
+| Slice 详情数据 | [SliceOfLifeShowViewHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeShowViewHelper.php) |
+| Slice 编辑数据 | [SliceOfLifeEditViewHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeEditViewHelper.php) |
+| Gate 权限定义 | [AuthServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Providers/AuthServiceProvider.php) |
+| Vault 模型（权限常量 + Tab 字段） | [Vault.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Models/Vault.php) |
+| Vault 权限辅助类 | [VaultHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Helpers/VaultHelper.php) |
+| Tab 显示开关设置控制器 | [VaultSettingsTabVisibilityController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageVaultSettings/Web/Controllers/VaultSettingsTabVisibilityController.php) |
+| Tab 显示开关前端组件 | [TabVisibility.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Settings/Partials/TabVisibility.vue) |
 
 ---
 
-## 9. 协作路径总结（单条用户请求视角）
+## 10. 协作路径总结（单条用户请求视角）
 
 ```
-用户点击跳转 → <Link :href="后端生成的URL">
-        ↓
+用户点击跳转  <Link :href="后端生成的URL">
+        
 浏览器请求 URL (SPA 下是 XHR)
-        ↓
+        
 Laravel 匹配 routes/web.php 中的路由定义
-        ↓
+        
+路由中间件检查：
+   auth  登录校验
+   can:vault-viewer / vault-editor  Gate 权限校验（不通过则 403）
+        
 Controller 方法接收到路由参数（vaultId / contactId 等）
-        ↓
+        
 Controller 调用 2 个 ViewHelper：
-  ├─ VaultIndexViewHelper::layoutData($vault)   → 生成 layoutData（含一级导航URL）
-  └─ XxxShowViewHelper::data($entity, $user)    → 生成 data（含实体数据+实体URL）
-        ↓
+   VaultIndexViewHelper::layoutData($vault)    生成 layoutData
+       permission   当前用户权限级别（100/200/300）
+       visibility   7 个 Tab 显示开关
+       url          所有 Tab 顶层链接（全量生成，不受可见性影响）
+   XxxShowViewHelper::data($entity, $user)     生成 data
+        实体业务数据
+        实体 URL（show/edit/back 等）
+        
 Inertia::render('组件名', compact('layoutData', 'data'))
-        ↓
-前端 Vue 组件接收 props
-        ↓
+        
+Layout 渲染：
+   顶部 Tab 导航  按 visibility 过滤显示（v-if="visibility.show_xxx"）
+   面包屑区域  页面组件内联渲染
+        
 页面顶部 <nav> 内联渲染面包屑：
-  第1层链接 → layoutData.vault.url.xxx
-  第2层链接 → data.url.back / data.url.show
-  最后一层  → data.name / data.title (纯文本)
+  第1层链接  layoutData.vault.url.xxx（不检查可见性，直接使用）
+  第2层链接  data.url.back / data.url.show / data.*.url.show
+  最后一层   data.name / data.title (纯文本)
 ```
 
 ---
 
-## 10. 设计特点与注意点
+## 11. 设计特点与注意点
 
 1. **无面包屑状态管理**：面包屑完全是声明式的静态结构，不依赖 Vuex/Pinia，直接由当前页的 props 决定。
 2. **URL 后端中心化**：前端从不拼接路径字符串，所有 URL 由后端 `route()` 生成，保证路由改定义时前端自动适配。
 3. **面包屑不使用通用组件**：虽然定义了 `Breadcrumb.vue`，但实际页面全部内联。这意味着新增页面需复制面包屑结构，存在样式和结构不一致的潜在风险。
 4. **移动设备隐藏**：面包屑 `<nav>` 使用 `sm:mt-20 sm:border-b md:block` 类，在小屏设备上完全隐藏，仅桌面端显示。
 5. **权限与可见性耦合**：Tab 导航的显示开关（`show_journal_tab` 等）由后端传入 `layoutData.vault.visibility`，前端据此过滤 Tab；面包屑不做权限判断，直接依赖当前页是否可达。
+6. **URL 命名两种模式并存**：Post 模块采用扁平模式（`data.url.back`），Slice 模块采用嵌套模式（`data.journal.url.show`）。两种模式在代码库中并存，新增页面时需注意与同模块保持一致。
+7. **面包屑可达性原则**：面包屑本身不做任何权限或可见性校验，遵循"能到达当前页就能访问所有回链"的原则。权限检查完全前置到路由中间件层，面包屑信任后端传入的 URL 数据。
+8. **Tab 可见性与面包屑解耦**：Tab 显示开关只控制顶部导航栏的按钮显示，不影响面包屑中的顶层链接。即使某个 Tab 被隐藏，面包屑中对应的链接仍然可点击跳转，URL 始终全量生成。
