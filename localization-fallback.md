@@ -317,10 +317,415 @@ lang/
 
 ---
 
-## 八、关键注意事项
+---
+
+## 八、Locale 持久化：Stores 三件套
+
+当检测器确定当前 locale 后，`asbiin/laravel-localizer` 会通过配置的 `stores` 将 locale 持久化，确保后续请求能保持语言设置。
+
+### 8.1 Stores 配置
+在 [config/localizer.php:49-53](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/config/localizer.php#L49-L53) 中定义了三个存储：
+
+```php
+'stores' => [
+    CodeZero\Localizer\Stores\SessionStore::class,
+    CodeZero\Localizer\Stores\CookieStore::class,
+    CodeZero\Localizer\Stores\AppStore::class,
+],
+```
+
+### 8.2 各 Store 的职责与配置
+
+| Store | 作用 | 相关配置 | 代码位置 |
+|-------|------|----------|----------|
+| **SessionStore** | 将 locale 存入 Session，单次会话有效 | `session_key = 'locale'` | [localizer.php:77](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/config/localizer.php#L77) |
+| **CookieStore** | 将 locale 存入 Cookie，长期持久化 | `cookie_name = 'locale'`, `cookie_minutes = 60*24*365` (1年) | [localizer.php:83-89](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/config/localizer.php#L83-L89) |
+| **AppStore** | 调用 `App::setLocale()` 设置当前请求运行时 locale | - | 框架内置 |
+
+### 8.3 持久化执行时序
+```
+检测器确定 locale 后
+    ↓
+按顺序执行所有 stores
+    ├─ SessionStore: session(['locale' => $locale])
+    ├─ CookieStore:  Cookie::queue('locale', $locale, $minutes)
+    └─ AppStore:    App::setLocale($locale)
+    ↓
+后续请求
+    ↓
+检测器按优先级读取
+    ├─ SessionDetector: 从 session('locale') 读取
+    ├─ CookieDetector:  从 Cookie::get('locale') 读取
+    └─ ...其他检测器
+```
+
+---
+
+## 九、Trusted Detectors 开关
+
+### 9.1 配置与作用
+在 [config/localizer.php:42-44](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/config/localizer.php#L42-L44) 中定义了受信任检测器：
+
+```php
+'trusted_detectors' => [
+    //
+],
+```
+
+**关键特性**：
+- 当某个检测器被加入 `trusted_detectors`，其返回的 locale 会被**直接使用**，跳过 `supported_locales` 的白名单校验
+- 普通检测器返回的 locale 必须在 `supported_locales` 列表中，否则会被忽略并继续下一个检测器
+- 当前配置为空数组，表示所有检测器都需要经过白名单校验
+
+### 9.2 安全意义
+```
+普通检测器流程：
+detector->detect() → $locale
+    ↓
+in_array($locale, $supported_locales)?
+    ↓ 是 → 使用
+    ↓ 否 → 忽略，尝试下一个检测器
+
+受信任检测器流程：
+detector->detect() → $locale
+    ↓
+★ 跳过白名单校验
+    ↓
+直接 App::setLocale($locale)
+```
+
+---
+
+## 十、用户偏好语言切换：运行时完整链路
+
+### 10.1 后端流程
+用户在设置页面切换语言时，完整的后端处理流程：
+
+#### 1. 控制器入口
+[PreferencesLocaleController.php:13-26](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Domains/Settings/ManageUserPreferences/Web/Controllers/PreferencesLocaleController.php#L13-L26)
+
+```php
+public function store(Request $request)
+{
+    $data = [
+        'account_id' => Auth::user()->account_id,
+        'author_id' => Auth::id(),
+        'locale' => $request->input('locale'),
+    ];
+
+    $user = (new StoreLocale)->execute($data);
+
+    return response()->json([
+        'data' => UserPreferencesIndexViewHelper::dtoLocale($user),
+    ], 200);
+}
+```
+
+#### 2. 业务逻辑层
+[StoreLocale.php:45-61](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Domains/Settings/ManageUserPreferences/Services/StoreLocale.php#L45-L61)
+
+```php
+public function execute(array $data): User
+{
+    $this->data = $data;
+    $this->validateRules($data);  // locale 必须在 supported_locales 中
+    $this->updateUser();
+    return $this->author;
+}
+
+private function updateUser(): void
+{
+    $this->author->locale = $this->data['locale'];  // 持久化到用户表
+    $this->author->save();
+    App::setLocale($this->data['locale']);  // 设置当前请求运行时 locale
+}
+```
+
+#### 3. DTO 组装
+[UserPreferencesIndexViewHelper.php:192-208](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Domains/Settings/ManageUserPreferences/Web/ViewHelpers/UserPreferencesIndexViewHelper.php#L192-L208)
+
+```php
+public static function dtoLocale(User $user): array
+{
+    return [
+        'id' => $user->locale,
+        'name' => self::language($user->locale),  // 关键：用目标语言翻译语言名
+        'dir' => htmldir(),
+        'locales' => collect(config('localizer.supported_locales'))
+            ->map(fn (string $locale) => [
+                'id' => $locale,
+                'name' => self::language($locale),
+            ])
+            ->sortByCollator('name'),
+        'url' => [
+            'store' => route('settings.preferences.locale.store'),
+        ],
+    ];
+}
+```
+
+**特殊技巧 - 语言名称自翻译**：
+[UserPreferencesIndexViewHelper.php:210-213](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Domains/Settings/ManageUserPreferences/Web/ViewHelpers/UserPreferencesIndexViewHelper.php#L210-L213)
+
+```php
+public static function language(?string $code): string
+{
+    return $code !== null ? __('auth.lang', [], $code) : '';
+}
+```
+
+这里 `__('auth.lang', [], $code)` 传递第三个参数 `$code` 作为 locale，**强制以目标语言来翻译语言名称**：
+- `__('auth.lang', [], 'fr')` → 读取 `lang/fr/auth.php` 的 `'lang'` 键 → 返回 `'Français'`
+- `__('auth.lang', [], 'zh_CN')` → 读取 `lang/zh_CN/auth.php` 的 `'lang'` 键 → 返回 `'中文(中华人民共和国)'`
+
+实现效果：在语言下拉列表中，每个语言名称用**该语言本身**显示。
+
+### 10.2 前端运行时切换
+[Locale.vue:4-44](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Settings/Preferences/Partials/Locale.vue#L4-L44)
+
+```javascript
+import { loadLanguageAsync, getActiveLanguage, trans } from 'laravel-vue-i18n';
+
+const submit = () => {
+    // ...
+    axios.post(props.data.url.store, form.data())
+        .then((response) => {
+            // ...
+            if (getActiveLanguage() !== form.locale) {
+                loadLanguageAsync(response.data.data.id);  // ★ 运行时加载新语言包
+                document.getRootNode().querySelector('html').setAttribute('dir', response.data.data.dir);
+            }
+        })
+    // ...
+};
+```
+
+### 10.3 完整切换时序图
+```
+用户在前端选择语言并提交
+    ↓
+POST /settings/preferences/locale
+    ↓
+StoreLocale 服务
+    ├─ 验证 locale 在 supported_locales 中
+    ├─ 保存到 users.locale 字段
+    └─ App::setLocale() 设置当前请求
+    ↓
+dtoLocale() 组装响应
+    ├─ id: 'fr'
+    ├─ name: 'Français' (用 fr  locale 翻译得到)
+    ├─ dir: 'ltr'
+    └─ locales: 所有支持语言列表
+    ↓
+前端收到响应
+    ↓
+getActiveLanguage() !== form.locale?
+    ↓ 是
+    ├─ loadLanguageAsync('fr') → 动态加载 lang/fr.json
+    └─ 更新 HTML dir 属性
+    ↓
+后续页面翻译立即生效（无需刷新）
+```
+
+---
+
+## 十一、Inertia Share 未传递 Locale 的事实
+
+### 11.1 验证
+检查 [HandleInertiaRequests.php:25-54](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/app/Http/Middleware/HandleInertiaRequests.php#L25-L54) 的 `share()` 方法：
+
+```php
+public function share(Request $request)
+{
+    return [
+        ...parent::share($request),
+        'help_links' => fn () => config('monica.help_links'),
+        'help_url' => fn () => config('monica.help_center_url'),
+        'footer' => fn () => $this->footer(),
+        'hasKey' => fn () => function () use ($request) { ... },
+        'ziggy' => fn () => [ ... ],
+        'sentry' => fn () => [ ... ],
+    ];
+}
+```
+
+**确认**：`share()` 方法中**没有传递 `locale`** 给前端。
+
+### 11.2 前端如何获取 Locale
+前端通过以下方式间接获取 locale，而不依赖 Inertia share：
+
+1. **初始加载**：从 `<html lang="xx">` 标签读取（由 Blade 模板设置）
+   - [app.blade.php:2](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/views/app.blade.php#L2)
+   - `laravel-vue-i18n` 插件自动读取此属性
+
+2. **运行时切换**：通过 `loadLanguageAsync(locale)` 主动设置（用户切换语言时）
+   - [Locale.vue:36](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Settings/Preferences/Partials/Locale.vue#L36)
+
+### 11.3 影响分析
+- ✅ **不影响正常翻译**：翻译由后端处理或前端 JSON 文件提供
+- ✅ **不影响语言切换**：切换通过 `loadLanguageAsync` 完成
+- ⚠️ **前端无法直接感知当前 locale**：如需在 JS 逻辑中判断当前语言，需使用 `getActiveLanguage()`
+- ⚠️ **SSR 场景需额外处理**：服务端渲染时需显式传递 locale 给前端
+
+---
+
+## 十二、前端 i18n 插件默认值详解
+
+### 12.1 实际初始化配置
+[resources/js/app.js:31-33](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/app.js#L31-L33)
+
+```javascript
+.use(i18nVue, {
+    resolve: (lang) => resolvePageComponent(`../../lang/${lang}.json`, import.meta.glob('../../lang/*.json')),
+})
+```
+
+**显式配置项**：仅配置了 `resolve` 函数，用于动态加载 JSON 语言文件。
+
+### 12.2 插件默认配置值
+根据 `laravel-vue-i18n@2.8.0` 文档，未显式配置的项使用以下默认值：
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `lang` | 自动检测 | 从 `<html lang="xx">` 标签读取，如不存在则使用 `fallbackLang` |
+| `fallbackLang` | `'en'` | 当语言无效或未提供时的 fallback 语言 |
+| `fallbackMissingTranslations` | **未启用** (v2.8.0 默认关闭) | 翻译键缺失时是否 fallback 到 `fallbackLang` |
+
+### 12.3 关键结论：缺失翻译的行为
+由于 `fallbackMissingTranslations` **默认关闭**，当前项目前端的实际行为是：
+
+```
+调用 $t('missing.key')
+    ↓
+查找当前 locale 的 JSON 文件
+    ↓ 未找到
+★ 不进行 fallback！
+    ↓
+直接返回 'missing.key' 本身
+```
+
+**与后端行为不一致**：
+- 后端：`__('missing.key')` → 自动 fallback 到 `en` → 找到则返回，否则返回键
+- 前端：`$t('missing.key')` → **不 fallback** → 直接返回键
+
+**代码验证**：前端项目中未配置 `fallbackMissingTranslations: true`，因此缺失翻译不会自动 fallback 到英文。
+
+### 12.4 改进建议
+如需前端与后端行为一致，应在 [app.js](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/app.js#L31-L33) 中显式启用：
+
+```javascript
+.use(i18nVue, {
+    resolve: (lang) => resolvePageComponent(`../../lang/${lang}.json`, import.meta.glob('../../lang/*.json')),
+    fallbackMissingTranslations: true,  // 启用缺失翻译 fallback
+})
+```
+
+---
+
+## 十三、复数翻译退化路径
+
+Monica 项目使用 Laravel 标准的 `|` 分隔符定义复数形式，支持复杂的数量区间匹配。
+
+### 13.1 复数格式定义
+#### 后端：`trans_choice()`
+虽然项目中未直接使用 `trans_choice()`，但翻译文件中已定义复数格式：
+
+[lang/en.json:3](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/lang/en.json#L3)
+```json
+"(and :count more errors)": "(and :count more error)|(and :count more errors)|(and :count more errors)"
+```
+
+#### 前端：`$tChoice()`
+在多个 Vue 组件中使用 `$tChoice()` 处理复数：
+
+- [MoodTrackingEvent.vue:31-35](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Shared/Modules/FeedItems/MoodTrackingEvent.vue#L31-L35)
+  ```javascript
+  $tChoice(
+      'Slept :count hour|Slept :count hours',
+      data.mood_tracking_event.object.number_of_hours_slept,
+      { count: data.mood_tracking_event.object.number_of_hours_slept },
+  )
+  ```
+
+- [Tags.vue:53](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/resources/js/Pages/Vault/Settings/Partials/Tags.vue#L53)
+  ```javascript
+  $tChoice(':count post|:count posts', tag.count, { count: tag.count })
+  ```
+
+### 13.2 Laravel 复数规则
+Laravel 支持三种复数格式：
+
+| 格式 | 示例 | 匹配逻辑 |
+|------|------|----------|
+| **简单二选一** | `'apple|apples'` | count=1 → 左边，其他 → 右边 |
+| **区间匹配** | `'{0} no apples|[1,19] some apples|[20,*] many apples'` | 精确匹配区间 |
+| **多区间** | `'{1} :count error|[2,*] :count errors'` | 支持多个区间 |
+
+**项目中使用的特殊三区间格式**：
+[lang/en.json:3](file:///d:/fz/0601-2/solo-dogfeeding/code/68-monica/lang/en.json#L3)
+```json
+"(and :count more errors)": "(and :count more error)|(and :count more errors)|(and :count more errors)"
+```
+
+这是处理俄语等有复杂复数规则语言的标准写法，三个区间分别对应：
+- 区间1：count = 1 → "error" (单数)
+- 区间2：count 为 2-4 或某些特殊数字 → "errors" 
+- 区间3：count ≥ 5 或其他 → "errors"
+
+在英语中虽然区间2和3相同，但为了与其他语言的翻译文件结构保持一致，仍保留三区间格式。
+
+### 13.3 复数翻译 Fallback 完整路径
+```
+调用 $tChoice('key', $count, $replace) 或 trans_choice('key', $count, $replace)
+    ↓
+查找当前 locale 的翻译文件
+    ├─ 后端: lang/{locale}.json 或 lang/{locale}/{file}.php
+    └─ 前端: lang/{locale}.json
+    ↓
+找到翻译字符串？
+    ├─ 是 → 解析 `|` 分隔的复数区间
+    │       ↓
+    │       根据 $count 匹配正确区间
+    │       ↓
+    │       替换参数 → 返回结果
+    │
+    └─ 否 → 进入 fallback 流程
+            ↓
+            ★ 后端: 查找 fallback_locale (en) 的翻译
+            │       ↓
+            │       找到？→ 解析复数 → 返回
+            │       ↓ 未找到
+            │       返回 key 本身（但参数替换仍会进行）
+            │
+            ★ 前端: 不 fallback（默认配置）
+                    ↓
+                    返回 key 本身（参数替换仍会进行）
+```
+
+### 13.4 复数翻译缺失的特殊处理
+**关键行为**：即使翻译键缺失，参数替换（`count` 等占位符）仍会执行。
+
+示例：
+```javascript
+// 假设 ':count apple|:count apples' 完全缺失
+$tChoice(':count apple|:count apples', 5, { count: 5 })
+
+// 前端默认行为：不 fallback，直接返回 key 并替换参数
+// 结果：':count apple|:count apples' → 参数替换后 → '5 apple|5 apples'
+```
+
+---
+
+## 十四、关键注意事项（补充）
 
 1. **英语作为基准**：`en.json` 是所有翻译的基准，键和值相同。
 2. **双重 fallback**：模型层有自己的 fallback（用户值 → 翻译键），翻译系统又有一层 fallback（当前语言 → fallback 语言 → 键本身）。
 3. **最终保底**：无论哪层 fallback，**最终都不会返回空值**，最差情况返回翻译键本身（即原始英文串）。
 4. **locale 和 fallback_locale 相同**：当前配置中两者均为 `'en'`，这意味着英文环境下不会触发 fallback（但对其他语言仍有效）。
 5. **前端默认配置**：项目中未显式配置 `fallbackMissingTranslations`，需要注意 `laravel-vue-i18n` 版本的默认行为。
+6. **前后端 fallback 不一致**：后端自动 fallback 到英文，前端默认不 fallback，翻译缺失时行为有差异。
+7. **Stores 持久化三件套**：Session（会话级）+ Cookie（长期）+ App（运行时）三级存储，确保 locale 正确持久化。
+8. **`trusted_detectors` 安全开关**：当前为空，所有 locale 都经过白名单校验，避免恶意 locale 注入。
+9. **Inertia share 不传递 locale**：前端通过 HTML lang 属性和 `loadLanguageAsync` 管理语言，不依赖 Inertia 共享数据。
+10. **复数翻译参数替换**：即使翻译键缺失，占位符参数仍会被替换，避免显示原始 `:count` 等占位符。
+11. **语言名称自翻译技巧**：`__('auth.lang', [], $code)` 通过第三个参数强制指定 locale，实现语言名称用自身显示。
