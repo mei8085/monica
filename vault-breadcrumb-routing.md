@@ -1,4 +1,4 @@
-# Vault Breadcrumb 与上下文路由协作路径分析
+﻿# Vault Breadcrumb 与上下文路由协作路径分析
 
 ## 1. 架构总览
 
@@ -218,7 +218,7 @@ public function show(Request $request, string $vaultId, string $contactId)
 | 3 | {post.title} | `data.url.show` | `post.show` | [PostEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostEditViewHelper.php#L88-L92) |
 | 4 | Edit a post | 无（终端节点） | - | 前端静态文本 |
 
-####  切片详情页（4 层面包屑）
+#### ⑦ 切片详情页（4 层面包屑）
 - **文件**：[Journal/Slices/Show.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Journal/Slices/Show.vue#L60-L117)
 - **路由**：`vaults/{vault}/journals/{journal}/slices/{slice}`
 - **面包屑**：
@@ -232,7 +232,7 @@ public function show(Request $request, string $vaultId, string $contactId)
 
 > **注意**：切片详情页的终端层使用 `localSlice` 而非 `data.slice.name`，因为封面图更新后会更新本地响应式变量，面包屑名称随之变化。
 
-####  切片编辑页（5 层面包屑）
+#### ⑧ 切片编辑页（5 层面包屑）
 - **文件**：[Journal/Slices/Edit.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Journal/Slices/Edit.vue#L34-L102)
 - **路由**：`vaults/{vault}/journals/{journal}/slices/{slice}/edit`
 - **面包屑**：
@@ -245,9 +245,7 @@ public function show(Request $request, string $vaultId, string $contactId)
 | 4 | {slice.name} | `data.slice.url.show` | `slices.show` | [SliceOfLifeEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeEditViewHelper.php#L12-L23) |
 | 5 | Edit slice of life | 无（终端节点） | - | 前端静态文本 |
 
-### 5.2 多层面包屑回链规则模式
-
-####  联系人重要日期页（3 层面包屑）
+#### ⑨ 联系人重要日期页（3 层面包屑）
 - **文件**：[Contact/ImportantDates/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Contact/ImportantDates/Index.vue#L63-L107)
 - **路由**：`vaults/{vault}/contacts/{contact}/dates`
 - **面包屑**：
@@ -258,24 +256,24 @@ public function show(Request $request, string $vaultId, string $contactId)
 | 2 | Profile of {name} | `data.url.contact` | `contact.show` | [ContactImportantDatesViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Contact/ManageContactImportantDates/Web/ViewHelpers/ContactImportantDatesViewHelper.php#L48-L52) |
 | 3 | All the important dates | 无（终端节点） | - | 前端静态文本 |
 
-####  报表子页面（2~3 层面包屑）
+#### ⑩ 报表子页面（2~3 层面包屑）
 
-报表模块下的子页共有三种层级深度：
+报表模块下的子页共有两种层级深度：
 
-**-1 报表一级子页（2 层）**  直接挂在 Reports 下：
-
-| 页面 | 文件 | 路由 | 面包屑 |
-|------|------|------|--------|
-| 地址报表 | [Reports/Address/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/Address/Index.vue#L13-L39) | `vaults/{vault}/reports/addresses` | Reports  List of addresses |
-| 重要日期报表 | [Reports/ImportantDate/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/ImportantDate/Index.vue#L14-L36) | `vaults/{vault}/reports/importantDates` | Reports  The important dates in the next 12 months |
-| 心情记录报表 | [Reports/MoodTrackingEvents/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/MoodTrackingEvents/Index.vue#L13-L36) | `vaults/{vault}/reports/moodTrackingEvents` | Reports  Mood in the year |
-
-**-2 报表二级子页（3 层）**  挂在 Addresses 下：
+**⑩-1 报表一级子页（2 层）** — 直接挂在 Reports 下：
 
 | 页面 | 文件 | 路由 | 面包屑 |
 |------|------|------|--------|
-| 城市地址报表 | [Reports/Address/Cities/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/Address/Cities/Index.vue#L14-L54) | `vaults/{vault}/reports/addresses/city/{city}` | Reports  List of addresses  {city} |
-| 国家地址报表 | [Reports/Address/Countries/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/Address/Countries/Index.vue) | `vaults/{vault}/reports/addresses/country/{country}` | Reports  List of addresses  {country} |
+| 地址报表 | [Reports/Address/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/Address/Index.vue#L13-L39) | `vaults/{vault}/reports/addresses` | Reports → List of addresses |
+| 重要日期报表 | [Reports/ImportantDate/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/ImportantDate/Index.vue#L14-L36) | `vaults/{vault}/reports/importantDates` | Reports → List of all important dates |
+| 心情记录报表 | [Reports/MoodTrackingEvents/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/MoodTrackingEvents/Index.vue#L13-L36) | `vaults/{vault}/reports/moodTrackingEvents` | Reports → Mood in the year |
+
+**⑩-2 报表二级子页（3 层）** — 挂在 Addresses 下：
+
+| 页面 | 文件 | 路由 | 面包屑 |
+|------|------|------|--------|
+| 城市地址报表 | [Reports/Address/Cities/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/Address/Cities/Index.vue#L14-L54) | `vaults/{vault}/reports/addresses/city/{city}` | Reports → List of addresses → {city} |
+| 国家地址报表 | [Reports/Address/Countries/Index.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/resources/js/Pages/Vault/Reports/Address/Countries/Index.vue) | `vaults/{vault}/reports/addresses/country/{country}` | Reports → List of addresses → {country} |
 
 **报表子页 URL 来源一览**：
 
@@ -283,9 +281,9 @@ public function show(Request $request, string $vaultId, string $contactId)
 |------|---------|--------|---------|
 | Reports（1层） | `layoutData.vault.url.reports` 或 `data.url.reports` | `vault.reports.index` | [ReportImportantDateSummaryIndexViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportImportantDateSummaryIndexViewHelper.php#L57-L61)、[ReportMoodTrackingEventIndexViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportMoodTrackingEventIndexViewHelper.php#L17-L21) |
 | List of addresses（2层） | `data.url.addresses` | `vault.reports.addresses.index` | [ReportCitiesShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportCitiesShowViewHelper.php#L41-L45) |
-| {city}/{country}（终端层） | 无（终端节点） | - | 从路由参数或 `data.city` / `data.country` 读取 |
+| {city}/{country}（终端层） | 无（终端节点） | - | 从路由参数或 `data.city` 读取 |
 
-
+### 5.2 多层面包屑回链规则模式
 通过分析以上 10 个典型页面，面包屑层级来源有明确的规则模式：
 
 ```
@@ -310,16 +308,25 @@ public function show(Request $request, string $vaultId, string $contactId)
 
 **URL 来源口诀**：**一层 layoutData，深层 data 挖，最后是文本。
 
-### 5.3 `data.url.back` 的两种模式对比
+### 5.3 回链 URL 的四种命名模式
 
-不同 ViewHelper 中，面包屑回链 URL 的命名并不统一，存在两种模式：
+不同模块的 ViewHelper 中，面包屑回链 URL 的 key 命名存在四种模式，没有统一规范：
 
-| 模式 | 示例 | 所在 ViewHelper |
-|------|------|---------------|
-| **`data.url.back`** | 帖子详情/编辑页 | [PostShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostShowViewHelper.php#L111-L114)、[PostEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostEditViewHelper.php#L113-L116) |
-| **`data.journal.url.show`** | 切片详情/编辑页 | [SliceOfLifeShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeShowViewHelper.php#L48-L57)、[SliceOfLifeEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeEditViewHelper.php#L24-L33) |
+| 模式 | key 格式 | 语义 | 使用场景 | 示例 |
+|------|---------|------|---------|------|
+| **A. 语义回链** | `data.url.back` | "回到上一级" | 父实体唯一时 | [PostShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostShowViewHelper.php#L111-L114)、[PostEditViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/PostEditViewHelper.php#L113-L116) |
+| **B. 嵌套实体引用** | `data.{entity}.url.show` | "指定实体的详情页" | 需要引用多个父实体时 | [SliceOfLifeShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageJournals/Web/ViewHelpers/SliceOfLifeShowViewHelper.php#L48-L57) 中 `data.journal.url.show` |
+| **C. 命名目标** | `data.url.{target}` | "指向特定目标页面" | 页面只有一个回链目标 | [ContactImportantDatesViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Contact/ManageContactImportantDates/Web/ViewHelpers/ContactImportantDatesViewHelper.php#L48-L52) 中 `data.url.contact`；[ReportCitiesShowViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageReports/Web/ViewHelpers/ReportCitiesShowViewHelper.php#L41-L45) 中 `data.url.addresses` |
+| **D. Layout 顶层** | `layoutData.vault.url.{tab}` | "Vault 一级 Tab 链接" | 面包屑第 1 层 | 所有页面（[VaultIndexViewHelper](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Domains/Vault/ManageVault/Web/ViewHelpers/VaultIndexViewHelper.php#L40-L80) 生成） |
 
-- 两种模式在不同模块约定俗成，并无强制规范。新增页面时需参考同模块其他页面的写法。
+**模式选择规律**：
+- **模式 A**：Post 模块采用。父实体（Journal）唯一且明确，`back` 语义简单直接。
+- **模式 B**：Slice 模块采用。面包屑需要同时引用 Journal 和 Slice 列表，用嵌套结构避免 key 冲突。
+- **模式 C**：Contact 重要日期和 Report 子页采用。只需要一个回链，直接用目标名作 key。
+- **模式 D**：所有页面共享。由 `VaultIndexViewHelper` 统一生成，永远用于面包屑第 1 层。
+
+
+> **注意**：这四种模式是不同模块约定俗成的结果，并无框架级强制规范。新增页面时需参考同模块现有页面的写法。
 
 ### 5.4 层级来源总结
 
@@ -330,6 +337,98 @@ public function show(Request $request, string $vaultId, string $contactId)
 ├─ data.url.show/edit/index   →  后端 ViewHelper 中 route() 生成的具体实体路由
 └─ 纯文本 (无链接)            →  终端当前页（最后一层）
 ```
+
+---
+
+### 5.5 路由树中 Gate 的层级嵌套与参数挂载
+
+### 5.5.1 Gate 在路由树中的嵌套结构
+
+[routes/web.php](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/routes/web.php#L190-L545) 中 Vault 路由采用 `Route::middleware('can:...')->prefix('{param}')->group(...)` 的逐层嵌套模式。每一层嵌套对应一个 Gate 权限校验，Gate 参数来自路由段绑定。
+
+```
+vaults/                                    ← 无 Gate（公开路由：列表/创建）
+├── {vault}/                               ← Gate 1: vault-viewer(vault)
+│   │                                        所有 vault 内页面的最低权限门槛
+│   ├── contacts/
+│   │   └── {contact}/                     ← Gate 2: contact-owner(vault, contact)
+│   │       │                                验证 contact 属于 vault
+│   │       ├── dates/
+│   │       ├── notes/
+│   │       ├── photos/
+│   │       └── ...
+│   │
+│   ├── groups/
+│   │   └── {group}/                       ← Gate 2: group-owner(vault, group)
+│   │                                          验证 group 属于 vault
+│   │
+│   ├── journals/
+│   │   └── {journal}/                     ← Gate 2: journal-owner(vault, journal)
+│   │       │                                验证 journal 属于 vault
+│   │       ├── posts/{post}/              ← Gate 3: post-owner(journal, post)
+│   │       │                                 验证 post 属于 journal（注意：第1个参数是 journal 而非 vault）
+│   │       │
+│   │       └── slices/{slice}/            ← Gate 3: slice-owner(journal, slice)
+│   │                                          验证 slice 属于 journal（同上）
+│   │
+│   ├── reports/                           ← 无额外 Gate（受 Gate 1 保护即可）
+│   │   ├── addresses/
+│   │   ├── moodTrackingEvents/
+│   │   └── importantDates/
+│   │
+│   └── settings/                          ← Gate 2: vault-manager(vault)
+│                                            更严格的权限：仅管理员
+```
+
+### 5.5.2 `can:vault-viewer,vault` 的参数挂载机制
+
+Laravel `can` 中间件的语法为 `can:gate-name,param1,param2,...`，其中 `paramN` 是路由参数名（而非变量名），Laravel 在运行时从当前请求的路由参数中自动解析。
+
+**`can:vault-viewer,vault` 解析过程**：
+1. 中间件读到 `vault-viewer` 作为 Gate 名称
+2. 读到 `vault` 作为第一个参数名 → 从路由中取 `$request->route('vault')`
+3. Laravel Route Model Binding 自动将 `{vault}` 路由段解析为 Vault 模型实例
+4. 调用 `Gate::check('vault-viewer', $vaultInstance)`
+5. [AuthServiceProvider](file:///d:/fz/0601-2/solo-dogfeeding/code/75-monica/app/Providers/AuthServiceProvider.php#L36-L40) 中的闭包接收 `(User $user, $vault)` 并检查用户是否属于该 Vault
+
+**嵌套 Gate 的逐层参数挂载**：
+
+| 路由中间件 | Gate 闭包签名 | 参数来源 | 验证逻辑 |
+|-----------|-------------|---------|---------|
+| `can:vault-viewer,vault` | `(User $user, $vault)` | `{vault}` 路由段 → Vault 模型 | `user.vaults().wherePivot('vault_id', vault.id).exists()` |
+| `can:contact-owner,vault,contact` | `(User $user, $vault, $contact)` | `{vault}` + `{contact}` | `contact.vault_id === vault.id` |
+| `can:journal-owner,vault,journal` | `(User $user, $vault, $journal)` | `{vault}` + `{journal}` | `journal.vault_id === vault.id` |
+| `can:group-owner,vault,group` | `(User $user, $vault, $group)` | `{vault}` + `{group}` | `group.vault_id === vault.id` |
+| `can:post-owner,journal,post` | `(User $user, $journal, $post)` | `{journal}` + `{post}` | `post.journal_id === journal.id` |
+| `can:slice-owner,journal,slice` | `(User $user, $journal, $slice)` | `{journal}` + `{slice}` | `slice.journal_id === journal.id` |
+| `can:vault-manager,vault` | `(User $user, $vault)` | `{vault}` | `user.vaults().wherePivot('permission', '<=', 100).exists()` |
+
+**关键设计规律**：
+
+1. **层级越深，参数越具体**：Level 1 Gate 用 `vault` 检查"用户能否访问这个 Vault"；Level 2 Gate 用 `(vault, entity)` 检查"实体是否属于这个 Vault"；Level 3 Gate 用 `(parent, child)` 检查"子实体是否属于父实体"。
+2. **Level 2 验证 vault 从属关系**：`contact-owner`、`journal-owner`、`group-owner` 都验证 `entity.vault_id === vault.id`，参数列表总是 `(vault, entity)`。
+3. **Level 3 验证父从属关系**：`post-owner`、`slice-owner` 验证 `child.parent_id === parent.id`，参数列表是 `(journal, post/slice)` — 第一个参数是直接父实体而非 vault。
+4. **vault-manager 是权限升级**：不是从属关系检查，而是权限值检查（`permission <= 100`），所以只需 `vault` 一个参数。
+5. **reports 无额外 Gate**：报表页面不涉及特定实体所有权，仅需 `vault-viewer` 即可访问。
+
+### 5.5.3 Gate 嵌套的权限传递链
+
+以帖子详情页 `vaults/{vault}/journals/{journal}/posts/{post}` 为例，请求经过三层 Gate：
+
+```
+请求进入 → Gate 1: vault-viewer(vault)
+              检查：用户是否属于该 Vault？（permission ≤ 300）
+              ↓ 通过
+           Gate 2: journal-owner(vault, journal)
+              检查：journal.vault_id === vault.id？
+              ↓ 通过
+           Gate 3: post-owner(journal, post)
+              检查：post.journal_id === journal.id？
+              ↓ 通过
+           Controller 执行
+```
+
+**注意**：Gate 2 不检查用户是否有编辑 Journal 的权限，只验证 Journal 属于当前 Vault。编辑权限的检查发生在 Controller 层（如 `Gate::authorize('vault-editor', $vault)`），而非路由中间件层。
 
 ---
 
@@ -522,6 +621,7 @@ Tab 显示开关和权限是两个独立的维度：
 3. **数据信任**：面包屑直接信任后端传入的 URL 数据，不做二次验证
 4. **可见性不影响面包屑**：即使某个 Tab 被隐藏，面包屑中对应的顶层链接仍然可以点击跳转
 
+
 ---
 ## 9. 关键文件索引
 
@@ -598,3 +698,4 @@ Layout 渲染：
 6. **URL 命名两种模式并存**：Post 模块采用扁平模式（`data.url.back`），Slice 模块采用嵌套模式（`data.journal.url.show`）。两种模式在代码库中并存，新增页面时需注意与同模块保持一致。
 7. **面包屑可达性原则**：面包屑本身不做任何权限或可见性校验，遵循"能到达当前页就能访问所有回链"的原则。权限检查完全前置到路由中间件层，面包屑信任后端传入的 URL 数据。
 8. **Tab 可见性与面包屑解耦**：Tab 显示开关只控制顶部导航栏的按钮显示，不影响面包屑中的顶层链接。即使某个 Tab 被隐藏，面包屑中对应的链接仍然可点击跳转，URL 始终全量生成。
+
