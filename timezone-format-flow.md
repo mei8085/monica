@@ -38,112 +38,118 @@ protected $appends = [
 
 ## 2. Inertia 全局共享属性的真实来源
 
-### 2.1 两个中间件，两条共享路径
+### 2.1 两个 JetstreamServiceProvider 的区别
 
-Monica 的 Inertia 数据共享来自**两个独立的中间件**，而非一个：
+项目中涉及两个不同的 JetstreamServiceProvider，容易混淆：
+
+| 提供者 | 命名空间 | 位置 | 注册方式 | 职责 |
+|--------|---------|------|---------|------|
+| **项目自身的** JetstreamServiceProvider | `App\Providers\JetstreamServiceProvider` | [app/Providers/JetstreamServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/app/Providers/JetstreamServiceProvider.php) | [bootstrap/providers.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/bootstrap/providers.php#L8) 显式注册 | 配置权限、whenRendering 回调等项目自定义逻辑 |
+| **Jetstream 包自带的** JetstreamServiceProvider | `Laravel\Jetstream\JetstreamServiceProvider` | vendor/laravel/jetstream 目录 | Composer 包自动发现（Package Discovery） | 注册路由、中间件、共享 Inertia 数据等核心功能 |
+
+> **重要**：下文提到"Jetstream 包"时，指的是 `laravel/jetstream` Composer 包及其 `Laravel\Jetstream\JetstreamServiceProvider`，而非项目自身的 `App\Providers\JetstreamServiceProvider`。
+
+### 2.2 两条共享路径：Jetstream 包 + HandleInertiaRequests
+
+Monica 的 Inertia 全局共享数据来自**两条独立路径**：
 
 ```
 HTTP 请求
   │
-  ├─① Jetstream\ShareInertiaData 中间件（自动注册）
-  │    └─ Inertia::share('auth.user', $user->toArray())
-  │    └─ Inertia::share('jetstream', ...)
+  ├─ 路径①：Jetstream 包的 Inertia 数据共享
+  │    └─ 共享：auth.user, jetstream 等
   │
-  └─② App\Http\Middleware\HandleInertiaRequests 中间件（手动定义）
-       └─ parent::share() → 只返回 ['errors' => ...]
+  └─ 路径②：App\Http\Middleware\HandleInertiaRequests
+       └─ parent::share() → ['errors' => ...]
        └─ 自定义共享：help_links, help_url, footer, hasKey, ziggy, sentry
 ```
 
-#### 路径①：Jetstream 的 ShareInertiaData 中间件
+#### 路径①：Jetstream 包的 auth.user 共享
 
-**来源**: `laravel/jetstream` 包的 [JetstreamServiceProvider](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/app/Providers/JetstreamServiceProvider.php#L33) 在 `boot()` 中调用 `bootInertia()`，将 `ShareInertiaData` 中间件追加到 web 中间件组。
+**来源**：`laravel/jetstream` 包（v5.x）的 Inertia 栈。
 
-**注册位置**: [bootstrap/app.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/bootstrap/app.php#L38) 中的 `HandleInertiaRequests` 中间件之前，Jetstream 已先注册了 `ShareInertiaData`。
+**可验证的证据**（项目代码中可直接确认）：
 
-**ShareInertiaData 的核心逻辑**（来自 `laravel/jetstream` v5 源码）：
+1. **依赖存在**：[composer.json](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/composer.json#L27) 声明 `"laravel/jetstream": "^5.0"`
+2. **配置为 Inertia 栈**：[config/jetstream.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/config/jetstream.php#L19) 中 `'stack' => 'inertia'`
+3. **项目使用 Jetstream Inertia API**：项目的 [JetstreamServiceProvider.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/app/Providers/JetstreamServiceProvider.php#L33) 调用 `Jetstream::inertia()->whenRendering(...)`
+4. **前端能访问 auth.user**：多个 Vue 组件读取 `$page.props.auth.user`
+5. **前端能访问 jetstream**：[Show.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/resources/js/Pages/Vault/Contact/Show.vue#L139) 读取 `$page.props.jetstream.flash.filename`
+6. **HandleInertiaRequests 不共享 auth**：[HandleInertiaRequests.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/app/Http/Middleware/HandleInertiaRequests.php#L25-L54) 的 `share()` 方法中没有 `auth` 键
 
-```php
-// Jetstream\ShareInertiaData::handle()
-Inertia::share([
-    'auth' => [
-        'user' => function () use ($request) {
-            if (! $user = $request->user()) {
-                return;
-            }
-            // ...
-            return array_merge(
-                $user->toArray(),        // ← 关键：调用 User 的 toArray()
-                array_filter([
-                    'all_teams' => ...,
-                ]),
-                ['two_factor_enabled' => ...]
-            );
-        },
-    ],
-    'jetstream' => [...],
-    'errorBags' => [...],
-]);
-```
+**共享机制**：Jetstream 包的 ServiceProvider 在 boot 阶段通过 `Inertia::share()` 方法注册共享数据回调。当 Inertia 渲染页面时，这些回调被执行，将 `auth.user`、`jetstream` 等数据合并到共享 props 中。
 
-**`$user->toArray()` 受 `$visible` 控制**，因此 `$page.props.auth.user` 的字段为：
+> 注：Jetstream 包的具体实现位于 vendor 目录中（本环境未安装 vendor，无法直接查看源码），以上基于 Jetstream Inertia 栈的标准行为和项目代码中的证据推断。
 
-| 字段 | 是否包含 | 原因 |
-|------|---------|------|
-| `name` | ✅ | `$visible` + `$appends` |
+#### auth.user 的数据结构与 $visible 的关系
+
+Jetstream 共享 `auth.user` 时，基础数据来自 `$user->toArray()`，而 `toArray()` 受 User 模型的 `$visible` 属性控制。Jetstream 还会追加一些额外字段（如 `two_factor_enabled`、`profile_photo_url` 等）。
+
+| 字段 | 在 auth.user 中 | 原因 |
+|------|:--------------:|------|
+| `name` | ✅ | `$visible` + `$appends` (accessor) |
 | `first_name` | ✅ | `$visible` |
 | `last_name` | ✅ | `$visible` |
 | `email` | ✅ | `$visible` |
 | `help_shown` | ✅ | `$visible` |
 | `locale` | ✅ | `$visible` |
-| `locale_ietf` | ✅ | `$visible` + `$appends` |
+| `locale_ietf` | ✅ | `$visible` + `$appends` (accessor) |
 | `is_account_administrator` | ✅ | `$visible` |
-| **timezone** | **✅** | **`$visible`** |
+| **timezone** | **✅** | **`$visible` 中显式声明** |
 | **date_format** | **❌** | **不在 `$visible` 中** |
-| `two_factor_enabled` | ✅ | Jetstream 追加 |
-| `password` | ❌ | `$hidden` |
+| `two_factor_enabled` | ✅ | Jetstream 追加（非 User 模型属性） |
+| `profile_photo_url` | ✅ | Jetstream 追加（accessor） |
+| `password` | ❌ | `$hidden` 中排除 |
 
 #### 路径②：HandleInertiaRequests 中间件
 
 **文件**: [HandleInertiaRequests.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/app/Http/Middleware/HandleInertiaRequests.php)
 
+**注册方式**：[bootstrap/app.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/bootstrap/app.php#L38) 通过 `$middleware->web(append: [...])` 追加到 web 中间件组。
+
 ```php
 public function share(Request $request)
 {
+    $this->storeCurrentUrl($request);
+
     return [
-        ...parent::share($request),   // ← 只含 ['errors' => ...]
-        'help_links' => ...,
-        'help_url' => ...,
-        'footer' => ...,
-        'hasKey' => ...,
-        'ziggy' => ...,
-        'sentry' => ...,
-        // ⚠️ 没有 'auth' 键！auth 由 Jetstream 的中间件共享
+        ...parent::share($request),   // ← Inertia v2 Middleware: 只含 ['errors' => ...]
+        'help_links' => fn () => config('monica.help_links'),
+        'help_url' => fn () => config('monica.help_center_url'),
+        'footer' => fn () => $this->footer(),
+        'hasKey' => fn () => function () use ($request) { ... },
+        'ziggy' => fn () => [...],
+        'sentry' => fn () => [...],
+        // ⚠️ 注意：这里没有 'auth' 键！auth 由 Jetstream 包共享
     ];
 }
 ```
 
-**重要纠正**：`parent::share()` 即 Inertia v2 Middleware 的 `share()` 方法，只返回 `['errors' => ...]`，**不包含 auth.user**。auth.user 完全由 Jetstream 的 `ShareInertiaData` 中间件提供。
+**关键纠正**：`parent::share()` 即 Inertia v2 `Middleware` 的 `share()` 方法，只返回 `['errors' => ...]`，**不包含 auth.user**。auth.user 完全由 Jetstream 包的共享机制提供。
 
-### 2.2 前端实际使用的 auth.user 字段
+### 2.3 前端实际使用的 auth.user 字段
 
-搜索所有 Vue 文件中 `$page.props.auth.user` 的引用：
+搜索所有 Vue 文件中 `$page.props.auth.user` 的引用（按出现次数排序）：
 
-| 字段 | 使用位置 | 用途 |
-|------|---------|------|
-| `locale_ietf` | 7 处（DatePicker 组件） | 日期选择器的 locale 设置 |
-| `help_shown` | 2 处（Help.vue, HelpPreference.vue） | 控制帮助提示显示 |
-| `name` | 3 处（AppLayout.vue） | 用户名显示 |
-| `email` | 1 处（AppLayout.vue） | 邮箱显示 |
-| `profile_photo_url` | 2 处（AppLayout.vue） | 头像 |
-| `instance_administrator` | 2 处（AppLayout.vue） | 管理员入口 |
+| 字段 | 使用位置数 | 用途 |
+|------|:----------:|------|
+| `locale_ietf` | 9 处 | DatePicker 组件的 locale 设置（日历显示语言） |
+| `name` | 3 处 | AppLayout 中显示用户名 |
+| `help_shown` | 2 处 | Help.vue 等控制帮助提示显示 |
+| `email` | 2 处 | AppLayout 中显示邮箱 |
+| `profile_photo_url` | 2 处 | AppLayout 中显示头像 |
+| `instance_administrator` | 2 处 | AppLayout 中管理员入口 |
+| `two_factor_enabled` | 1 处 | TwoFactorAuthenticationForm.vue |
 
-**关键发现**：虽然 `$page.props.auth.user.timezone` 存在（因为 timezone 在 `$visible` 中），但**没有任何 Vue 组件读取它**。`date_format` 则根本不在 auth.user 中。
+**关键发现**：
+- ✅ `$page.props.auth.user.timezone` 存在（因为 timezone 在 `$visible` 中），但**没有任何 Vue 组件读取它**
+- ❌ `$page.props.auth.user.date_format` 不存在（不在 `$visible` 中）
 
 ---
 
 ## 3. 偏好设置的真实数据路径
 
-### 3.1 概览：两条完全独立的路径
+### 3.1 概览：三条完全独立的路径
 
 ```
                     ┌──────────────────────────────┐
@@ -155,53 +161,69 @@ public function share(Request $request)
               ┌────────────────────┼────────────────────┐
               ▼                    ▼                     ▼
    ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-   │ 路径A: Inertia   │  │ 路径B: ViewHelper │  │ 路径C: ViewHelper │
-   │ 全局共享          │  │ 偏好设置页面       │  │ 业务页面日期格式化 │
+   │ 路径A: Jetstream│  │ 路径B: ViewHelper │  │ 路径C: ViewHelper │
+   │ 全局共享 auth    │  │ 偏好设置页面       │  │ 业务页面日期格式化 │
+   │ .user           │  │                  │  │                  │
    └────────┬────────┘  └────────┬─────────┘  └────────┬─────────┘
             │                     │                      │
             ▼                     ▼                      ▼
    $page.props.auth.user   props.data.timezone    props.xxx.scheduled_at
-     .timezone ✅存在       props.data.date_format   = "Jun 22, 2026"
-     .date_format ❌缺失     = "MMM DD, YYYY"        (后端已格式化)
-     但前端从未读取过        (ViewHelper 直接读
-                            $user->timezone
-                            和 $user->date_format)
+     .timezone ✅ 存在      props.data.date_format   = "Jun 22, 2026"
+     .date_format ❌ 缺失    = "MMM DD, YYYY"        (后端已格式化)
+     但从未被读取           (ViewHelper 直接读        前端直接渲染
+                          $user->timezone
+                          和 $user->date_format)
 ```
 
-### 3.2 路径A：Inertia 全局共享（Jetstream → auth.user）
+### 3.2 路径A：Jetstream 全局共享（auth.user）
 
 ```
-Jetstream\ShareInertiaData 中间件
-  → $request->user()                           // 获取 User 模型
-  → $user->toArray()                           // 受 $visible 控制
-  → Inertia::share('auth.user', result)        // 共享到前端
+Jetstream 包 ServiceProvider boot()
+  → Inertia::share('auth.user', function () use ($request) {
+      $user = $request->user();
+      return array_merge($user->toArray(), [/* Jetstream 追加字段 */]);
+    })
   → 前端: $page.props.auth.user
-      .timezone ✅ (在 $visible 中，但从未被读取)
-      .date_format ❌ (不在 $visible 中)
-      .locale_ietf ✅ (被 DatePicker 大量使用)
+      .timezone      ✅ 存在（$visible 中），但从未被读取
+      .date_format   ❌ 不存在（不在 $visible 中）
+      .locale_ietf   ✅ 存在，被 DatePicker 大量使用
 ```
+
+**特点**：
+- 数据受 User 模型 `$visible` / `$hidden` / `$appends` 控制
+- 是"全局"的——每个页面都能访问
+- timezone 和 date_format 在此路径上的可见性不一致
 
 ### 3.3 路径B：偏好设置页面（ViewHelper → page props）
 
 ```
 PreferencesController::index()
-  → Auth::user()                               // 直接获取 User 模型
+  → Auth::user()                               // 直接获取 User 模型对象
   → UserPreferencesIndexViewHelper::data($user) // 绕过 $visible 限制
       → dtoTimezone($user): ['timezone' => $user->timezone, ...]
-      → dtoDateFormat($user): ['date_format' => $user->date_format, ...]
+      → dtoDateFormat($user): [
+            'dates' => [...],                   // 4种可选格式
+            'date_format' => $user->date_format, // 用户当前格式
+            'human_date_format' => Carbon::now()->isoFormat($user->date_format),
+            'url' => [...],
+         ]
   → Inertia::render('Settings/Preferences/Index', ['data' => ...])
   → 前端: props.data.timezone     = "America/New_York"
           props.data.date_format   = "MMM DD, YYYY"
           props.data.human_date_format = "Jun 22, 2026"
 ```
 
-**关键点**：ViewHelper 直接读取 `$user->timezone` 和 `$user->date_format` 属性（PHP 对象属性访问），不受 `$visible` 限制。只有序列化为 JSON/数组时 `$visible` 才起作用。
+**文件**：
+- Controller: [PreferencesController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/app/Domains/Settings/ManageUserPreferences/Web/Controllers/PreferencesController.php)
+- ViewHelper: [UserPreferencesIndexViewHelper.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/app/Domains/Settings/ManageUserPreferences/Web/ViewHelpers/UserPreferencesIndexViewHelper.php)
+
+**关键点**：ViewHelper 直接读取 `$user->timezone` 和 `$user->date_format` 属性（PHP 对象属性访问），**不受 `$visible` 限制**。`$visible` 只在序列化为数组/JSON 时才起作用。
 
 ### 3.4 路径C：业务页面（ViewHelper → DateHelper → 预格式化字符串）
 
 ```
 各业务 Controller::method()
-  → Auth::user()                               // 直接获取 User 模型
+  → Auth::user()                               // 直接获取 User 模型对象
   → XxxViewHelper::method($model, Auth::user())// 传入 User 对象
       → DateHelper::format($date, $user)       // 使用 $user->date_format
       → ImportantDateHelper::formatDate($date, $user)
@@ -230,6 +252,8 @@ POST /settings/preferences/timezone  → PreferencesTimezoneController@store
 
 **Controller**: [PreferencesTimezoneController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/app/Domains/Settings/ManageUserPreferences/Web/Controllers/PreferencesTimezoneController.php)
 
+**Service**: [StoreTimezone.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/app/Domains/Settings/ManageUserPreferences/Services/StoreTimezone.php)
+
 ```
 前端 axios.post(url, { timezone }) 
   → Controller: $request->input('timezone')
@@ -237,9 +261,13 @@ POST /settings/preferences/timezone  → PreferencesTimezoneController@store
   → 返回 JSON: UserPreferencesIndexViewHelper::dtoTimezone($user)
 ```
 
+验证规则：`timezone` 为 required|string|max:255
+
 ### 4.3 Date Format 保存
 
 **Controller**: [PreferencesDateFormatController.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/app/Domains/Settings/ManageUserPreferences/Web/Controllers/PreferencesDateFormatController.php)
+
+**Service**: [StoreDateFormatPreference.php](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/app/Domains/Settings/ManageUserPreferences/Services/StoreDateFormatPreference.php)
 
 ```
 前端 axios.post(url, { dateFormat })
@@ -247,6 +275,8 @@ POST /settings/preferences/timezone  → PreferencesTimezoneController@store
   → StoreDateFormatPreference 服务: $this->author->date_format = $data['date_format']; save()
   → 返回 JSON: UserPreferencesIndexViewHelper::dtoDateFormat($user)
 ```
+
+验证规则：`date_format` 为 required|string|max:255
 
 **注意**：前端表单字段名是 `dateFormat`（camelCase），在 Controller 中手动映射为 `date_format` 传给 Service。
 
@@ -298,12 +328,12 @@ POST /settings/preferences/timezone  → PreferencesTimezoneController@store
 ```vue
 <DatePicker
   :timezone="'UTC'"                          ← 硬编码 UTC
-  :locale="$page.props.auth.user?.locale_ietf"  ← 从 Inertia 共享获取
+  :locale="$page.props.auth.user?.locale_ietf"  ← 从 auth.user 读取（路径A）
   v-model.string="form.date"
 />
 ```
 
-**出现位置**：
+**出现位置**（共 9 处）：
 - [MoodTrackingEvents.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/resources/js/Pages/Vault/Dashboard/Partials/MoodTrackingEvents.vue#L149-L155)
 - [CreateLifeEvent.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/resources/js/Shared/Modules/CreateLifeEvent.vue#L256-L261)
 - [Reminders.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/resources/js/Shared/Modules/Reminders.vue)
@@ -313,7 +343,9 @@ POST /settings/preferences/timezone  → PreferencesTimezoneController@store
 - [PostEdit.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/resources/js/Pages/Vault/Journal/Post/Edit.vue)
 - [CreateOrEditImportantDate.vue](file:///d:/fz/0601-2/solo-dogfeeding/code/78-monica/resources/js/Pages/Vault/Contact/ImportantDates/Partials/CreateOrEditImportantDate.vue)
 
-**注意**：DatePicker 的 `:timezone="'UTC'"` 是硬编码的，没有使用用户的 timezone 偏好。`locale` 来自 `$page.props.auth.user.locale_ietf`（通过 Jetstream 共享），只影响日历的显示语言。
+**注意**：
+- DatePicker 的 `:timezone="'UTC'"` 是**硬编码**的，没有使用用户的 timezone 偏好
+- `:locale` 来自 `$page.props.auth.user.locale_ietf`（路径A，Jetstream 全局共享），只影响日历的显示语言，不影响时区
 
 ---
 
@@ -430,9 +462,9 @@ API 时间戳格式来自 [config/api.php](file:///d:/fz/0601-2/solo-dogfeeding/
        ▼               ▼                        ▼
 ┌──────────────┐ ┌──────────────┐      ┌──────────────┐
 │ 路径A         │ │ 路径B         │      │ 路径C         │
-│ Jetstream     │ │ ViewHelper    │      │ ViewHelper    │
-│ ShareInertia  │ │ 偏好设置页面   │      │ 业务页面       │
-│ Data 中间件    │ │               │      │               │
+│ Jetstream 包  │ │ ViewHelper    │      │ ViewHelper    │
+│ 全局共享 auth │ │ 偏好设置页面   │      │ 业务页面       │
+│ .user         │ │              │      │              │
 └──────┬───────┘ └──────┬───────┘      └──────┬───────┘
        │                │                      │
        │ $user->toArray()│ 直接读 $user->xxx     │ DateHelper::format()
@@ -456,9 +488,10 @@ API 时间戳格式来自 [config/api.php](file:///d:/fz/0601-2/solo-dogfeeding/
 
 | 问题 | 说明 |
 |------|------|
-| **timezone 在 auth.user 中但从未被读取** | `$page.props.auth.user.timezone` 存在，但所有 Vue 组件都通过 ViewHelper 的 `props.data.timezone` 获取，没有任何组件从 auth.user 读取 timezone |
+| **timezone 在 auth.user 中但从未被读取** | `$page.props.auth.user.timezone` 存在（在 `$visible` 中），但所有 Vue 组件都通过 ViewHelper 的 `props.data.timezone` 获取偏好值，没有任何组件从 auth.user 读取 timezone |
 | **date_format 不在 auth.user 中** | 由于不在 `$visible` 中，`$page.props.auth.user.date_format` 不存在。偏好设置页面通过 ViewHelper 的 `props.data.date_format` 获取 |
-| **两者走完全不同的路径** | auth.user 由 Jetstream 中间件通过 `$user->toArray()` 序列化（受 `$visible` 控制）；偏好值由 ViewHelper 通过 PHP 对象属性直接读取（不受 `$visible` 限制） |
+| **两者走完全不同的路径** | auth.user 由 Jetstream 包通过 `$user->toArray()` 序列化（受 `$visible` 控制）；偏好值由 ViewHelper 通过 PHP 对象属性直接读取（不受 `$visible` 限制） |
+| **$visible 设计意图不明确** | `timezone` 被放入 `$visible` 但从未通过 auth.user 被消费；`date_format` 不在 `$visible` 中但通过 ViewHelper 被大量使用。两者在序列化策略上的不一致没有功能上的理由 |
 
 ### 10.2 其他问题
 
@@ -470,4 +503,4 @@ API 时间戳格式来自 [config/api.php](file:///d:/fz/0601-2/solo-dogfeeding/
 
 4. **`formatDate()` 与 `format()` 的格式来源不同**：`formatDate()` 用 locale 翻译字符串 `trans('format.date')`，`format()` 用用户偏好 `$user->date_format`。两者可能产生不同的格式输出。
 
-5. **`$visible` 的设计意图不明确**：`timezone` 被放入 `$visible` 但从未通过 auth.user 被消费；`date_format` 不在 `$visible` 中但通过 ViewHelper 被大量使用。两者在序列化策略上的不一致没有功能上的理由。
+5. **两条路径的数据一致性风险**：偏好保存后，ViewHelper 路径立即反映新值（因为保存后返回新的 DTO），但 auth.user 路径（Jetstream 全局共享）在下一次页面刷新前可能仍为旧值。不过由于前端从未从 auth.user 读取 timezone/date_format，这个问题目前不影响功能。
